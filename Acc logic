@@ -1,67 +1,57 @@
-import polars as pl
+import pandas as pd
 
 
-def find_trade_pairs_polars(df, tolerance_days=3):
+def find_trade_pairs(df, tolerance_days=3):
 
-    # Convert pandas -> polars if needed
-    if not isinstance(df, pl.DataFrame):
-        df = pl.from_pandas(df)
+    df = df.copy()
 
-    # ---- Normalize schema ----
-    df = df.with_columns([
-        pl.col("trade_date").str.strptime(pl.Date, strict=False),
-        pl.col("start_date").str.strptime(pl.Date, strict=False),
-        pl.col("maturity_date").str.strptime(pl.Date, strict=False),
-        pl.col("nominal").abs().alias("abs_nominal")
-    ])
+    # ---- Standardize dates ----
+    date_cols = ["trade_date", "start_date", "maturity_date"]
+    for c in date_cols:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    # ---- Self join on abs nominal ----
-    joined = df.join(
+    # ---- Absolute nominal column ----
+    df["abs_nominal"] = df["nominal"].abs()
+
+    # ---- Self merge on nominal ----
+    merged = df.merge(
         df,
         on="abs_nominal",
-        how="inner",
-        suffix="_2"
+        suffixes=("_1", "_2")
     )
 
-    # ---- Remove self matching ----
-    joined = joined.filter(
-        pl.col("trade_id") != pl.col("trade_id_2")
-    )
+    # ---- Remove same trade matching ----
+    merged = merged[merged["trade_id_1"] != merged["trade_id_2"]]
 
-    # ---- Conditions ----
-    filtered = joined.filter(
-        (pl.col("entity") != pl.col("entity_2")) &
+    # ---- Entity must be different ----
+    merged = merged[merged["entity_1"] != merged["entity_2"]]
 
-        (pl.col("message_receipt") != pl.col("message_receipt_2")) &
+    # ---- Message receipt must be different ----
+    merged = merged[
+        merged["message_receipt_1"] != merged["message_receipt_2"]
+    ]
 
-        (pl.col("mtm_usd_act") * pl.col("mtm_usd_act_2") < 0) &
+    # ---- MTM opposite sign ----
+    merged = merged[
+        merged["mtm_usd_act_1"] * merged["mtm_usd_act_2"] < 0
+    ]
 
-        (
-            (pl.col("trade_date") - pl.col("trade_date_2"))
-            .abs()
-            .dt.total_days() <= tolerance_days
-        ) &
+    # ---- Date tolerance checks ----
+    merged = merged[
+        (abs((merged["trade_date_1"] - merged["trade_date_2"]).dt.days) <= tolerance_days) &
+        (abs((merged["start_date_1"] - merged["start_date_2"]).dt.days) <= tolerance_days) &
+        (abs((merged["maturity_date_1"] - merged["maturity_date_2"]).dt.days) <= tolerance_days)
+    ]
 
-        (
-            (pl.col("start_date") - pl.col("start_date_2"))
-            .abs()
-            .dt.total_days() <= tolerance_days
-        ) &
+    # ---- Select useful columns ----
+    result = merged[
+        [
+            "trade_id_1",
+            "trade_id_2",
+            "entity_1",
+            "entity_2",
+            "abs_nominal"
+        ]
+    ]
 
-        (
-            (pl.col("maturity_date") - pl.col("maturity_date_2"))
-            .abs()
-            .dt.total_days() <= tolerance_days
-        )
-    )
-
-    # ---- Select output ----
-    result = filtered.select([
-        pl.col("trade_id").alias("trade1"),
-        pl.col("trade_id_2").alias("trade2"),
-        "entity",
-        "entity_2",
-        "abs_nominal"
-    ])
-
-    return result
+    return result.reset_index(drop=True)
