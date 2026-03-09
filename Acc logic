@@ -1,0 +1,54 @@
+import pandas as pd
+
+def find_trade_pairs(df, tolerance_days=3):
+    
+    df = df.copy()
+
+    # Ensure dates are datetime
+    date_cols = ["trade_date", "start_date", "maturity_date"]
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col])
+
+    pairs = []
+
+    for i in range(len(df)):
+        for j in range(i+1, len(df)):
+
+            t1 = df.iloc[i]
+            t2 = df.iloc[j]
+
+            # 1. Entity should be different
+            if t1["entity"] == t2["entity"]:
+                continue
+
+            # 2. Message receipt should not be same
+            if t1["message_receipt"] == t2["message_receipt"]:
+                continue
+
+            # 3. Nominal absolute match
+            if abs(t1["nominal"]) != abs(t2["nominal"]):
+                continue
+
+            # 4. Date tolerance checks
+            if abs((t1["trade_date"] - t2["trade_date"]).days) > tolerance_days:
+                continue
+
+            if abs((t1["start_date"] - t2["start_date"]).days) > tolerance_days:
+                continue
+
+            if abs((t1["maturity_date"] - t2["maturity_date"]).days) > tolerance_days:
+                continue
+
+            # 5. MTM opposite sign check
+            if t1["mtm_usd_act"] * t2["mtm_usd_act"] >= 0:
+                continue
+
+            pairs.append({
+                "trade1_id": t1["trade_id"],
+                "trade2_id": t2["trade_id"],
+                "entity1": t1["entity"],
+                "entity2": t2["entity"],
+                "nominal": t1["nominal"]
+            })
+
+    return pd.DataFrame(pairs)
