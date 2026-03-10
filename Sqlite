@@ -15,15 +15,25 @@ class LentilDatabaseSQLite(LentilDatabase):
         super().__init__()
 
         self.logger = get_logger(__name__)
-        self.conn = sqlite3.connect("lentil.db", check_same_thread=False)
+
+        self.conn = sqlite3.connect(
+            "lentil.db",
+            check_same_thread=False
+        )
+
         self.conn.row_factory = sqlite3.Row
-        self.cursor = self.conn.cursor()
 
         self._init_tables()
 
+    # -------------------------
+    # TABLE CREATION
+    # -------------------------
+
     def _init_tables(self):
 
-        self.cursor.execute("""
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             exceptionId TEXT,
@@ -36,11 +46,16 @@ class LentilDatabaseSQLite(LentilDatabase):
         """)
 
         self.conn.commit()
+        cursor.close()
+
+    # -------------------------
+    # RECORD CREATION
+    # -------------------------
 
     def _record_from_prediction(
         self,
         b_exc: BusinessException,
-        model_output: List[PredictorModelOutput],
+        model_output: List[PredictorModelOutput]
     ) -> Mapping[str, Any]:
 
         if not model_output:
@@ -55,9 +70,15 @@ class LentilDatabaseSQLite(LentilDatabase):
             "prediction": str(model_output),
         }
 
+    # -------------------------
+    # INSERT MULTIPLE
+    # -------------------------
+
     def insert_predictions(
         self,
-        predictions: Iterator[Tuple[BusinessException, List[PredictorModelOutput]]],
+        predictions: Iterator[
+            Tuple[BusinessException, List[PredictorModelOutput]]
+        ],
     ):
 
         records = []
@@ -77,7 +98,9 @@ class LentilDatabaseSQLite(LentilDatabase):
                 )
             )
 
-        self.cursor.executemany(
+        cursor = self.conn.cursor()
+
+        cursor.executemany(
             """
             INSERT INTO predictions
             (exceptionId, exceptionTimestamp, responseCode,
@@ -88,8 +111,13 @@ class LentilDatabaseSQLite(LentilDatabase):
         )
 
         self.conn.commit()
+        cursor.close()
 
         self.logger.debug(f"Inserted {len(records)} predictions")
+
+    # -------------------------
+    # INSERT SINGLE
+    # -------------------------
 
     def insert_prediction(
         self,
@@ -99,7 +127,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         record = self._record_from_prediction(b_exc, model_output)
 
-        self.cursor.execute(
+        cursor = self.conn.cursor()
+
+        cursor.execute(
             """
             INSERT INTO predictions
             (exceptionId, exceptionTimestamp, responseCode,
@@ -117,6 +147,11 @@ class LentilDatabaseSQLite(LentilDatabase):
         )
 
         self.conn.commit()
+        cursor.close()
+
+    # -------------------------
+    # QUERY PAGINATION
+    # -------------------------
 
     def query_predictions(
         self,
@@ -128,7 +163,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         limit = end_row - start_row
 
-        rows = self.cursor.execute(
+        cursor = self.conn.cursor()
+
+        rows = cursor.execute(
             "SELECT * FROM predictions LIMIT ? OFFSET ?",
             (limit, start_row),
         ).fetchall()
@@ -152,17 +189,33 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         row_count = self.count_query_predictions(filter_model)
 
+        cursor.close()
+
         return {"rowData": row_data, "rowCount": row_count}
+
+    # -------------------------
+    # COUNT
+    # -------------------------
 
     def count_query_predictions(self, filter_model):
 
-        result = self.cursor.execute(
+        cursor = self.conn.cursor()
+
+        result = cursor.execute(
             "SELECT COUNT(*) FROM predictions"
         ).fetchone()
 
+        cursor.close()
+
         return result[0]
 
+    # -------------------------
+    # GET BY EXCEPTION
+    # -------------------------
+
     def get_predictions_by_exception_id(self, exception_id: str):
+
+        cursor = self.conn.cursor()
 
         query = """
         SELECT * FROM predictions
@@ -171,7 +224,9 @@ class LentilDatabaseSQLite(LentilDatabase):
         LIMIT 1
         """
 
-        row = self.cursor.execute(query, (exception_id,)).fetchone()
+        row = cursor.execute(query, (exception_id,)).fetchone()
+
+        cursor.close()
 
         if row is None:
             return {}
