@@ -1,0 +1,217 @@
+import asyncio
+from collections.abc import AsyncGenerator
+from csv import DictWriter
+from datetime import datetime
+from pathlib import Path
+from typing import Iterator, List, Tuple
+
+from tqdm.asyncio import tqdm
+
+from lentil.cache.storage_interface import StorageInterface
+from lentil.data_fetch.epe.controls import ControlGroup
+from lentil.data_fetch.epe.exceptions_api import ExceptionsAPI
+from lentil.data_fetch.epe.query import EPEQueryConfig, query_iter
+from lentil.data_fetch.epe.vocab import vocab
+from lentil.model.business_exception import BusinessException
+from lentil.utilities.log import get_logger
+from lentil.utilities.utils import batches_from_datetimes
+from lentil.cache import USE_S3
+
+
+logger = get_logger(__name__)
+
+
+class ExceptionsFetcher:
+
+    def __init__(self, storage_interface: StorageInterface):
+
+        self._epe_store_path = Path("./epe_data")
+        self._cache = storage_interface
+
+    async def query_date_range(
+        self,
+        api: ExceptionsAPI,
+        from_dt: datetime,
+        to_dt: datetime,
+        exception_status,
+        control_group: ControlGroup,
+    ) -> AsyncGenerator[BusinessException, None]:
+
+        semaphore = asyncio.Semaphore(10)  # max parallel API calls
+
+        async def run_query(query):
+
+            async with semaphore:
+                return await api.query(query)
+
+        for status in exception_status.value:
+
+            queries = query_iter(
+                EPEQueryConfig(
+                    from_datetime=from_dt,
+                    to_datetime=to_dt,
+                    control_group=control_group,
+                    exception_status=status,
+                )
+            )
+
+            while True:
+
+                batch = []
+
+                for _ in range(10):
+                    try:
+                        batch.append(next(queries))
+                    except StopIteration:
+                        break
+
+                if not batch:
+                    return
+
+                responses = await asyncio.gather(
+                    *[run_query(q) for q in batch]
+                )
+
+                for response in responses:
+
+                    response = response[vocab[control_group].details_str]
+
+                    response_inner = response[
+                        vocab[control_group].response_str
+                    ]
+
+                    if not response_inner:
+                        continue
+
+                    for item in response_inner:
+
+                        header = list(item.keys())
+
+                        be = BusinessException(header=header)
+
+                        for k, v in item.items():
+                            be[k] = v
+
+                        yield be
+
+    async def download_date_range_async(
+        self,
+        start: datetime,
+        end: datetime,
+        exception_status,
+        control_group: ControlGroup,
+        batched: bool,
+        whole_days_only: bool = False,
+    ):
+
+        api = ExceptionsAPI()
+
+        logger.info(f"Downloading exceptions between {start} and {end}")
+
+        if batched:
+
+            batch_datetimes = list(batches_from_datetimes(start, end))
+
+            if whole_days_only:
+                batch_datetimes = batch_datetimes[1:-2]
+
+            tasks = []
+
+            for batch_start, batch_end in batch_datetimes:
+
+                tasks.append(
+                    self.download_date_range_async(
+                        start=batch_start,
+                        end=batch_end,
+                        exception_status=exception_status,
+                        control_group=control_group,
+                        batched=False,
+                    )
+                )
+
+            await asyncio.gather(*tasks)
+
+            return
+
+        path = self.cache_path(start, end, control_group)
+
+        if self._cache.path_exists(path):
+
+            logger.info(f"Found cached path {path}")
+
+            return
+
+        exception_rows = self.query_date_range(
+            api,
+            start,
+            end,
+            exception_status,
+            control_group,
+        )
+
+        logger.debug(f"Store opening path {path}")
+
+        rows_buffer = []
+
+        async for row in tqdm(exception_rows, desc=f"Downloading {path}"):
+
+            rows_buffer.append(row)
+
+        if not rows_buffer:
+
+            logger.warning(f"Empty response downloading {path}")
+
+            return
+
+        with self._cache.open(path, "w") as f:
+
+            writer = DictWriter(f, fieldnames=rows_buffer[0].keys())
+
+            writer.writeheader()
+            writer.writerows(rows_buffer)
+
+            if USE_S3:
+
+                data = f.getvalue()
+
+                path = str(path).replace("\\", "/")
+
+                path = f"lentil/{path}"
+
+                logger.debug(f"Uploading to path: {path}")
+
+                self._cache.upload_file(path, data)
+
+                logger.debug("File uploaded successfully!")
+
+        logger.info(f"Downloaded file {path}")
+
+    def download_date_range_asyncio(
+        self,
+        start: datetime,
+        end: datetime,
+        exception_status,
+        control_group: ControlGroup,
+        batched: bool,
+    ):
+
+        asyncio.run(
+            self.download_date_range_async(
+                start,
+                end,
+                exception_status,
+                control_group,
+                batched,
+            )
+        )
+
+    def cache_path(self, start, end, control_group):
+
+        t1 = start.strftime("%Y-%m-%d_%H%M%S")
+        t2 = end.strftime("%Y-%m-%d_%H%M%S")
+
+        cg_subdir = self._epe_store_path / control_group.value
+
+        cg_subdir.mkdir(parents=True, exist_ok=True)
+
+        return self._epe_store_path / control_group.value / f"{t1}_to_{t2}.csv"
