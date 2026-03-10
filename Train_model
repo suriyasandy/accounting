@@ -1,0 +1,87 @@
+import logging
+
+from argparse import ArgumentParser, Namespace
+from csv import DictReader
+from pathlib import Path
+
+from lentil.cache import cache, MODELS_DIR
+from lentil.data_fetch.epe.controls import ControlGroup
+from lentil.model.business_exception import be_from_dict
+from lentil.model.predictor_model import PredictorModel
+from lentil.utilities.log import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def add_args(parser: ArgumentParser) -> ArgumentParser:
+    """Define command line arguments."""
+
+    parser.add_argument(
+        "--control-group",
+        help="Select the control group on which to run this command.",
+        choices=[cg.value for cg in ControlGroup],
+    )
+
+    parser.add_argument(
+        "--predict",
+        help="Select the data column that the model should be trained to predict.",
+        metavar="column_key",
+    )
+
+    return parser
+
+
+def main(args: Namespace) -> PredictorModel:
+    """Entry point for this script."""
+
+    # Convert CLI string → Enum
+    if isinstance(args.control_group, str):
+        args.control_group = ControlGroup(args.control_group)
+
+    logger.info(f"Using control group: {args.control_group}")
+
+    # Require filter_similar to have run first
+    dataset_path = Path("epe_data") / args.control_group.value / "filtered.csv"
+
+    logger.info(f"Loading dataset from: {dataset_path}")
+
+    with cache.open(dataset_path, "r") as f:
+
+        reader = DictReader(f)
+
+        fieldnames = reader.fieldnames
+
+        if fieldnames is None:
+            raise Exception(
+                f"Input file {dataset_path} must contain a header row"
+            )
+
+        # Remove unusable columns
+        fieldnames = PredictorModel.remove_unusable_columns(list(fieldnames))
+
+        model = PredictorModel(
+            control_group=args.control_group,
+            feature_keys=fieldnames,
+            predict_key=args.predict,
+        )
+
+        business_exceptions = (
+            be_from_dict(row) for row in reader
+        )
+
+        logger.info("Training model...")
+        model.train(business_exceptions)
+
+    logger.info("Saving trained model...")
+    model.save(MODELS_DIR)
+
+    logger.info("Training complete")
+
+    return model
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    args = add_args(parser).parse_args()
+    main(args)
