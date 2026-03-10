@@ -1,5 +1,4 @@
 import sqlite3
-import ast
 import re
 from typing import Any, Dict, Iterator, List, Mapping, Tuple
 
@@ -24,11 +23,14 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self.conn.row_factory = sqlite3.Row
 
+        # Better concurrency
+        self.conn.execute("PRAGMA journal_mode=WAL")
+
         self._init_tables()
 
-    # ---------------------------------------------------
+    # ----------------------------------------------------
     # TABLE CREATION
-    # ---------------------------------------------------
+    # ----------------------------------------------------
 
     def _init_tables(self):
 
@@ -49,9 +51,9 @@ class LentilDatabaseSQLite(LentilDatabase):
         self.conn.commit()
         cursor.close()
 
-    # ---------------------------------------------------
-    # CREATE RECORD
-    # ---------------------------------------------------
+    # ----------------------------------------------------
+    # BUILD RECORD
+    # ----------------------------------------------------
 
     def _record_from_prediction(
         self,
@@ -71,9 +73,9 @@ class LentilDatabaseSQLite(LentilDatabase):
             "prediction": str(model_output)
         }
 
-    # ---------------------------------------------------
+    # ----------------------------------------------------
     # INSERT MULTIPLE
-    # ---------------------------------------------------
+    # ----------------------------------------------------
 
     def insert_predictions(
         self,
@@ -108,7 +110,7 @@ class LentilDatabaseSQLite(LentilDatabase):
              responseDescription, controlGroup, prediction)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            records
+            records,
         )
 
         self.conn.commit()
@@ -116,9 +118,43 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self.logger.debug(f"Inserted {len(records)} predictions")
 
-    # ---------------------------------------------------
-    # QUERY PREDICTIONS (FIXED)
-    # ---------------------------------------------------
+    # ----------------------------------------------------
+    # REQUIRED ABSTRACT METHOD
+    # ----------------------------------------------------
+
+    def insert_prediction(
+        self,
+        b_exc: BusinessException,
+        model_output: List[PredictorModelOutput],
+    ):
+
+        record = self._record_from_prediction(b_exc, model_output)
+
+        cursor = self.conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO predictions
+            (exceptionId, exceptionTimestamp, responseCode,
+             responseDescription, controlGroup, prediction)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["exceptionId"],
+                record["exceptionTimestamp"],
+                record["responseCode"],
+                record["responseDescription"],
+                record["controlGroup"],
+                record["prediction"],
+            ),
+        )
+
+        self.conn.commit()
+        cursor.close()
+
+    # ----------------------------------------------------
+    # QUERY PREDICTIONS (UI GRID)
+    # ----------------------------------------------------
 
     def query_predictions(
         self,
@@ -141,26 +177,22 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         for row in rows:
 
-            prediction_timestamp = []
+            raw_prediction = row["prediction"]
+
             prediction_key = []
             prediction_value = []
-
-            raw_prediction = row["prediction"]
+            prediction_timestamp = []
 
             try:
 
-                # Extract keys
+                # Extract FeatureImportance keys
                 keys = re.findall(r"key='([^']*)'", raw_prediction)
 
-                # Extract values
+                # Extract FeatureImportance values
                 values = re.findall(r"value='([^']*)'", raw_prediction)
-
-                # Extract timestamps
-                timestamps = re.findall(r"timestamp='([^']*)'", raw_prediction)
 
                 prediction_key = keys
                 prediction_value = values
-                prediction_timestamp = timestamps
 
             except Exception as e:
 
@@ -188,9 +220,9 @@ class LentilDatabaseSQLite(LentilDatabase):
             "rowCount": row_count
         }
 
-    # ---------------------------------------------------
+    # ----------------------------------------------------
     # COUNT
-    # ---------------------------------------------------
+    # ----------------------------------------------------
 
     def count_query_predictions(self):
 
@@ -204,9 +236,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         return result[0]
 
-    # ---------------------------------------------------
-    # GET BY EXCEPTION ID
-    # ---------------------------------------------------
+    # ----------------------------------------------------
+    # GET BY EXCEPTION
+    # ----------------------------------------------------
 
     def get_predictions_by_exception_id(
         self,
