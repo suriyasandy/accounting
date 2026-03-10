@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Tuple
 
 from lentil.database.lentil_db_base import LentilDatabase
 from lentil.model.business_exception import BusinessException
-from lentil.model.output import PredictorModelOutput, FeatureImportance
+from lentil.model.output import PredictorModelOutput
 from lentil.utilities.log import get_logger
 
 
@@ -27,54 +27,55 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self._init_tables()
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # CREATE TABLE
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def _init_tables(self):
 
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS predictions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            exceptionId TEXT,
-            exceptionTimestamp TEXT,
-            responseCode TEXT,
-            responseDescription TEXT,
-            controlGroup TEXT,
-            prediction TEXT
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exceptionId TEXT,
+                exceptionTimestamp TEXT,
+                responseCode TEXT,
+                responseDescription TEXT,
+                controlGroup TEXT,
+                prediction TEXT
+            )
+            """
         )
-        """)
 
         self.conn.commit()
         cursor.close()
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # CONVERT MODEL OUTPUT
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def _prediction_to_json(self, model_output):
 
         prediction = []
 
         for p in model_output:
-
-            for fi in p.feature_importances:
+            for fi in p.features:
 
                 prediction.append(
                     {
                         "timestamp": p.timestamp.isoformat(),
                         "key": fi.key,
-                        "value": fi.value
+                        "value": fi.value,
                     }
                 )
 
         return prediction
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # CREATE RECORD
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def _record_from_prediction(
         self,
@@ -94,9 +95,9 @@ class LentilDatabaseSQLite(LentilDatabase):
             "prediction": json.dumps(self._prediction_to_json(model_output)),
         }
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # INSERT MULTIPLE
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def insert_predictions(
         self,
@@ -106,7 +107,6 @@ class LentilDatabaseSQLite(LentilDatabase):
     ):
 
         cursor = self.conn.cursor()
-
         records = []
 
         for b_exc, model_output in predictions:
@@ -131,7 +131,7 @@ class LentilDatabaseSQLite(LentilDatabase):
              responseDescription, controlGroup, prediction)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            records
+            records,
         )
 
         self.conn.commit()
@@ -139,9 +139,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self.logger.debug(f"Inserted {len(records)} predictions")
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # INSERT SINGLE
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def insert_prediction(
         self,
@@ -173,9 +173,9 @@ class LentilDatabaseSQLite(LentilDatabase):
         self.conn.commit()
         cursor.close()
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # QUERY GRID
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def query_predictions(
         self,
@@ -191,7 +191,7 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         rows = cursor.execute(
             "SELECT * FROM predictions LIMIT ? OFFSET ?",
-            (limit, start_row)
+            (limit, start_row),
         ).fetchall()
 
         row_data = []
@@ -211,12 +211,8 @@ class LentilDatabaseSQLite(LentilDatabase):
                         datetime.fromisoformat(p["timestamp"])
                         for p in prediction
                     ],
-                    "prediction.key": [
-                        p["key"] for p in prediction
-                    ],
-                    "prediction.value": [
-                        p["value"] for p in prediction
-                    ],
+                    "prediction.key": [p["key"] for p in prediction],
+                    "prediction.value": [p["value"] for p in prediction],
                 }
             )
 
@@ -226,12 +222,12 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         return {
             "rowData": row_data,
-            "rowCount": row_count
+            "rowCount": row_count,
         }
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # COUNT
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def count_query_predictions(self):
 
@@ -245,13 +241,13 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         return result[0]
 
-    # ----------------------------------------------------
+    # ---------------------------------------------------
     # EXCEPTION DETAILS
-    # ----------------------------------------------------
+    # ---------------------------------------------------
 
     def get_predictions_by_exception_id(
         self,
-        exception_id: str
+        exception_id: str,
     ):
 
         cursor = self.conn.cursor()
@@ -264,7 +260,7 @@ class LentilDatabaseSQLite(LentilDatabase):
             ORDER BY exceptionTimestamp DESC
             LIMIT 1
             """,
-            (exception_id,)
+            (exception_id,),
         ).fetchone()
 
         cursor.close()
