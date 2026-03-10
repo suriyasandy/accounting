@@ -1,5 +1,5 @@
 """
-Download and storage of data from EPE (Optimized Version)
+Download and storage of data from EPE.
 """
 
 import asyncio
@@ -9,8 +9,6 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Iterator, List, Tuple
-
-from tqdm.asyncio import tqdm
 
 from lentil.cache.storage_interface import StorageInterface
 from lentil.data_fetch.epe.controls import ControlGroup
@@ -22,10 +20,14 @@ from lentil.utilities.log import get_logger
 from lentil.utilities.utils import batches_from_datetimes
 from lentil.cache import USE_S3
 
+
 logger = get_logger(__name__)
 
 
 class ExceptionStatus(Enum):
+    """
+    Different values of the exceptionStatus column in EPE.
+    """
 
     OPEN = {""}
     CLOSED = {"Closed"}
@@ -34,21 +36,67 @@ class ExceptionStatus(Enum):
 
 class ExceptionsFetcher:
     """
-    Optimized EPE exceptions downloader
+    Download and storage of data from EPE.
     """
 
-    MAX_PARALLEL_REQUESTS = 8
-    QUERY_BATCH_SIZE = 8
-    CSV_BUFFER_SIZE = 500
-
     def __init__(self, storage_interface: StorageInterface):
-
         self._epe_store_path = Path("./epe_data")
         self._cache = storage_interface
 
-    # ---------------------------------------------------
-    # Path helpers
-    # ---------------------------------------------------
+    def list_paths(self) -> List[Path]:
+
+        listed_dirs: List[Path] = []
+
+        for control_group in ControlGroup:
+            subdir = self._epe_store_path / control_group.value
+            listed_dirs.extend(self._cache.list_dir(subdir))
+
+        return listed_dirs
+
+    def list_processed_paths(self) -> List[Tuple[Path, ControlGroup]]:
+
+        listed_dirs: List[Tuple[Path, ControlGroup]] = []
+
+        for control_group in ControlGroup:
+            subdir = self._epe_store_path / control_group.value
+
+            for p in self._cache.list_dir(subdir):
+                if p.name != "filtered.csv":
+                    listed_dirs.append((p, control_group))
+
+        return listed_dirs
+
+    def fetch_paths(self, paths: List[Path]) -> Iterator[BusinessException]:
+
+        columns: List[str] = []
+
+        for path in paths:
+
+            with self._cache.open(path, "r") as f:
+
+                reader = DictReader(f)
+
+                if not reader.fieldnames:
+                    continue
+
+                if not columns:
+                    columns = [str(c) for c in reader.fieldnames]
+
+                if columns != reader.fieldnames:
+
+                    mismatch = sorted(list(set(columns) ^ set(reader.fieldnames)))
+
+                    logger.error(
+                        f"Inconsistent headers between files!\n\n"
+                        f"The path {paths[0]} contained fields {sorted(reader.fieldnames)}\n"
+                        f"whereas the path {path} contained fields {columns}.\n"
+                        f"\nThe following fields mismatched: {mismatch}."
+                    )
+
+                    raise RuntimeError("Inconsistent file input headers")
+
+                for row in reader:
+                    yield be_from_dict(row)
 
     def cache_path(
         self,
@@ -57,22 +105,13 @@ class ExceptionsFetcher:
         control_group: ControlGroup,
     ) -> Path:
 
-        t1 = start.strftime("%Y-%m-%d_%H%M%S")
-        t2 = end.strftime("%Y-%m-%d_%H%M%S")
+        t1 = start.strftime(r"%Y-%m-%d_%H%M%S")
+        t2 = end.strftime(r"%Y-%m-%d_%H%M%S")
 
         cg_subdir = self._epe_store_path / control_group.value
         cg_subdir.mkdir(parents=True, exist_ok=True)
 
         return cg_subdir / f"{t1}_to_{t2}.csv"
-
-    # ---------------------------------------------------
-    # Parallel Query Engine
-    # ---------------------------------------------------
-
-    async def _run_query(self, api, query, semaphore):
-
-        async with semaphore:
-            return await api.query(query)
 
     async def query_date_range(
         self,
@@ -82,8 +121,6 @@ class ExceptionsFetcher:
         exception_status: ExceptionStatus,
         control_group: ControlGroup,
     ) -> AsyncGenerator[BusinessException, None]:
-
-        semaphore = asyncio.Semaphore(self.MAX_PARALLEL_REQUESTS)
 
         for status in exception_status.value:
 
@@ -98,158 +135,27 @@ class ExceptionsFetcher:
 
             while True:
 
-                batch = []
+                query = next(queries)
 
-                for _ in range(self.QUERY_BATCH_SIZE):
-                    try:
-                        batch.append(next(queries))
-                    except StopIteration:
-                        break
+                response = await api.query(query)
 
-                if not batch:
+                response = response[vocab[control_group].details_str]
+
+                response_inner: List[dict[str, str]] = response[
+                    vocab[control_group].response_str
+                ]
+
+                if not response_inner:
                     return
 
-                responses = await asyncio.gather(
-                    *[
-                        self._run_query(api, q, semaphore)
-                        for q in batch
-                    ]
-                )
+                for item in response_inner:
+                    header = list(item.keys())
+                    be = BusinessException(header=header)
 
-                for response in responses:
+                    for k, v in item.items():
+                        be[k] = v
 
-                    response = response[vocab[control_group].details_str]
-
-                    response_inner = response[
-                        vocab[control_group].response_str
-                    ]
-
-                    if not response_inner:
-                        continue
-
-                    for item in response_inner:
-
-                        header = list(item.keys())
-
-                        be = BusinessException(header=header)
-
-                        for k, v in item.items():
-                            be[k] = v
-
-                        yield be
-
-    # ---------------------------------------------------
-    # Downloader
-    # ---------------------------------------------------
-
-    async def download_date_range_async(
-        self,
-        start: datetime,
-        end: datetime,
-        exception_status: ExceptionStatus,
-        control_group: ControlGroup,
-        batched: bool,
-        whole_days_only: bool = False,
-    ):
-
-        api = ExceptionsAPI()
-
-        logger.info(f"Downloading exceptions between {start} and {end}")
-
-        # -------------------------
-        # Parallel batching
-        # -------------------------
-
-        if batched:
-
-            batch_datetimes = list(batches_from_datetimes(start, end))
-
-            if whole_days_only:
-                batch_datetimes = batch_datetimes[1:-2]
-
-            tasks = []
-
-            for batch_start, batch_end in batch_datetimes:
-
-                tasks.append(
-                    self.download_date_range_async(
-                        start=batch_start,
-                        end=batch_end,
-                        exception_status=exception_status,
-                        control_group=control_group,
-                        batched=False,
-                    )
-                )
-
-            await asyncio.gather(*tasks)
-
-            return
-
-        # -------------------------
-        # File path
-        # -------------------------
-
-        path = self.cache_path(start, end, control_group)
-
-        if self._cache.path_exists(path):
-
-            logger.info(f"Found cached path {path}")
-
-            return
-
-        logger.debug(f"Store opening path {path}")
-
-        exception_rows = self.query_date_range(
-            api,
-            start,
-            end,
-            exception_status,
-            control_group,
-        )
-
-        with self._cache.open(path, "w") as f:
-
-            writer = None
-            buffer = []
-
-            async for row in tqdm(exception_rows, desc=f"Downloading {path}"):
-
-                buffer.append(row)
-
-                if writer is None:
-                    writer = DictWriter(f, fieldnames=row.keys())
-                    writer.writeheader()
-
-                if len(buffer) >= self.CSV_BUFFER_SIZE:
-
-                    writer.writerows(buffer)
-                    buffer.clear()
-
-            if buffer:
-                writer.writerows(buffer)
-
-            # -------------------------
-            # Optional S3 upload
-            # -------------------------
-
-            if USE_S3:
-
-                data = f.getvalue()
-
-                path_str = str(path).replace("\\", "/")
-                path_str = f"lentil/{path_str}"
-
-                logger.debug(f"Uploading to path: {path_str}")
-
-                self._cache.upload_file(path_str, data)
-
-                logger.debug("File uploaded successfully!")
-
-        logger.info(f"Downloaded file {path}")
-
-    # ---------------------------------------------------
-    # Sync Wrapper
-    # ---------------------------------------------------
+                    yield be
 
     def download_date_range_asyncio(
         self,
@@ -270,70 +176,99 @@ class ExceptionsFetcher:
             )
         )
 
-    # ---------------------------------------------------
-    # File Readers
-    # ---------------------------------------------------
-
-    def list_paths(self) -> List[Path]:
-
-        listed_dirs: List[Path] = []
-
-        for control_group in ControlGroup:
-
-            subdir = self._epe_store_path / control_group.value
-
-            listed_dirs.extend(self._cache.list_dir(subdir))
-
-        return listed_dirs
-
-    def list_processed_paths(self) -> List[Tuple[Path, ControlGroup]]:
-
-        listed_dirs: List[Tuple[Path, ControlGroup]] = []
-
-        for control_group in ControlGroup:
-
-            subdir = self._epe_store_path / control_group.value
-
-            for p in self._cache.list_dir(subdir):
-
-                if p.name != "filtered.csv":
-
-                    listed_dirs.append((p, control_group))
-
-        return listed_dirs
-
-    def fetch_paths(
+    async def download_date_range_async(
         self,
-        paths: List[Path],
-    ) -> Iterator[BusinessException]:
+        start: datetime,
+        end: datetime,
+        exception_status: ExceptionStatus,
+        control_group: ControlGroup,
+        batched: bool,
+        whole_days_only: bool = False,
+    ):
 
-        columns: List[str] = []
+        api = ExceptionsAPI()
 
-        for path in paths:
+        logger.info(f"Downloading exceptions between {start} and {end}")
 
-            with self._cache.open(path, "r") as f:
+        if batched:
 
-                reader = DictReader(f)
+            batch_datetimes = list(batches_from_datetimes(start, end))
 
-                if not reader.fieldnames:
-                    continue
+            if whole_days_only:
+                batch_datetimes = batch_datetimes[1:-2]
 
-                if not columns:
-                    columns = [str(c) for c in reader.fieldnames]
+            for batch_start, batch_end in batch_datetimes:
 
-                if columns != reader.fieldnames:
+                await self.download_date_range_async(
+                    start=batch_start,
+                    end=batch_end,
+                    exception_status=exception_status,
+                    control_group=control_group,
+                    batched=False,
+                )
 
-                    mismatch = sorted(
-                        list(set(columns) ^ set(reader.fieldnames))
-                    )
+            return
 
-                    logger.error(
-                        f"Inconsistent headers between files!\n"
-                        f"Mismatch fields: {mismatch}"
-                    )
+        path = self.cache_path(start, end, control_group)
 
-                    raise RuntimeError("Inconsistent file input headers")
+        if self._cache.path_exists(path):
+            logger.info(f"Found cached path {path}")
+            return
 
-                for row in reader:
+        exception_rows = self.query_date_range(
+            api,
+            start,
+            end,
+            exception_status,
+            control_group=control_group,
+        )
 
-                    yield be_from_dict(row)
+        logger.debug(f"Store opening path {path}")
+
+        with self._cache.open(path, "w") as f:
+
+            try:
+                task = asyncio.ensure_future(exception_rows.__anext__())
+                first_row = (await asyncio.gather(task))[0]
+
+            except StopAsyncIteration:
+                logger.warning(f"Empty response downloading {path}")
+                return
+
+            writer: DictWriter[str] = DictWriter(f, fieldnames=first_row.keys())
+            writer.writeheader()
+
+            rows_buffer = []
+            rows_buffer.append(first_row)
+
+            BATCH_SIZE = 2000
+            total_rows = 1
+
+            async for line in exception_rows:
+
+                rows_buffer.append(line)
+                total_rows += 1
+
+                if len(rows_buffer) >= BATCH_SIZE:
+                    writer.writerows(rows_buffer)
+                    rows_buffer.clear()
+
+                if total_rows % 10000 == 0:
+                    logger.info(f"Downloaded {total_rows} rows...")
+
+            if rows_buffer:
+                writer.writerows(rows_buffer)
+
+        if USE_S3:
+
+            data = f.getvalue()
+            path = str(path).replace("\\", "/")
+            path = f"lentil/{path}"
+
+            logger.debug(f"Uploading to path: {path}")
+
+            self._cache.upload_file(path, data)
+
+            logger.debug("File uploaded successfully!")
+
+        logger.info(f"Downloaded file {path}")
