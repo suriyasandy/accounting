@@ -23,7 +23,6 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self.conn.row_factory = sqlite3.Row
 
-        # Better concurrency
         self.conn.execute("PRAGMA journal_mode=WAL")
 
         self._init_tables()
@@ -52,7 +51,7 @@ class LentilDatabaseSQLite(LentilDatabase):
         cursor.close()
 
     # ----------------------------------------------------
-    # BUILD RECORD
+    # CREATE RECORD
     # ----------------------------------------------------
 
     def _record_from_prediction(
@@ -116,8 +115,6 @@ class LentilDatabaseSQLite(LentilDatabase):
         self.conn.commit()
         cursor.close()
 
-        self.logger.debug(f"Inserted {len(records)} predictions")
-
     # ----------------------------------------------------
     # REQUIRED ABSTRACT METHOD
     # ----------------------------------------------------
@@ -153,7 +150,43 @@ class LentilDatabaseSQLite(LentilDatabase):
         cursor.close()
 
     # ----------------------------------------------------
-    # QUERY PREDICTIONS (UI GRID)
+    # PARSE PREDICTION STRING
+    # ----------------------------------------------------
+
+    def _parse_prediction(self, prediction_str):
+
+        prediction_key = []
+        prediction_value = []
+        prediction_timestamp = []
+
+        try:
+
+            # extract keys
+            keys = re.findall(r"key='([^']*)'", prediction_str)
+
+            # extract values
+            values = re.findall(r"value='([^']*)'", prediction_str)
+
+            # extract timestamps
+            timestamps = re.findall(
+                r"timestamp=datetime\.datetime\((.*?)\)",
+                prediction_str
+            )
+
+            prediction_key = keys
+            prediction_value = values
+
+            for t in timestamps:
+                prediction_timestamp.append(t)
+
+        except Exception as e:
+
+            self.logger.warning(f"Prediction parsing failed: {e}")
+
+        return prediction_timestamp, prediction_key, prediction_value
+
+    # ----------------------------------------------------
+    # GRID QUERY
     # ----------------------------------------------------
 
     def query_predictions(
@@ -177,26 +210,7 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         for row in rows:
 
-            raw_prediction = row["prediction"]
-
-            prediction_key = []
-            prediction_value = []
-            prediction_timestamp = []
-
-            try:
-
-                # Extract FeatureImportance keys
-                keys = re.findall(r"key='([^']*)'", raw_prediction)
-
-                # Extract FeatureImportance values
-                values = re.findall(r"value='([^']*)'", raw_prediction)
-
-                prediction_key = keys
-                prediction_value = values
-
-            except Exception as e:
-
-                self.logger.warning(f"Prediction parsing failed: {e}")
+            ts, keys, values = self._parse_prediction(row["prediction"])
 
             row_data.append(
                 {
@@ -205,9 +219,9 @@ class LentilDatabaseSQLite(LentilDatabase):
                     "responseCode": row["responseCode"],
                     "responseDescription": row["responseDescription"],
                     "controlGroup": row["controlGroup"],
-                    "prediction.timestamp": prediction_timestamp,
-                    "prediction.key": prediction_key,
-                    "prediction.value": prediction_value,
+                    "prediction.timestamp": ts,
+                    "prediction.key": keys,
+                    "prediction.value": values,
                 }
             )
 
@@ -237,7 +251,7 @@ class LentilDatabaseSQLite(LentilDatabase):
         return result[0]
 
     # ----------------------------------------------------
-    # GET BY EXCEPTION
+    # DETAILS PAGE QUERY
     # ----------------------------------------------------
 
     def get_predictions_by_exception_id(
@@ -247,16 +261,14 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         cursor = self.conn.cursor()
 
-        query = """
-        SELECT *
-        FROM predictions
-        WHERE exceptionId = ?
-        ORDER BY exceptionTimestamp DESC
-        LIMIT 1
-        """
-
         row = cursor.execute(
-            query,
+            """
+            SELECT *
+            FROM predictions
+            WHERE exceptionId = ?
+            ORDER BY exceptionTimestamp DESC
+            LIMIT 1
+            """,
             (exception_id,)
         ).fetchone()
 
@@ -265,4 +277,15 @@ class LentilDatabaseSQLite(LentilDatabase):
         if row is None:
             return {}
 
-        return dict(row)
+        ts, keys, values = self._parse_prediction(row["prediction"])
+
+        return {
+            "exceptionId": row["exceptionId"],
+            "exceptionTimestamp": row["exceptionTimestamp"],
+            "responseCode": row["responseCode"],
+            "responseDescription": row["responseDescription"],
+            "controlGroup": row["controlGroup"],
+            "prediction.timestamp": ts,
+            "prediction.key": keys,
+            "prediction.value": values,
+        }
