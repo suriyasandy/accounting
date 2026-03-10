@@ -1,0 +1,63 @@
+from datetime import datetime
+from typing import Iterator
+
+from lentil.data_fetch.epe.vocab import vocab
+from lentil.data_fetch.epe.controls import ControlGroup
+
+
+class EPEQueryConfig:
+
+    def __init__(
+        self,
+        from_datetime: datetime,
+        to_datetime: datetime,
+        control_group: ControlGroup,
+        exception_status: str = "Closed",
+    ):
+        self.control_group: ControlGroup = control_group
+        self.exception_status: str = exception_status
+        self.from_datetime: datetime = from_datetime
+        self.to_datetime: datetime = to_datetime
+
+
+def query_iter(config: EPEQueryConfig) -> Iterator[str]:
+    """
+    Optimized query iterator for EPE GraphQL API.
+    Keeps same function signature and behaviour.
+    """
+
+    vcb = vocab[config.control_group]
+
+    from_date = config.from_datetime.isoformat()
+    to_date = config.to_datetime.isoformat()
+
+    newline = "\n"
+
+    offset = 0
+    limit = 20000
+
+    columns = newline.join(vcb.columns)
+
+    while True:
+
+        query = f"""
+        query {{
+            {vcb.details_str}(epeRequest: {{
+                controlGroup: "{config.control_group.value}"
+                exceptionStatus: "{config.exception_status}"
+                fromDate: "{from_date}"
+                toDate: "{to_date}"
+                limit: {limit}
+                offSet: {offset}
+            }}) {{
+                {vcb.response_str} {{
+                    {columns}
+                }}
+            }}
+        }}
+        """
+
+        yield query
+
+        # increment AFTER yielding
+        offset += limit
