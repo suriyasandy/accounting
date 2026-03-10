@@ -1,0 +1,41 @@
+import json
+import ast
+
+for row in rows:
+
+    prediction_timestamp = []
+    prediction_key = []
+    prediction_value = []
+
+    raw_prediction = row["prediction"]
+
+    try:
+        # Try JSON first (new data)
+        prediction_data = json.loads(raw_prediction)
+
+    except Exception:
+        try:
+            # Fallback for old stored data
+            prediction_data = ast.literal_eval(raw_prediction)
+        except Exception as e:
+            self.logger.warning(f"Prediction parsing failed: {e}")
+            prediction_data = []
+
+    for p in prediction_data:
+
+        prediction_timestamp.append(str(p.get("timestamp", "")))
+        prediction_key.append(str(p.get("key", "")))
+        prediction_value.append(str(p.get("value", "")))
+
+    row_data.append(
+        {
+            "exceptionId": row["exceptionId"],
+            "exceptionTimestamp": row["exceptionTimestamp"],
+            "responseCode": row["responseCode"],
+            "responseDescription": row["responseDescription"],
+            "controlGroup": row["controlGroup"],
+            "prediction.timestamp": prediction_timestamp,
+            "prediction.key": prediction_key,
+            "prediction.value": prediction_value,
+        }
+    )
