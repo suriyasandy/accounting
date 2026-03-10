@@ -1,41 +1,103 @@
-import json
-import ast
+from pathlib import Path
+from typing import Iterator, List, Tuple
+import csv
 
-for row in rows:
+from lentil.model.controls import ControlGroup
+from lentil.model.business_exception import BusinessException
 
-    prediction_timestamp = []
-    prediction_key = []
-    prediction_value = []
 
-    raw_prediction = row["prediction"]
+class ExceptionsFetcher:
+    """
+    Fetch and load EPE exception CSV files stored locally.
+    """
 
-    try:
-        # Try JSON first (new data)
-        prediction_data = json.loads(raw_prediction)
+    def __init__(self):
 
-    except Exception:
-        try:
-            # Fallback for old stored data
-            prediction_data = ast.literal_eval(raw_prediction)
-        except Exception as e:
-            self.logger.warning(f"Prediction parsing failed: {e}")
-            prediction_data = []
+        # root folder where exception CSVs are stored
+        self._epe_store_path = Path("epe_data")
 
-    for p in prediction_data:
+        # create folder if missing
+        self._epe_store_path.mkdir(parents=True, exist_ok=True)
 
-        prediction_timestamp.append(str(p.get("timestamp", "")))
-        prediction_key.append(str(p.get("key", "")))
-        prediction_value.append(str(p.get("value", "")))
+    # ---------------------------------------------------
+    # LIST FILES
+    # ---------------------------------------------------
 
-    row_data.append(
-        {
-            "exceptionId": row["exceptionId"],
-            "exceptionTimestamp": row["exceptionTimestamp"],
-            "responseCode": row["responseCode"],
-            "responseDescription": row["responseDescription"],
-            "controlGroup": row["controlGroup"],
-            "prediction.timestamp": prediction_timestamp,
-            "prediction.key": prediction_key,
-            "prediction.value": prediction_value,
-        }
-    )
+    def list_paths(self) -> List[Path]:
+        """
+        List all CSV files downloaded into epe_data.
+        """
+
+        listed_dirs: List[Path] = []
+
+        for control_group in ControlGroup:
+
+            subdir = self._epe_store_path / control_group.value
+
+            if not subdir.exists():
+                continue
+
+            for p in subdir.iterdir():
+
+                if p.suffix == ".csv":
+                    listed_dirs.append(p)
+
+        return listed_dirs
+
+    # ---------------------------------------------------
+
+    def list_processed_paths(self) -> List[Tuple[Path, ControlGroup]]:
+        """
+        List downloaded CSV files along with their control group.
+        Excludes filtered.csv output file.
+        """
+
+        listed_dirs: List[Tuple[Path, ControlGroup]] = []
+
+        for control_group in ControlGroup:
+
+            subdir = self._epe_store_path / control_group.value
+
+            if not subdir.exists():
+                continue
+
+            for p in subdir.iterdir():
+
+                if p.name == "filtered.csv":
+                    continue
+
+                if p.suffix == ".csv":
+                    listed_dirs.append((p, control_group))
+
+        return listed_dirs
+
+    # ---------------------------------------------------
+    # LOAD CSV DATA
+    # ---------------------------------------------------
+
+    def fetch_paths(
+        self,
+        paths: List[Path],
+    ) -> Iterator[BusinessException]:
+        """
+        Load exceptions from multiple CSV files.
+        """
+
+        for path in paths:
+
+            yield from self._load_csv(path)
+
+    # ---------------------------------------------------
+
+    def _load_csv(self, path: Path) -> Iterator[BusinessException]:
+        """
+        Load a single CSV file and convert rows into BusinessException objects.
+        """
+
+        with open(path, newline="", encoding="utf-8") as f:
+
+            reader = csv.DictReader(f)
+
+            for row in reader:
+
+                yield BusinessException(row)
