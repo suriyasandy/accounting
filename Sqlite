@@ -1,0 +1,189 @@
+import sqlite3
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, Iterator, List, Mapping
+
+from lentil.database.lentil_db_base import LentilDatabase
+from lentil.model.business_exception import BusinessException
+from lentil.model.output import FeatureImportance, PredictorModelOutput
+from lentil.utilities.log import get_logger
+
+
+class LentilDatabaseSQLite(LentilDatabase):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.logger = get_logger(__name__)
+        self.conn = sqlite3.connect("lentil.db", check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.cursor = self.conn.cursor()
+
+        self._init_tables()
+
+    def _init_tables(self):
+
+        self.cursor.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exceptionId TEXT,
+            exceptionTimestamp TEXT,
+            responseCode TEXT,
+            responseDescription TEXT,
+            controlGroup TEXT,
+            prediction TEXT
+        )
+        """)
+
+        self.conn.commit()
+
+    def _record_from_prediction(
+        self,
+        b_exc: BusinessException,
+        model_output: List[PredictorModelOutput],
+    ) -> Mapping[str, Any]:
+
+        if not model_output:
+            raise Exception("Cannot create record from empty predictions")
+
+        return {
+            "exceptionId": b_exc.exception_id,
+            "exceptionTimestamp": b_exc.exception_timestamp.isoformat(),
+            "responseCode": b_exc.response_code,
+            "responseDescription": b_exc.response_description,
+            "controlGroup": model_output[0].control_group.value,
+            "prediction": str(model_output),
+        }
+
+    def insert_predictions(
+        self,
+        predictions: Iterator[
+            (
+                BusinessException,
+                List[PredictorModelOutput],
+            )
+        ],
+    ):
+
+        records = []
+
+        for b_exc, model_output in predictions:
+
+            record = self._record_from_prediction(b_exc, model_output)
+
+            records.append((
+                record["exceptionId"],
+                record["exceptionTimestamp"],
+                record["responseCode"],
+                record["responseDescription"],
+                record["controlGroup"],
+                record["prediction"]
+            ))
+
+        self.cursor.executemany(
+            """
+            INSERT INTO predictions
+            (exceptionId, exceptionTimestamp, responseCode,
+             responseDescription, controlGroup, prediction)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            records,
+        )
+
+        self.conn.commit()
+
+        self.logger.debug(f"Inserted {len(records)} predictions")
+
+    def insert_prediction(
+        self,
+        b_exc: BusinessException,
+        model_output: List[PredictorModelOutput],
+    ):
+
+        record = self._record_from_prediction(b_exc, model_output)
+
+        self.cursor.execute(
+            """
+            INSERT INTO predictions
+            (exceptionId, exceptionTimestamp, responseCode,
+             responseDescription, controlGroup, prediction)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["exceptionId"],
+                record["exceptionTimestamp"],
+                record["responseCode"],
+                record["responseDescription"],
+                record["controlGroup"],
+                record["prediction"],
+            ),
+        )
+
+        self.conn.commit()
+
+    def query_predictions(
+        self,
+        start_row: int,
+        end_row: int,
+        sort_model: List[Dict[str, str]],
+        filter_model: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+
+        limit = end_row - start_row
+
+        query = "SELECT * FROM predictions LIMIT ? OFFSET ?"
+
+        rows = self.cursor.execute(query, (limit, start_row)).fetchall()
+
+        row_data = []
+
+        for row in rows:
+
+            row_data.append(
+                {
+                    "exceptionId": row["exceptionId"],
+                    "exceptionTimestamp": row["exceptionTimestamp"],
+                    "responseCode": row["responseCode"],
+                    "responseDescription": row["responseDescription"],
+                    "controlGroup": row["controlGroup"],
+                    "prediction.timestamp": [],
+                    "prediction.key": [],
+                    "prediction.value": [],
+                }
+            )
+
+        row_count = self.count_query_predictions(filter_model)
+
+        return {"rowData": row_data, "rowCount": row_count}
+
+    def count_query_predictions(self, filter_model):
+
+        result = self.cursor.execute(
+            "SELECT COUNT(*) FROM predictions"
+        ).fetchone()
+
+        return result[0]
+
+    def get_predictions_by_exception_id(self, exception_id: str):
+
+        query = """
+        SELECT * FROM predictions
+        WHERE exceptionId = ?
+        ORDER BY exceptionTimestamp DESC
+        LIMIT 1
+        """
+
+        row = self.cursor.execute(query, (exception_id,)).fetchone()
+
+        if row is None:
+            return {}
+
+        return {
+            "exceptionId": row["exceptionId"],
+            "exceptionTimestamp": row["exceptionTimestamp"],
+            "responseCode": row["responseCode"],
+            "responseDescription": row["responseDescription"],
+            "controlGroup": row["controlGroup"],
+            "prediction": row["prediction"],
+        }
