@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Mapping
+from typing import Any, Dict, Iterator, List, Mapping, Tuple
 
 from lentil.database.lentil_db_base import LentilDatabase
 from lentil.model.business_exception import BusinessException
@@ -12,7 +12,6 @@ from lentil.utilities.log import get_logger
 class LentilDatabaseSQLite(LentilDatabase):
 
     def __init__(self):
-
         super().__init__()
 
         self.logger = get_logger(__name__)
@@ -58,12 +57,7 @@ class LentilDatabaseSQLite(LentilDatabase):
 
     def insert_predictions(
         self,
-        predictions: Iterator[
-            (
-                BusinessException,
-                List[PredictorModelOutput],
-            )
-        ],
+        predictions: Iterator[Tuple[BusinessException, List[PredictorModelOutput]]],
     ):
 
         records = []
@@ -72,14 +66,16 @@ class LentilDatabaseSQLite(LentilDatabase):
 
             record = self._record_from_prediction(b_exc, model_output)
 
-            records.append((
-                record["exceptionId"],
-                record["exceptionTimestamp"],
-                record["responseCode"],
-                record["responseDescription"],
-                record["controlGroup"],
-                record["prediction"]
-            ))
+            records.append(
+                (
+                    record["exceptionId"],
+                    record["exceptionTimestamp"],
+                    record["responseCode"],
+                    record["responseDescription"],
+                    record["controlGroup"],
+                    record["prediction"],
+                )
+            )
 
         self.cursor.executemany(
             """
@@ -132,9 +128,10 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         limit = end_row - start_row
 
-        query = "SELECT * FROM predictions LIMIT ? OFFSET ?"
-
-        rows = self.cursor.execute(query, (limit, start_row)).fetchall()
+        rows = self.cursor.execute(
+            "SELECT * FROM predictions LIMIT ? OFFSET ?",
+            (limit, start_row),
+        ).fetchall()
 
         row_data = []
 
