@@ -1,5 +1,6 @@
 import sqlite3
-import json
+import ast
+import re
 from typing import Any, Dict, Iterator, List, Mapping, Tuple
 
 from lentil.database.lentil_db_base import LentilDatabase
@@ -25,9 +26,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self._init_tables()
 
-    # -----------------------------
+    # ---------------------------------------------------
     # TABLE CREATION
-    # -----------------------------
+    # ---------------------------------------------------
 
     def _init_tables(self):
 
@@ -48,9 +49,9 @@ class LentilDatabaseSQLite(LentilDatabase):
         self.conn.commit()
         cursor.close()
 
-    # -----------------------------
+    # ---------------------------------------------------
     # CREATE RECORD
-    # -----------------------------
+    # ---------------------------------------------------
 
     def _record_from_prediction(
         self,
@@ -61,28 +62,18 @@ class LentilDatabaseSQLite(LentilDatabase):
         if not model_output:
             raise Exception("Cannot create record from empty predictions")
 
-        prediction_list = []
-
-        for p in model_output:
-
-            prediction_list.append({
-                "timestamp": str(getattr(p, "timestamp", "")),
-                "key": str(getattr(p, "key", "")),
-                "value": str(getattr(p, "value", ""))
-            })
-
         return {
             "exceptionId": b_exc.exception_id,
             "exceptionTimestamp": b_exc.exception_timestamp.isoformat(),
             "responseCode": b_exc.response_code,
             "responseDescription": b_exc.response_description,
             "controlGroup": model_output[0].control_group.value,
-            "prediction": json.dumps(prediction_list),
+            "prediction": str(model_output)
         }
 
-    # -----------------------------
+    # ---------------------------------------------------
     # INSERT MULTIPLE
-    # -----------------------------
+    # ---------------------------------------------------
 
     def insert_predictions(
         self,
@@ -125,43 +116,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self.logger.debug(f"Inserted {len(records)} predictions")
 
-    # -----------------------------
-    # INSERT SINGLE
-    # -----------------------------
-
-    def insert_prediction(
-        self,
-        b_exc: BusinessException,
-        model_output: List[PredictorModelOutput],
-    ):
-
-        record = self._record_from_prediction(b_exc, model_output)
-
-        cursor = self.conn.cursor()
-
-        cursor.execute(
-            """
-            INSERT INTO predictions
-            (exceptionId, exceptionTimestamp, responseCode,
-             responseDescription, controlGroup, prediction)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record["exceptionId"],
-                record["exceptionTimestamp"],
-                record["responseCode"],
-                record["responseDescription"],
-                record["controlGroup"],
-                record["prediction"],
-            ),
-        )
-
-        self.conn.commit()
-        cursor.close()
-
-    # -----------------------------
-    # QUERY PREDICTIONS
-    # -----------------------------
+    # ---------------------------------------------------
+    # QUERY PREDICTIONS (FIXED)
+    # ---------------------------------------------------
 
     def query_predictions(
         self,
@@ -188,16 +145,25 @@ class LentilDatabaseSQLite(LentilDatabase):
             prediction_key = []
             prediction_value = []
 
+            raw_prediction = row["prediction"]
+
             try:
 
-                prediction_data = json.loads(row["prediction"])
+                # Extract keys
+                keys = re.findall(r"key='([^']*)'", raw_prediction)
 
-                for p in prediction_data:
-                    prediction_timestamp.append(p.get("timestamp"))
-                    prediction_key.append(p.get("key"))
-                    prediction_value.append(p.get("value"))
+                # Extract values
+                values = re.findall(r"value='([^']*)'", raw_prediction)
+
+                # Extract timestamps
+                timestamps = re.findall(r"timestamp='([^']*)'", raw_prediction)
+
+                prediction_key = keys
+                prediction_value = values
+                prediction_timestamp = timestamps
 
             except Exception as e:
+
                 self.logger.warning(f"Prediction parsing failed: {e}")
 
             row_data.append(
@@ -213,7 +179,7 @@ class LentilDatabaseSQLite(LentilDatabase):
                 }
             )
 
-        row_count = self.count_query_predictions(filter_model)
+        row_count = self.count_query_predictions()
 
         cursor.close()
 
@@ -222,11 +188,11 @@ class LentilDatabaseSQLite(LentilDatabase):
             "rowCount": row_count
         }
 
-    # -----------------------------
+    # ---------------------------------------------------
     # COUNT
-    # -----------------------------
+    # ---------------------------------------------------
 
-    def count_query_predictions(self, filter_model):
+    def count_query_predictions(self):
 
         cursor = self.conn.cursor()
 
@@ -238,9 +204,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         return result[0]
 
-    # -----------------------------
+    # ---------------------------------------------------
     # GET BY EXCEPTION ID
-    # -----------------------------
+    # ---------------------------------------------------
 
     def get_predictions_by_exception_id(
         self,
@@ -250,7 +216,8 @@ class LentilDatabaseSQLite(LentilDatabase):
         cursor = self.conn.cursor()
 
         query = """
-        SELECT * FROM predictions
+        SELECT *
+        FROM predictions
         WHERE exceptionId = ?
         ORDER BY exceptionTimestamp DESC
         LIMIT 1
@@ -266,13 +233,4 @@ class LentilDatabaseSQLite(LentilDatabase):
         if row is None:
             return {}
 
-        prediction = json.loads(row["prediction"])
-
-        return {
-            "exceptionId": row["exceptionId"],
-            "exceptionTimestamp": row["exceptionTimestamp"],
-            "responseCode": row["responseCode"],
-            "responseDescription": row["responseDescription"],
-            "controlGroup": row["controlGroup"],
-            "prediction": prediction,
-        }
+        return dict(row)
