@@ -1,14 +1,12 @@
-"""
-Wrapper for EPE's GraphQL API.
-"""
-
 import logging
 import asyncio
+
 from datetime import datetime, timedelta
 
 import httpx
 
 from lentil.env import LentilEnv
+
 
 logging.getLogger("httpx").setLevel(logging.ERROR)
 
@@ -16,6 +14,13 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 class ExceptionsAPI:
 
     def __init__(self):
+
+        # Ensure asyncio event loop exists (required for waitress threads)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
         self.endpoint = LentilEnv.EPE_GRAPHQL_API_URL
         self.username = LentilEnv.EPE_GRAPHQL_API_USERNAME
@@ -27,14 +32,17 @@ class ExceptionsAPI:
         self.token_timestamp = datetime.fromtimestamp(0)
         self.access_token = ""
 
-        # lock prevents multiple token refresh calls
+        # Prevent concurrent token refresh
         self._token_lock = asyncio.Lock()
 
-        # reuse http connection (10x faster)
+        # Reuse HTTP connections (important for performance)
         self.client = httpx.AsyncClient(
             verify=False,
             timeout=httpx.Timeout(20.0, read=300.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10
+            ),
         )
 
     async def refresh_token(self):
@@ -65,7 +73,10 @@ class ExceptionsAPI:
             "client_secret": self.client_secret,
         }
 
-        resp = await self.client.post(self.oauth, data=oauth_params)
+        resp = await self.client.post(
+            self.oauth,
+            data=oauth_params
+        )
 
         try:
             token = resp.json()["access_token"]
