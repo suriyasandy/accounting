@@ -1,0 +1,148 @@
+"""The asynchronous task for running a model on a live data feed."""
+
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+from pprint import pformat
+from typing import List, Tuple
+
+import httpx
+
+from lentil.cache import cache
+from lentil.data_fetch.epe.controls import ControlGroup
+from lentil.data_fetch.epe.epe_fetcher import ExceptionsFetcher, ExceptionStatus
+from lentil.data_fetch.epe.exceptions_api import ExceptionsAPI
+
+from lentil.database.lentil_db import lentil_db
+
+from lentil.model.business_exception import BusinessException
+from lentil.model.output import PredictorModelOutput
+from lentil.model.predictor_model import PredictorModel
+from lentil.model.simple_encoder import SimpleEncoder
+
+from lentil.task.tasks.async_task_thread import AsyncTaskThread
+from lentil.utilities.log import get_logger
+
+
+logger = get_logger(__name__)
+
+
+class LiveInferenceTask(AsyncTaskThread):
+    """An asynchronous task for running a model on a live data feed."""
+
+    def __init__(self, model_paths: List[Path]):
+        """Construct a new live inference task from the given models."""
+
+        super().__init__()
+
+        self.task_name = type(self).__name__
+
+        # Load trained models
+        self.models: List[PredictorModel] = [
+            PredictorModel.load_from_pkl(path) for path in model_paths
+        ]
+
+        control_groups = {m.control_group for m in self.models}
+
+        if len(control_groups) != 1:
+            raise RuntimeError(
+                "The union of model control groups must be exactly length 1"
+            )
+
+        self.control_group: ControlGroup = next(iter(control_groups))
+
+        self.epe_api = ExceptionsAPI()
+        self.epe_fetcher = ExceptionsFetcher(cache)
+
+    async def _task_loop(self):
+
+        """
+        Once every minute:
+        - Pull latest exceptions
+        - Run model inference
+        - Store predictions in SQLite
+        """
+
+        dt = timedelta(minutes=1)
+
+        lag = timedelta(seconds=10)
+
+        next_time = datetime.now() - lag
+
+        while not self.cancel_flag.is_set():
+
+            from_dt = next_time - dt
+            to_dt = next_time
+
+            logger.debug(
+                f"Thread {self.thread_uuid} streaming up to {to_dt.isoformat()}"
+            )
+
+            exceptions_and_predictions: List[
+                Tuple[BusinessException, List[PredictorModelOutput]]
+            ] = []
+
+            try:
+
+                async for b_exc in self.epe_fetcher.query_date_range(
+                    self.epe_api,
+                    from_dt,
+                    to_dt,
+                    exception_status=ExceptionStatus.OPEN,
+                    control_group=self.control_group,
+                ):
+
+                    logger.debug(
+                        f"Processing exception_id={b_exc.exception_id}"
+                    )
+
+                    predictions: List[PredictorModelOutput] = []
+
+                    for model in self.models:
+
+                        prediction = model.inference_single(b_exc)
+
+                        if prediction.value != SimpleEncoder.MISSING:
+                            predictions.append(prediction)
+
+                    if predictions:
+                        logger.info(
+                            f"Prediction {pformat(predictions)}"
+                        )
+
+                        exceptions_and_predictions.append((b_exc, predictions))
+
+                next_time += dt
+
+                sleepy_time = (lag + next_time - datetime.now()).total_seconds()
+
+            except httpx.ConnectError as e:
+
+                logger.warning(e)
+
+                sleepy_time = dt.total_seconds()
+
+            # -----------------------------
+            # STORE PREDICTIONS (SQLite)
+            # -----------------------------
+
+            if exceptions_and_predictions:
+
+                try:
+                    lentil_db.insert_predictions(
+                        iter(exceptions_and_predictions)
+                    )
+
+                    logger.info(
+                        f"Inserted {len(exceptions_and_predictions)} predictions into SQLite"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Failed to insert predictions: {e}")
+
+            logger.debug(
+                f"Thread {self.thread_uuid} sleeping for {sleepy_time} secs"
+            )
+
+            if sleepy_time > 0:
+                await asyncio.sleep(sleepy_time)
