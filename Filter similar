@@ -1,0 +1,210 @@
+import csv
+import logging
+from argparse import Namespace
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterator, Set
+
+import numpy as np
+from frozendict import frozendict
+from tqdm import tqdm
+
+from lentil.cache import cache
+from lentil.data.fetch.epe.epe_fetcher import ExceptionsFetcher
+from lentil.model.business_exception import BusinessException
+
+
+logging.basicConfig()
+logging.root.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def main(args: Namespace):
+    """Entry point for filtering training data."""
+
+    ef = ExceptionsFetcher()
+
+    # UPDATED: use list_processed_paths()
+    all_paths_and_cgs = ef.list_processed_paths()
+
+    logger.info(f"Found files: {all_paths_and_cgs}")
+
+    cg_paths = [
+        path for (path, cg) in all_paths_and_cgs
+        if cg == args.control_group
+    ]
+
+    if not cg_paths:
+        logger.warning("No files found for control group.")
+        return
+
+    # First iterator
+    exceptions = ef.fetch_paths(cg_paths)
+    all_columns = get_all_columns(exceptions)
+
+    # Need fresh iterator
+    exceptions = ef.fetch_paths(cg_paths)
+    usable_columns = get_usable_columns(exceptions, all_columns)
+
+    # Apply user "do not exclude"
+    do_not_exclude_columns = {str(col) for col in args.columns_do_not_exclude}
+
+    if do_not_exclude_columns - all_columns:
+        raise RuntimeError(
+            f"Columns {do_not_exclude_columns - all_columns} requested "
+            f"in do_not_exclude_columns but not found in dataset"
+        )
+
+    usable_columns |= do_not_exclude_columns
+
+    # Fresh iterator again
+    exceptions = ef.fetch_paths(cg_paths)
+
+    filtered_exceptions = filter_unique_usable_exceptions(
+        exceptions,
+        usable_columns,
+    )
+
+    filtered_exceptions_path = (
+        Path("epe_data") /
+        Path(args.control_group.value) /
+        "filtered.csv"
+    )
+
+    with cache.open(filtered_exceptions_path, "w") as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=sorted(usable_columns),
+        )
+
+        writer.writeheader()
+
+        for filtered_item in filtered_exceptions:
+            writer.writerow(filtered_item)
+
+    logger.info(f"Filtered dataset written to {filtered_exceptions_path}")
+
+
+# -------------------------------------------------------
+# COLUMN DISCOVERY
+# -------------------------------------------------------
+
+def get_all_columns(
+    exceptions: Iterator[BusinessException],
+) -> Set[str]:
+
+    """Return all column names in the dataset."""
+
+    try:
+        first_exception = next(exceptions)
+    except StopIteration:
+        raise RuntimeError("No exceptions found to analyze.")
+
+    return set(first_exception.keys())
+
+
+# -------------------------------------------------------
+# COLUMN FILTERING
+# -------------------------------------------------------
+
+def get_usable_columns(
+    exceptions: Iterator[BusinessException],
+    all_columns: Set[str],
+) -> Set[str]:
+
+    removal_threshold = 5000
+
+    columns_values_count: Dict[str, Dict[str, int]] = {}
+
+    usable_columns = set(all_columns)
+    unusable_columns: Set[str] = set()
+
+    logger.debug(
+        f"Finding usable columns, starting with {len(usable_columns)} columns"
+    )
+
+    for e in tqdm(exceptions):
+
+        for col in usable_columns:
+
+            val = e[col]
+
+            if col not in columns_values_count:
+                columns_values_count[col] = defaultdict(int)
+
+            columns_values_count[col][val] += 1
+
+            if len(columns_values_count[col]) > removal_threshold:
+                unusable_columns.add(col)
+
+    for unused_col in unusable_columns:
+        del columns_values_count[unused_col]
+
+    usable_columns -= unusable_columns
+    unusable_columns = set()
+
+    # remove columns with single value
+
+    for col, counts in columns_values_count.items():
+        if len(counts) == 1:
+            unusable_columns.add(col)
+
+    for unused_col in unusable_columns:
+        del columns_values_count[unused_col]
+
+    usable_columns -= unusable_columns
+    unusable_columns = set()
+
+    # remove columns with low median
+
+    for col in sorted(columns_values_count.keys()):
+
+        median = np.median(list(columns_values_count[col].values()))
+
+        if median < 10:
+            unusable_columns.add(col)
+
+    for unused_col in unusable_columns:
+        del columns_values_count[unused_col]
+
+    usable_columns -= unusable_columns
+
+    logger.debug(f"Filtered down to {len(usable_columns)} usable columns")
+
+    feature_columns = set(columns_values_count.keys())
+
+    # Force include prediction columns
+    feature_columns |= {
+        "processAdditionalInformation",
+        "lastComment",
+        "reasonCodeId",
+    }
+
+    return feature_columns
+
+
+# -------------------------------------------------------
+# UNIQUE EXCEPTIONS
+# -------------------------------------------------------
+
+def filter_unique_usable_exceptions(
+    exceptions: Iterator[BusinessException],
+    usable_columns: Set[str],
+) -> Iterator[frozendict]:
+
+    counts: Dict[frozendict, int] = defaultdict(int)
+
+    for e in tqdm(exceptions):
+
+        e_f = frozendict({
+            k: e[k]
+            for k in usable_columns
+        })
+
+        if e_f not in counts:
+            yield e_f
+
+        counts[e_f] += 1
+
+    logger.debug(f"Total usable exceptions: {len(counts)}")
