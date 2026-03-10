@@ -1,0 +1,99 @@
+"""
+Wrapper for EPE's GraphQL API.
+"""
+
+import logging
+import asyncio
+from datetime import datetime, timedelta
+
+import httpx
+
+from lentil.env import LentilEnv
+
+logging.getLogger("httpx").setLevel(logging.ERROR)
+
+
+class ExceptionsAPI:
+
+    def __init__(self):
+
+        self.endpoint = LentilEnv.EPE_GRAPHQL_API_URL
+        self.username = LentilEnv.EPE_GRAPHQL_API_USERNAME
+        self.password = LentilEnv.EPE_GRAPHQL_API_PASSWORD
+        self.client_id = LentilEnv.EPE_GRAPHQL_API_CLIENT_ID
+        self.client_secret = LentilEnv.EPE_GRAPHQL_API_CLIENT_SECRET
+        self.oauth = LentilEnv.OAUTH_GET_TOKEN_URL
+
+        self.token_timestamp = datetime.fromtimestamp(0)
+        self.access_token = ""
+
+        # lock prevents multiple token refresh calls
+        self._token_lock = asyncio.Lock()
+
+        # reuse http connection (10x faster)
+        self.client = httpx.AsyncClient(
+            verify=False,
+            timeout=httpx.Timeout(20.0, read=300.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+
+    async def refresh_token(self):
+
+        async with self._token_lock:
+
+            if datetime.now() - self.token_timestamp < timedelta(hours=2) and self.access_token:
+                return
+
+            logging.debug("Refreshing EPE API token")
+
+            self.access_token = await self.get_oauth_token()
+
+            if not self.access_token:
+                raise RuntimeError("Failed to obtain EPE access token")
+
+            self.token_timestamp = datetime.now()
+
+    async def get_oauth_token(self):
+
+        oauth_params = {
+            "grant_type": "password",
+            "response_type": "token",
+            "username": self.username,
+            "password": self.password,
+            "scope": "process",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        }
+
+        resp = await self.client.post(self.oauth, data=oauth_params)
+
+        try:
+            token = resp.json()["access_token"]
+        except Exception:
+            logging.error(f"OAuth token fetch failed: {resp.text}")
+            raise RuntimeError("Unable to fetch OAuth token")
+
+        return token
+
+    async def query(self, query: str):
+
+        await self.refresh_token()
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+
+        resp = await self.client.post(
+            self.endpoint,
+            json={"query": query},
+            headers=headers,
+        )
+
+        try:
+            resp_data = resp.json()["data"]
+        except Exception:
+            logging.error(f"Invalid response from EPE API: {resp.text}")
+            raise RuntimeError("Invalid GraphQL response")
+
+        return resp_data
