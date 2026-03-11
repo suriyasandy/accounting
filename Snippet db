@@ -1,21 +1,12 @@
-@authenticate(UserRole.ADMIN)
-def get(self):
+def list_dir(self, path: Path) -> list[Path]:
+    """Implement directory listing for local storage"""
 
-    print("MODELS_DIR =", MODELS_DIR)
-    print("Exists:", MODELS_DIR.exists())
-    print("Content:", list(MODELS_DIR.glob("**/*")))
+    path = self._dir / path
 
-    models = []
+    if not path.exists():
+        return []
 
-    for model_file in MODELS_DIR.glob("**/*_model.pkl"):
+    items = path.glob("*")
+    items = (f.relative_to(self._dir) for f in items)
 
-        feature_file = model_file.with_name(
-            model_file.name.replace("_model.pkl", "_features.json")
-        )
-
-        models.append({
-            "model": str(model_file.relative_to(MODELS_DIR)),
-            "features": str(feature_file.relative_to(MODELS_DIR))
-        })
-
-    return models, HTTPStatus.OK
+    return list(sorted(items))
