@@ -1,108 +1,26 @@
-from http import HTTPStatus
-from pathlib import Path
+@staticmethod
+def load_from_pkl(path):
 
-from flask import request
-from flask_restx import Resource, fields
+    path = Path(path)
 
-from lentil.cache import MODELS_DIR, cache
-from lentil.auth.authenticator import authenticate
-from lentil.auth.user import UserRole
-from lentil.task.tasks.live_inference import LiveInferenceTask
-from lentil.task.async_task_handler import async_task_handler
+    # remove leading "models/" if present
+    if str(path).startswith("models"):
+        path = Path(*path.parts[1:])
 
-from . import namespace
+    full_path = MODELS_DIR / path
 
+    if not full_path.exists():
+        raise FileNotFoundError(f"Model not found: {full_path}")
 
-trained_models_model = namespace.model(
-    "TrainedModels",
-    {
-        "models": fields.List(
-            fields.String(
-                description="Relative model path from models directory"
-            ),
-            required=True,
-            example=["OMRC/OMRC_2026-03-11_model.pkl"],
-        )
-    },
-)
+    model = joblib.load(full_path)
 
+    # load feature file
+    features_path = path.with_name(path.name.replace("_model.pkl", "_features.json"))
+    features_full_path = MODELS_DIR / features_path
 
-@namespace.route("/start")
-class Start(Resource):
-    """Start live inference using selected models"""
+    with open(features_full_path) as f:
+        feature_keys = json.load(f)
 
-    @namespace.expect(trained_models_model)
-    @authenticate(UserRole.ADMIN)
-    def post(self):
+    model.feature_keys = feature_keys
 
-        request_as_json = request.json
-
-        if request_as_json is None:
-            return HTTPStatus.BAD_REQUEST.description, HTTPStatus.BAD_REQUEST
-
-        params = dict(request_as_json)
-
-        try:
-            model_paths = params["models"]
-
-            # build full paths
-            model_path_valid = [MODELS_DIR / Path(mp) for mp in model_paths]
-
-            # validate model exists
-            assert all(cache.path_exists(mpv) for mpv in model_path_valid)
-
-        except (ValueError, KeyError, TypeError):
-            return HTTPStatus.BAD_REQUEST.description, HTTPStatus.BAD_REQUEST
-
-        except AssertionError:
-            return HTTPStatus.NOT_FOUND.description, HTTPStatus.NOT_FOUND
-
-        task = LiveInferenceTask(model_paths=model_paths)
-
-        async_task_handler.start_task(task)
-
-        return task.json_description(), HTTPStatus.ACCEPTED
-
-
-
-from http import HTTPStatus
-from pathlib import Path
-
-from flask_restx import Resource
-
-from lentil.cache import MODELS_DIR, cache
-from lentil.auth.authenticator import authenticate
-from lentil.auth.user import UserRole
-
-from . import namespace
-
-
-@namespace.route("/ls/")
-class ListModel(Resource):
-    """List all available trained models"""
-
-    @authenticate(UserRole.ADMIN)
-    def get(self):
-
-        models = []
-
-        # list control group folders
-        control_groups = cache.list_dir(Path("models"))
-
-        for cg in control_groups:
-
-            # list files inside each control group
-            files = cache.list_dir(cg)
-
-            for f in files:
-
-                if f.name.endswith("_model.pkl"):
-
-                    feature_file = f.name.replace("_model.pkl", "_features.json")
-
-                    models.append({
-                        "model": str(f.relative_to(Path("models"))).replace("\\", "/"),
-                        "features": str((f.parent / feature_file).relative_to(Path("models"))).replace("\\", "/"),
-                    })
-
-        return models, HTTPStatus.OK
+    return model
