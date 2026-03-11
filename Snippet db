@@ -13,19 +13,16 @@ from lentil.task.async_task_handler import async_task_handler
 from . import namespace
 
 
-# Swagger schema
-model_object = namespace.model(
-    "ModelObject",
-    {
-        "model": fields.String(required=True, description="Model path"),
-        "features": fields.String(required=False, description="Feature file path"),
-    },
-)
-
 trained_models_model = namespace.model(
     "TrainedModels",
     {
-        "models": fields.List(fields.Nested(model_object), required=True)
+        "models": fields.List(
+            fields.String(
+                description="Relative model path from models directory"
+            ),
+            required=True,
+            example=["OMRC/OMRC_2026-03-11_model.pkl"],
+        )
     },
 )
 
@@ -46,14 +43,12 @@ class Start(Resource):
         params = dict(request_as_json)
 
         try:
-            model_objects = params["models"]
+            model_paths = params["models"]
 
-            # extract model paths from objects
-            model_paths = [m["model"] for m in model_objects]
-
-            # validate paths
+            # build full paths
             model_path_valid = [MODELS_DIR / Path(mp) for mp in model_paths]
 
+            # validate model exists
             assert all(cache.path_exists(mpv) for mpv in model_path_valid)
 
         except (ValueError, KeyError, TypeError):
@@ -62,7 +57,6 @@ class Start(Resource):
         except AssertionError:
             return HTTPStatus.NOT_FOUND.description, HTTPStatus.NOT_FOUND
 
-        # start inference
         task = LiveInferenceTask(model_paths=model_paths)
 
         async_task_handler.start_task(task)
