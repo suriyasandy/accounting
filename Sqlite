@@ -124,6 +124,48 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         }
 
+def insert_prediction(
+    self,
+    b_exc: BusinessException,
+    model_output: List[PredictorModelOutput],
+):
+
+    cursor = self.conn.cursor()
+
+    record = self._record_from_prediction(b_exc, model_output)
+
+    cursor.execute(
+        """
+        INSERT INTO predictions
+        (exceptionId, exceptionTimestamp, responseCode,
+         responseDescription, controlGroup, prediction, insertedAt)
+
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+
+        ON CONFLICT(exceptionId)
+        DO UPDATE SET
+            exceptionTimestamp=excluded.exceptionTimestamp,
+            responseCode=excluded.responseCode,
+            responseDescription=excluded.responseDescription,
+            controlGroup=excluded.controlGroup,
+            prediction=excluded.prediction,
+            insertedAt=excluded.insertedAt
+        """,
+        (
+            record["exceptionId"],
+            record["exceptionTimestamp"],
+            record["responseCode"],
+            record["responseDescription"],
+            record["controlGroup"],
+            record["prediction"],
+            record["insertedAt"],
+        ),
+    )
+
+    self.conn.commit()
+    cursor.close()
+
+
     # --------------------------------------------------------
     # INSERT MULTIPLE
     # --------------------------------------------------------
