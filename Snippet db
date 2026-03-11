@@ -1,23 +1,38 @@
-@authenticate(UserRole.ADMIN)
-def get(self):
-    """Handle GET request to this endpoint."""
+from http import HTTPStatus
+from flask_restx import Resource
 
-    model_paths = []
+from lentil.cache import MODELS_DIR, cache
+from lentil.auth.authenticator import authenticate
+from lentil.auth.user import UserRole
 
-    cg_dirs = cache.list_dir(MODELS_DIR)
+from . import namespace
 
-    for cg in cg_dirs:
 
-        if not cg.is_dir():
-            continue
+@namespace.route("/ls")
+class ListModel(Resource):
+    """List all available trained models and their feature files"""
 
-        files = cache.list_dir(cg)
+    @authenticate(UserRole.ADMIN)
+    def get(self):
+        models = []
 
-        for f in files:
+        # iterate control-group folders
+        for cg_dir in cache.list_dir(MODELS_DIR):
 
-            if f.name.endswith("_model.pkl"):
-                model_paths.append(
-                    str(f.relative_to(MODELS_DIR))
-                )
+            if not cg_dir.is_dir():
+                continue
 
-    return model_paths, HTTPStatus.OK
+            # list files inside control-group folder
+            for file in cache.list_dir(cg_dir):
+
+                if file.name.endswith("_model.pkl"):
+
+                    feature_file = file.name.replace("_model.pkl", "_features.json")
+                    feature_path = cg_dir / feature_file
+
+                    models.append({
+                        "model": str(file.relative_to(MODELS_DIR)),
+                        "features": str(feature_path.relative_to(MODELS_DIR))
+                    })
+
+        return models, HTTPStatus.OK
