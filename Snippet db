@@ -1,61 +1,37 @@
 from http import HTTPStatus
-from flask import request
-from flask_restx import Resource, fields
-
-from lentil.cache import MODELS_DIR, cache
+from flask_restx import Resource
+from lentil.cache import MODELS_DIR
 from lentil.auth.authenticator import authenticate
 from lentil.auth.user import UserRole
-from lentil.task.tasks.live_inference import LiveInferenceTask
-from lentil.task.async_task_handler import async_task_handler
-
 from . import namespace
+from pathlib import Path
 
 
-trained_models_model = namespace.model(
-    "TrainedModels",
-    {
-        "models": fields.List(
-            fields.String(),
-            required=True,
-            description="Relative path of trained model inside models directory",
-        ),
-    },
-)
+@namespace.route("/ls/")
+class ListModel(Resource):
+    """List all trained models"""
 
-
-@namespace.route("/start")
-class Start(Resource):
-    """Start live inference using selected models"""
-
-    @namespace.expect(trained_models_model)
     @authenticate(UserRole.ADMIN)
-    def post(self):
+    def get(self):
 
-        request_as_json = request.json
-        if request_as_json is None:
-            return HTTPStatus.BAD_REQUEST.description, HTTPStatus.BAD_REQUEST
+        models = []
 
-        params = dict(request_as_json)
+        # iterate control group folders
+        for cg_dir in MODELS_DIR.iterdir():
 
-        try:
-            model_paths = params["models"]
+            if not cg_dir.is_dir():
+                continue
 
-            # convert to absolute cache paths
-            model_path_valid = [MODELS_DIR / mp for mp in model_paths]
+            for f in cg_dir.iterdir():
 
-            # validate existence
-            for mp in model_path_valid:
-                if not cache.path_exists(mp):
-                    return (
-                        f"Model not found: {mp}",
-                        HTTPStatus.NOT_FOUND,
-                    )
+                if f.name.endswith("_model.pkl"):
 
-        except (ValueError, KeyError):
-            return HTTPStatus.BAD_REQUEST.description, HTTPStatus.BAD_REQUEST
+                    feature_file = f.name.replace("_model.pkl", "_features.json")
 
-        # start live inference
-        task = LiveInferenceTask(model_paths=model_path_valid)
-        async_task_handler.start_task(task)
+                    models.append({
+                        "control_group": cg_dir.name,
+                        "model_file": f"{cg_dir.name}/{f.name}",
+                        "features_file": f"{cg_dir.name}/{feature_file}"
+                    })
 
-        return task.json_description(), HTTPStatus.ACCEPTED
+        return models, HTTPStatus.OK
