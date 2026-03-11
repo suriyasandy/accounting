@@ -1,0 +1,137 @@
+<script lang="ts">
+
+import backend from "$lib/backend";
+import {
+  type ElasticRecord,
+  type PredictorModelOutput,
+} from "$lib/interfaces";
+
+import SinglePrediction from "$lib/components/SinglePrediction.svelte";
+import { onMount } from "svelte";
+
+/** @type {import('./$types').PageData} */
+export let data;
+
+export let result: ElasticRecord = {
+  exceptionId: "-",
+  exceptionTimestamp: "",
+  controlGroup: "",
+  responseCode: "",
+  responseDescription: "",
+  prediction: [],
+};
+
+onMount(async () => {
+
+  result = {
+    exceptionId: data.exceptionId,
+    exceptionTimestamp: "loading...",
+    controlGroup: "loading...",
+    responseCode: "loading...",
+    responseDescription: "loading...",
+    prediction: [],
+  };
+
+  let response = await backend.getPredictionsForExceptionId(
+    data.exceptionId
+  );
+
+  if (String(response) === "Nothing matches the given URI") {
+
+    console.error("Exception ID wasn't found");
+
+    result = {
+      exceptionId: `${data.exceptionId} not found`,
+      exceptionTimestamp: "",
+      controlGroup: "",
+      responseCode: "",
+      responseDescription: "",
+      prediction: [],
+    };
+
+  } else {
+
+    result = response;
+
+  }
+
+});
+</script>
+
+
+<h3>Exception ID {result.exceptionId}</h3>
+
+<table>
+
+<tr>
+<td>Control Group</td>
+<td>{result.controlGroup}</td>
+</tr>
+
+<!-- OMRC DISPLAY -->
+{#if result.controlGroup === "OMRC"}
+
+<tr>
+<td>Control Object</td>
+<td>{result.responseCode}</td>
+</tr>
+
+<tr>
+<td>Alert Description</td>
+<td>{result.responseDescription}</td>
+</tr>
+
+<!-- TNTR DISPLAY -->
+
+{:else}
+
+<tr>
+<td>Response Code</td>
+<td>{result.responseCode}</td>
+</tr>
+
+<tr>
+<td>Response Description</td>
+<td>{result.responseDescription}</td>
+</tr>
+
+{/if}
+
+</table>
+
+
+<h3>Predicted Outcomes</h3>
+
+{#if result.prediction && result.prediction.length > 0}
+
+  {#each result.prediction as prediction}
+
+    <SinglePrediction
+      modelOutput={prediction}
+    />
+
+  {/each}
+
+{:else}
+
+<p>No predictions available.</p>
+
+{/if}
+
+
+<style>
+
+table {
+  width: 720px;
+  border-collapse: collapse;
+}
+
+table tr:nth-child(odd) {
+  background-color: #eee;
+}
+
+td {
+  padding: 8px;
+}
+
+</style>
