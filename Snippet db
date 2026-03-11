@@ -1,32 +1,90 @@
-def _prediction_to_json(self, model_output):
+<script lang="ts">
 
-    prediction = []
+import FeatureImportanceBarChart from "$lib/components/FeatureImportanceBarChart.svelte";
+import { type FeatureImportance, type PredictorModelOutput } from "$lib/interfaces";
 
-    for p in model_output:
+export let modelOutput: PredictorModelOutput;
 
-        features = []
+/* Feature importance chart labels */
+let featureChartLabels =
+    modelOutput.features?.map((feat: FeatureImportance) => {
+        return [`${feat.key}`, `${feat.value}`];
+    }) ?? [];
 
-        for fi in p.features:
-            features.append(
-                {
-                    "key": fi.key,
-                    "value": fi.value,
-                    "importance": float(fi.importance)
-                }
-            )
+/* Feature importance chart scores */
+let featureChartScores =
+    modelOutput.features?.map((feat: FeatureImportance) => {
+        return 100 * feat.importance;
+    }) ?? [];
 
-        prediction.append(
-            {
-                "key": p.key,
-                "value": p.value,
-                "confidence": float(p.confidence),
-                "timestamp": p.timestamp.isoformat(),
-                "root_cause": getattr(p, "root_cause", None),
-                "features": features
-            }
-        )
+/* Confidence formatting */
+let confidencePercent = (modelOutput.confidence * 100).toFixed(2);
 
-    return prediction
+</script>
 
+<table>
 
+<tr>
+<td>Column</td>
+<td>{modelOutput.key}</td>
+</tr>
 
+<tr>
+<td>Prediction</td>
+<td>{modelOutput.value}</td>
+</tr>
+
+<tr>
+<td>Confidence</td>
+<td>{confidencePercent}%</td>
+</tr>
+
+<tr>
+<td>Timestamp</td>
+<td>{modelOutput.timestamp}</td>
+</tr>
+
+{#if modelOutput.root_cause}
+<tr>
+<td>Root Cause</td>
+<td>{modelOutput.root_cause}</td>
+</tr>
+{/if}
+
+</table>
+
+{#if modelOutput.features && modelOutput.features.length > 0}
+
+<div class="chartWrapper">
+
+<FeatureImportanceBarChart
+barLabels={featureChartLabels}
+barValues={featureChartScores}
+/>
+
+</div>
+
+{/if}
+
+<style>
+
+table {
+width: 720px;
+border-collapse: collapse;
+margin-bottom: 10px;
+}
+
+table tr:nth-child(odd) {
+background-color: #eee;
+}
+
+td {
+padding: 8px;
+}
+
+.chartWrapper {
+width: 1200px;
+height: 400px;
+}
+
+</style>
