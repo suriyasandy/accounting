@@ -2,51 +2,11 @@ trained_models_model = namespace.model(
     "TrainedModels",
     {
         "models": fields.List(
-            fields.Nested(
-                namespace.model(
-                    "ModelObject",
-                    {
-                        "model": fields.String(required=True),
-                        "features": fields.String(required=True),
-                    },
-                )
+            fields.String(
+                description="Relative path of trained model inside models directory"
             ),
             required=True,
+            example=["OMRC/OMRC_2026-03-11_model.pkl"]
         )
     },
 )
-
-
-
-
-@namespace.expect(trained_models_model)
-@authenticate(UserRole.ADMIN)
-def post(self):
-
-    request_as_json = request.json
-    if request_as_json is None:
-        return HTTPStatus.BAD_REQUEST.description, HTTPStatus.BAD_REQUEST
-
-    params = dict(request_as_json)
-
-    try:
-        model_objects = params["models"]
-
-        # extract model paths from objects
-        model_paths = [m["model"] for m in model_objects]
-
-        model_path_valid = [MODELS_DIR / Path(mp) for mp in model_paths]
-
-        assert all(cache.path_exists(mpv) for mpv in model_path_valid)
-
-    except (ValueError, KeyError, TypeError):
-        return HTTPStatus.BAD_REQUEST.description, HTTPStatus.BAD_REQUEST
-
-    except AssertionError:
-        return HTTPStatus.NOT_FOUND.description, HTTPStatus.NOT_FOUND
-
-    task = LiveInferenceTask(model_paths=model_paths)
-
-    async_task_handler.start_task(task)
-
-    return task.json_description(), HTTPStatus.ACCEPTED
