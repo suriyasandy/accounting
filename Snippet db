@@ -1,40 +1,30 @@
-predictions: List[PredictorModelOutput] = []
+model_name = f"{args.control_group.value}_model.pkl"
+features_name = f"{args.control_group.value}_features.json"
 
-for model in self.models:
+model_path = MODELS_DIR / model_name
+features_path = MODELS_DIR / features_name
 
-    try:
+model.save_model(model_path)
 
-        logger.info(f"Model features keys: {model.feature_keys}")
+with open(features_path, "w") as f:
+    json.dump(selected_features, f, indent=2)
 
-        filtered_features = {}
+logger.info(f"Model saved: {model_path}")
+logger.info(f"Feature list saved: {features_path}")
 
-        for key in model.feature_keys:
 
-            value = b_exc.get(key, None)
+#predictier model.py
+def load_from_pkl(path):
 
-            if value in [None, "", "NULL", "null"]:
-                value = SimpleEncoder.MISSING
+    model = joblib.load(path)
 
-            filtered_features[key] = value
+    control_group = path.stem.replace("_model", "")
 
-        filtered_exception = BusinessException(filtered_features)
+    features_path = path.parent / f"{control_group}_features.json"
 
-        prediction = model.inference_single(filtered_exception)
+    with open(features_path) as f:
+        feature_keys = json.load(f)
 
-        logger.info(f"Raw Predictions for {b_exc.exception_id}: {prediction}")
+    model.feature_keys = feature_keys
 
-        if prediction is None:
-            continue
-
-        if prediction.value == SimpleEncoder.MISSING:
-            continue
-
-        prediction.exception_id = b_exc.exception_id
-
-        predictions.append(prediction)
-
-    except Exception as e:
-
-        logger.error(
-            f"Prediction failed for exception {b_exc.exception_id}: {e}"
-        )
+    return model
