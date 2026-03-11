@@ -3,10 +3,6 @@ def load_from_pkl(path):
 
     path = Path(path)
 
-    # remove leading "models/" if present
-    if str(path).startswith("models"):
-        path = Path(*path.parts[1:])
-
     full_path = MODELS_DIR / path
 
     if not full_path.exists():
@@ -14,7 +10,6 @@ def load_from_pkl(path):
 
     model = joblib.load(full_path)
 
-    # load feature file
     features_path = path.with_name(path.name.replace("_model.pkl", "_features.json"))
     features_full_path = MODELS_DIR / features_path
 
