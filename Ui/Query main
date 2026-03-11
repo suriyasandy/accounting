@@ -1,0 +1,205 @@
+<script lang="ts">
+
+import { onMount } from "svelte";
+
+import {
+  createGrid,
+  type ColDef,
+  type GridApi,
+  type GridOptions,
+  type ICellRendererParams,
+  type PaginationChangedEvent
+} from "ag-grid-enterprise";
+
+import backend from "$lib/backend";
+import { LENTIL_APP_URL_BASE } from "$env/static/public";
+
+let grid: GridApi;
+let gridFirstDataHasDisplayed: Boolean = false;
+
+onMount(() => {
+  loadGrid();
+});
+
+
+function loadGrid() {
+
+  if (typeof grid === "undefined") {
+    newGrid();
+  }
+
+  grid.setGridOption("serverSideDatasource", {
+    getRows: backend.serverSideDatasource
+  });
+
+}
+
+
+function newGrid() {
+
+  let gridOptions: GridOptions = {
+    rowModelType: "serverSide",
+    columnDefs: getColumnDefs(),
+    pagination: true,
+    paginationAutoPageSize: true,
+
+    suppressRowTransform: true,
+    suppressFieldDotNotation: true,
+
+    onSortChanged: saveGridState,
+    onFilterChanged: saveGridState,
+    onColumnResized: saveGridState,
+    onColumnVisible: saveGridState,
+
+    onPaginationChanged: savePageState,
+
+    onGridReady: onGridReady,
+    onFirstDataRendered: onFirstDataRendered,
+  };
+
+  let gridDiv: HTMLElement | null = document.querySelector(".agGrid");
+
+  if (gridDiv !== null) {
+    gridDiv.innerHTML = "";
+    grid = createGrid(gridDiv, gridOptions);
+  }
+
+}
+
+
+function getColumnDefs() {
+
+  let rawFields = [
+    "exceptionId",
+    "exceptionTimestamp",
+    "responseCode",
+    "responseDescription",
+    "controlGroup",
+    "prediction.timestamp",
+    "prediction.key",
+    "prediction.value"
+  ];
+
+  let fields: ColDef[] = rawFields.map((value) => {
+
+    let headerName = value;
+
+    // Rename OMRC fields dynamically
+    if (value === "responseCode") {
+      headerName = "Response Code / Control Object";
+    }
+
+    if (value === "responseDescription") {
+      headerName = "Response Description / Alert Description";
+    }
+
+    return {
+      field: value,
+      headerName: headerName,
+      filter: "agTextColumnFilter",
+      filterParams: {
+        buttons: ["apply", "clear"],
+        filterOptions: ["contains", "notContains"],
+        maxNumConditions: 1,
+      },
+      flex: 1
+    };
+
+  });
+
+
+  // Exception ID clickable link
+  fields[0]["cellRenderer"] = (value: ICellRendererParams) => {
+
+    let exceptionId = value.data.exceptionId;
+
+    return `
+      <a
+      style="text-decoration: unset; color: unset;"
+      href="${LENTIL_APP_URL_BASE}/exception_id/${exceptionId}">
+      ${exceptionId}
+      </a>
+    `;
+
+  };
+
+  return fields;
+
+}
+
+
+
+function saveGridState() {
+
+  localStorage.setItem(
+    "gridColumnState",
+    JSON.stringify(grid.getColumnState())
+  );
+
+  localStorage.setItem(
+    "gridFilterModel",
+    JSON.stringify(grid.getFilterModel())
+  );
+
+}
+
+
+function savePageState(event: PaginationChangedEvent) {
+
+  if (event.newPage && gridFirstDataHasDisplayed) {
+
+    localStorage.setItem(
+      "gridCurrentPage",
+      JSON.stringify(grid.paginationGetCurrentPage())
+    );
+
+  }
+
+}
+
+
+function onGridReady() {
+
+  let cachedFilterModel = localStorage.getItem("gridFilterModel");
+
+  if (cachedFilterModel) {
+    grid.setFilterModel(JSON.parse(cachedFilterModel));
+  }
+
+  let cachedColumnState = localStorage.getItem("gridColumnState");
+
+  if (cachedColumnState) {
+    grid.applyColumnState({
+      state: JSON.parse(cachedColumnState)
+    });
+  }
+
+}
+
+
+function onFirstDataRendered() {
+
+  let cachedPageNum = localStorage.getItem("gridCurrentPage");
+
+  if (cachedPageNum) {
+    grid.paginationGoToPage(JSON.parse(cachedPageNum));
+  }
+
+  gridFirstDataHasDisplayed = true;
+
+}
+
+</script>
+
+
+<div class="agGrid ag-theme-quartz"></div>
+
+
+<style>
+
+.agGrid {
+  width: 100%;
+  height: 80vh;
+}
+
+</style>
