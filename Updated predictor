@@ -1,0 +1,111 @@
+def train(self, rows: Iterator[BusinessException]):
+
+    self._encoder = SimpleEncoder()
+
+    logging.info("Fitting structured encoder")
+
+    (x_rows, y_rows) = self._encoder.encode_rows(
+        rows,
+        feature_keys=self._feature_keys,
+        predict_key=self._predict_key,
+        frozen=False,
+    )
+
+    # Convert rows again for text extraction
+    comments = []
+    root_labels = []
+
+    for r in rows:
+        comment = r.get("lastComment", "")
+        reason = r.get("reasonCodeId", "UNKNOWN")
+
+        comments.append(comment if comment else "")
+        root_labels.append(reason)
+
+    # Train TFIDF
+    logging.info("Training TFIDF text model")
+
+    X_text = self._tfidf.fit_transform(comments)
+
+    self._text_model.fit(X_text, root_labels)
+
+    # Split structured data
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_rows,
+        y_rows,
+        shuffle=True,
+        test_size=0.2,
+    )
+
+    train_pool = Pool(data=x_train, label=y_train)
+    val_pool = Pool(data=x_val, label=y_val)
+
+    logging.info(
+        f"Training CatBoost for {self.control_group}"
+    )
+
+    self._classifier.fit(
+        train_pool,
+        eval_set=val_pool,
+        verbose=True,
+        early_stopping_rounds=100,
+    )
+
+    self._fscore_report(y_train, x_val, y_val)
+
+
+def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
+
+    encoded = self.encode(b_exc)
+
+    prediction_probs = self._classifier.predict_proba(encoded)
+
+    best_class_i = np.argmax(prediction_probs)
+    confidence = prediction_probs[best_class_i]
+
+    predicted_value = self._encoder.decode(
+        self._classifier.classes_[best_class_i]
+    )
+
+    # NEW: root cause prediction
+    comment = b_exc.get("lastComment", "")
+
+    root_cause = None
+
+    if comment:
+        text_vec = self._tfidf.transform([comment])
+        root_cause = self._text_model.predict(text_vec)[0]
+
+    return PredictorModelOutput(
+        control_group=self.control_group,
+        key=self._predict_key,
+        value=predicted_value,
+        confidence=confidence,
+        timestamp=datetime.now(),
+        features=[],
+        root_cause=root_cause,
+    )
+
+
+
+#in model/output.py
+
+class PredictorModelOutput:
+
+    def __init__(
+        self,
+        control_group,
+        key,
+        value,
+        confidence,
+        timestamp,
+        features,
+        root_cause=None
+    ):
+        self.control_group = control_group
+        self.key = key
+        self.value = value
+        self.confidence = confidence
+        self.timestamp = timestamp
+        self.features = features
+        self.root_cause = root_cause
