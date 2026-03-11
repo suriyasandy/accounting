@@ -3,12 +3,12 @@ def load_from_pkl(path):
 
     path = Path(path)
 
-    # If path already contains models/, strip it
+    # Remove "models" prefix if present
     if path.parts and path.parts[0] == "models":
         path = Path(*path.parts[1:])
 
-    # Build final path
-    full_path = MODELS_DIR / path
+    # Correct full path
+    full_path = MODELS_DIR.joinpath(path)
 
     if not full_path.exists():
         raise FileNotFoundError(f"Model not found: {full_path}")
@@ -16,19 +16,16 @@ def load_from_pkl(path):
     # Load model
     model = joblib.load(full_path)
 
-    # Derive features json path
-    features_path = path.with_name(
-        path.name.replace("_model.pkl", "_features.json")
+    # Build feature file path
+    features_path = full_path.with_name(
+        full_path.name.replace("_model.pkl", "_features.json")
     )
 
-    features_full_path = MODELS_DIR / features_path
+    if not features_path.exists():
+        raise FileNotFoundError(f"Features file not found: {features_path}")
 
-    if not features_full_path.exists():
-        raise FileNotFoundError(
-            f"Features file not found: {features_full_path}"
-        )
-
-    with open(features_full_path) as f:
+    import json
+    with open(features_path) as f:
         feature_keys = json.load(f)
 
     model.feature_keys = feature_keys
