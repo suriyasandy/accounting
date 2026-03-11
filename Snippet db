@@ -1,47 +1,32 @@
-def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
+def _prediction_to_json(self, model_output):
 
-    encoded = self.encode(b_exc)
+    prediction = []
 
-    # Prediction probabilities
-    prediction_probs = self._classifier.predict_proba(encoded)
+    for p in model_output:
 
-    # Feature importance
-    importances = self._classifier.get_feature_importance()
+        features = []
 
-    best_class_i = np.argmax(prediction_probs)
-    confidence = float(prediction_probs[best_class_i])
-
-    predicted_value = self._encoder.decode(
-        self._classifier.classes_[best_class_i]
-    )
-
-    # Build feature importance list
-    features = []
-
-    for i, key in enumerate(self._feature_keys):
-        features.append(
-            FeatureImportance(
-                key=key,
-                value=b_exc.get(key),
-                importance=float(importances[i])
+        for fi in p.features:
+            features.append(
+                {
+                    "key": fi.key,
+                    "value": fi.value,
+                    "importance": float(fi.importance)
+                }
             )
+
+        prediction.append(
+            {
+                "key": p.key,
+                "value": p.value,
+                "confidence": float(p.confidence),
+                "timestamp": p.timestamp.isoformat(),
+                "root_cause": getattr(p, "root_cause", None),
+                "features": features
+            }
         )
 
-    # Root cause from comments
-    comment = b_exc.get("lastComment", "")
-    root_cause = None
+    return prediction
 
-    if comment and hasattr(self, "_text_model"):
 
-        text_vec = self._tfidf.transform([comment])
-        root_cause = self._text_model.predict(text_vec)[0]
 
-    return PredictorModelOutput(
-        control_group=self.control_group,
-        key=self._predict_key,
-        value=predicted_value,
-        confidence=confidence,
-        timestamp=datetime.now(),
-        features=features,
-        root_cause=root_cause
-    )
