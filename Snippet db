@@ -1,23 +1,47 @@
-predictions: List[PredictorModelOutput] = []
+def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
 
-for model in self.models:
+    encoded = self.encode(b_exc)
 
-    try:
-        prediction = model.inference_single(b_exc)
+    # Prediction probabilities
+    prediction_probs = self._classifier.predict_proba(encoded)
 
-        # Skip empty predictions
-        if prediction is None:
-            continue
+    # Feature importance
+    importances = self._classifier.get_feature_importance()
 
-        if prediction.value == SimpleEncoder.MISSING:
-            continue
+    best_class_i = np.argmax(prediction_probs)
+    confidence = float(prediction_probs[best_class_i])
 
-        # Attach exception id for DB
-        prediction.exception_id = b_exc.exception_id
+    predicted_value = self._encoder.decode(
+        self._classifier.classes_[best_class_i]
+    )
 
-        predictions.append(prediction)
+    # Build feature importance list
+    features = []
 
-    except Exception as e:
-        logger.error(
-            f"Prediction failed for exception {b_exc.exception_id}: {e}"
+    for i, key in enumerate(self._feature_keys):
+        features.append(
+            FeatureImportance(
+                key=key,
+                value=b_exc.get(key),
+                importance=float(importances[i])
+            )
         )
+
+    # Root cause from comments
+    comment = b_exc.get("lastComment", "")
+    root_cause = None
+
+    if comment and hasattr(self, "_text_model"):
+
+        text_vec = self._tfidf.transform([comment])
+        root_cause = self._text_model.predict(text_vec)[0]
+
+    return PredictorModelOutput(
+        control_group=self.control_group,
+        key=self._predict_key,
+        value=predicted_value,
+        confidence=confidence,
+        timestamp=datetime.now(),
+        features=features,
+        root_cause=root_cause
+    )
