@@ -1,3 +1,24 @@
+trained_models_model = namespace.model(
+    "TrainedModels",
+    {
+        "models": fields.List(
+            fields.Nested(
+                namespace.model(
+                    "ModelObject",
+                    {
+                        "model": fields.String(required=True),
+                        "features": fields.String(required=True),
+                    },
+                )
+            ),
+            required=True,
+        )
+    },
+)
+
+
+
+
 @namespace.expect(trained_models_model)
 @authenticate(UserRole.ADMIN)
 def post(self):
