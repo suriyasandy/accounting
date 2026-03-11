@@ -1,30 +1,24 @@
-model_name = f"{args.control_group.value}_model.pkl"
-features_name = f"{args.control_group.value}_features.json"
+@authenticate(UserRole.ADMIN)
+def get(self):
+    """Handle GET request to list trained models"""
 
-model_path = MODELS_DIR / model_name
-features_path = MODELS_DIR / features_name
+    paths = cache.list_dir(MODELS_DIR)
 
-model.save_model(model_path)
+    models = []
 
-with open(features_path, "w") as f:
-    json.dump(selected_features, f, indent=2)
+    for p in paths:
 
-logger.info(f"Model saved: {model_path}")
-logger.info(f"Feature list saved: {features_path}")
+        name = p.name
 
+        # only return trained model files
+        if name.endswith("_model.pkl"):
 
-#predictier model.py
-def load_from_pkl(path):
+            control_group = name.replace("_model.pkl", "")
 
-    model = joblib.load(path)
+            models.append({
+                "control_group": control_group,
+                "model_file": name,
+                "features_file": f"{control_group}_features.json"
+            })
 
-    control_group = path.stem.replace("_model", "")
-
-    features_path = path.parent / f"{control_group}_features.json"
-
-    with open(features_path) as f:
-        feature_keys = json.load(f)
-
-    model.feature_keys = feature_keys
-
-    return model
+    return models, HTTPStatus.OK
