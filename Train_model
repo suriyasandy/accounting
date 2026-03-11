@@ -14,8 +14,31 @@ from lentil.utilities.log import get_logger
 logger = get_logger(__name__)
 
 
+# --------------------------------------------------
+# DEFINE FEATURE WHITELIST
+# --------------------------------------------------
+
+ALLOWED_FEATURES = [
+    "exceptionAge",
+    "omrctradeBasecurrency",
+    "omrctradeOriglegalentity",
+    "omrctradeProduct",
+    "omrctradeTrader",
+    "omrctradeDesk",
+    "omrctradeRegion",
+    "omrctradeTransactiontype",
+    "omrctradeMarketsector",
+    "omrctradeReportingccy",
+    "omrctradeLocation",
+    "lastComment"
+]
+
+
+# --------------------------------------------------
+# CLI ARGUMENTS
+# --------------------------------------------------
+
 def add_args(parser: ArgumentParser) -> ArgumentParser:
-    """Define command line arguments."""
 
     parser.add_argument(
         "--control-group",
@@ -32,8 +55,11 @@ def add_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
+# --------------------------------------------------
+# MAIN TRAINING FUNCTION
+# --------------------------------------------------
+
 def main(args: Namespace) -> PredictorModel:
-    """Entry point for this script."""
 
     # Convert CLI string → Enum
     if isinstance(args.control_group, str):
@@ -41,7 +67,6 @@ def main(args: Namespace) -> PredictorModel:
 
     logger.info(f"Using control group: {args.control_group}")
 
-    # Require filter_similar to have run first
     dataset_path = Path("epe_data") / args.control_group.value / "filtered.csv"
 
     logger.info(f"Loading dataset from: {dataset_path}")
@@ -60,20 +85,36 @@ def main(args: Namespace) -> PredictorModel:
         # Remove unusable columns
         fieldnames = PredictorModel.remove_unusable_columns(list(fieldnames))
 
+        # --------------------------------------------------
+        # FILTER FEATURES
+        # --------------------------------------------------
+
+        feature_keys = [f for f in fieldnames if f in ALLOWED_FEATURES]
+
+        logger.info(f"Using {len(feature_keys)} features")
+        logger.info(f"Feature list: {feature_keys}")
+
+        # --------------------------------------------------
+        # CREATE MODEL
+        # --------------------------------------------------
+
         model = PredictorModel(
             control_group=args.control_group,
-            feature_keys=fieldnames,
+            feature_keys=feature_keys,
             predict_key=args.predict,
         )
 
+        # Convert CSV rows → BusinessException
         business_exceptions = (
             be_from_dict(row) for row in reader
         )
 
         logger.info("Training model...")
+
         model.train(business_exceptions)
 
     logger.info("Saving trained model...")
+
     model.save(MODELS_DIR)
 
     logger.info("Training complete")
@@ -81,7 +122,14 @@ def main(args: Namespace) -> PredictorModel:
     return model
 
 
+# --------------------------------------------------
+# ENTRY POINT
+# --------------------------------------------------
+
 if __name__ == "__main__":
+
     parser = ArgumentParser()
+
     args = add_args(parser).parse_args()
+
     main(args)
