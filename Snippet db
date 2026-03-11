@@ -1,26 +1,140 @@
-def _prediction_to_json(self, model_output):
+def train(self, rows: Iterator[BusinessException]):
 
-    prediction = []
+    # Convert iterator to list so it can be reused
+    rows = list(rows)
 
-    for p in model_output:
+    # Reset encoder
+    self._encoder = SimpleEncoder()
 
-        features = []
+    logging.info("Fitting structured encoder")
 
-        for fi in p.features:
-            features.append({
-                "key": fi.key,
-                "value": fi.value,
-                "importance": float(fi.importance)
-            })
+    # Encode structured features
+    (x_rows, y_rows) = self._encoder.encode_rows(
+        rows,
+        feature_keys=self._feature_keys,
+        predict_key=self._predict_key,
+        frozen=False,
+    )
 
-        prediction.append(
-            {
-                "key": p.key,
-                "value": p.value,
-                "confidence": float(p.confidence),
-                "timestamp": p.timestamp.isoformat(),
-                "features": features
-            }
-        )
+    # -----------------------------
+    # Remove rare classes
+    # -----------------------------
+    from collections import Counter
+    import numpy as np
 
-    return prediction
+    label_counts = Counter(y_rows)
+
+    valid_indices = [
+        i for i, y in enumerate(y_rows)
+        if label_counts[y] > 1
+    ]
+
+    x_rows = x_rows[valid_indices]
+    y_rows = y_rows[valid_indices]
+
+    logging.info(f"Dataset size after rare class removal: {len(y_rows)}")
+
+    # -----------------------------
+    # Train / Validation Split
+    # -----------------------------
+    from sklearn.model_selection import train_test_split
+
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_rows,
+        y_rows,
+        test_size=0.2,
+        shuffle=True,
+        stratify=y_rows
+    )
+
+    # -----------------------------
+    # Train CatBoost model
+    # -----------------------------
+    from catboost import Pool
+
+    train_pool = Pool(data=x_train, label=y_train)
+    val_pool = Pool(data=x_val, label=y_val)
+
+    logging.info(
+        f"Beginning model training for {self.control_group} "
+        f"on column {self._predict_key}"
+    )
+
+    self._classifier.fit(
+        train_pool,
+        eval_set=val_pool,
+        verbose=True,
+        early_stopping_rounds=100,
+    )
+
+    # -----------------------------
+    # Evaluation
+    # -----------------------------
+    from sklearn import metrics
+
+    y_val_pred = self._classifier.predict(x_val)
+
+    label_ids = np.unique(y_train)
+    target_names = [
+        str(self._encoder.decode(col))
+        for col in label_ids
+    ]
+
+    report = metrics.classification_report(
+        y_val,
+        y_val_pred,
+        labels=label_ids,
+        target_names=target_names,
+        zero_division=np.nan,
+    )
+
+    logging.info(f"\n{report}")
+
+    # -----------------------------
+    # TFIDF Comment Model
+    # -----------------------------
+    logging.info("Training TFIDF text model")
+
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    comments = []
+    root_labels = []
+
+    for r in rows:
+
+        comment = r.get("lastComment")
+        reason = r.get("reasonCodeId", "UNKNOWN")
+
+        if comment is None:
+            continue
+
+        comment = str(comment).strip()
+
+        if len(comment.split()) < 2:
+            continue
+
+        comments.append(comment)
+        root_labels.append(reason)
+
+    if len(comments) == 0:
+        logging.warning("No valid comments found. Skipping TFIDF model.")
+        return
+
+    logging.info(f"Training TFIDF with {len(comments)} comments")
+
+    self._tfidf = TfidfVectorizer(
+        max_features=2000,
+        stop_words="english"
+    )
+
+    X_text = self._tfidf.fit_transform(comments)
+
+    from sklearn.linear_model import LogisticRegression
+
+    self._text_classifier = LogisticRegression(
+        max_iter=200
+    )
+
+    self._text_classifier.fit(X_text, root_labels)
+
+    logging.info("TFIDF text model training complete")
