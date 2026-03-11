@@ -1,102 +1,23 @@
-def train(self, rows: Iterator[BusinessException]):
+predictions: List[PredictorModelOutput] = []
 
-    self._encoder = SimpleEncoder()
+for model in self.models:
 
-    # Convert iterator → list so we can reuse it
-    rows = list(rows)
+    try:
+        prediction = model.inference_single(b_exc)
 
-    logging.info("Fitting structured encoder")
-
-    (x_rows, y_rows) = self._encoder.encode_rows(
-        rows,
-        feature_keys=self._feature_keys,
-        predict_key=self._predict_key,
-        frozen=False,
-    )
-
-    # -----------------------------
-    # REMOVE RARE LABELS
-    # -----------------------------
-    from collections import Counter
-    import numpy as np
-
-    label_counts = Counter(y_rows)
-
-    valid_idx = [
-        i for i, y in enumerate(y_rows)
-        if label_counts[y] > 1
-    ]
-
-    x_rows = x_rows[valid_idx]
-    y_rows = y_rows[valid_idx]
-
-    logging.info(f"Dataset size after removing rare labels: {len(y_rows)}")
-
-    # -----------------------------
-    # EXTRACT COMMENTS FOR TFIDF
-    # -----------------------------
-    comments = []
-    root_labels = []
-
-    for r in rows:
-
-        comment = r.get("lastComment")
-        reason = r.get("reasonCodeId", "UNKNOWN")
-
-        if comment is None:
+        # Skip empty predictions
+        if prediction is None:
             continue
 
-        comment = str(comment).strip()
-
-        if len(comment.split()) < 2:
+        if prediction.value == SimpleEncoder.MISSING:
             continue
 
-        comments.append(comment)
-        root_labels.append(reason)
+        # Attach exception id for DB
+        prediction.exception_id = b_exc.exception_id
 
-    # -----------------------------
-    # TRAIN TFIDF MODEL (SAFE)
-    # -----------------------------
-    if len(comments) > 0:
+        predictions.append(prediction)
 
-        logging.info("Training TFIDF text model.")
-
-        X_text = self._tfidf.fit_transform(comments)
-
-        self._text_model.fit(X_text, root_labels)
-
-    else:
-        logging.warning("No valid comments found. Skipping TFIDF training.")
-
-    # -----------------------------
-    # SPLIT STRUCTURED DATA
-    # -----------------------------
-    x_train, x_val, y_train, y_val = train_test_split(
-        x_rows,
-        y_rows,
-        shuffle=True,
-        test_size=0.2,
-        stratify=y_rows
-    )
-
-    # -----------------------------
-    # CATBOOST TRAINING
-    # -----------------------------
-    train_pool = Pool(data=x_train, label=y_train)
-    val_pool = Pool(data=x_val, label=y_val)
-
-    logging.info(
-        f"Training CatBoost for {self.control_group}"
-    )
-
-    self._classifier.fit(
-        train_pool,
-        eval_set=val_pool,
-        verbose=True,
-        early_stopping_rounds=100,
-    )
-
-    # -----------------------------
-    # MODEL EVALUATION
-    # -----------------------------
-    self._fscore_report(y_train, x_val, y_val)
+    except Exception as e:
+        logger.error(
+            f"Prediction failed for exception {b_exc.exception_id}: {e}"
+        )
