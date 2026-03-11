@@ -62,3 +62,47 @@ class Start(Resource):
         async_task_handler.start_task(task)
 
         return task.json_description(), HTTPStatus.ACCEPTED
+
+
+
+from http import HTTPStatus
+from pathlib import Path
+
+from flask_restx import Resource
+
+from lentil.cache import MODELS_DIR, cache
+from lentil.auth.authenticator import authenticate
+from lentil.auth.user import UserRole
+
+from . import namespace
+
+
+@namespace.route("/ls/")
+class ListModel(Resource):
+    """List all available trained models"""
+
+    @authenticate(UserRole.ADMIN)
+    def get(self):
+
+        models = []
+
+        # list control group folders
+        control_groups = cache.list_dir(Path("models"))
+
+        for cg in control_groups:
+
+            # list files inside each control group
+            files = cache.list_dir(cg)
+
+            for f in files:
+
+                if f.name.endswith("_model.pkl"):
+
+                    feature_file = f.name.replace("_model.pkl", "_features.json")
+
+                    models.append({
+                        "model": str(f.relative_to(Path("models"))).replace("\\", "/"),
+                        "features": str((f.parent / feature_file).relative_to(Path("models"))).replace("\\", "/"),
+                    })
+
+        return models, HTTPStatus.OK
