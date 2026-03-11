@@ -1,37 +1,23 @@
-from http import HTTPStatus
-from flask_restx import Resource
-from lentil.cache import MODELS_DIR
-from lentil.auth.authenticator import authenticate
-from lentil.auth.user import UserRole
-from . import namespace
-from pathlib import Path
+@authenticate(UserRole.ADMIN)
+def get(self):
+    """Handle GET request to this endpoint."""
 
+    model_paths = []
 
-@namespace.route("/ls/")
-class ListModel(Resource):
-    """List all trained models"""
+    cg_dirs = cache.list_dir(MODELS_DIR)
 
-    @authenticate(UserRole.ADMIN)
-    def get(self):
+    for cg in cg_dirs:
 
-        models = []
+        if not cg.is_dir():
+            continue
 
-        # iterate control group folders
-        for cg_dir in MODELS_DIR.iterdir():
+        files = cache.list_dir(cg)
 
-            if not cg_dir.is_dir():
-                continue
+        for f in files:
 
-            for f in cg_dir.iterdir():
+            if f.name.endswith("_model.pkl"):
+                model_paths.append(
+                    str(f.relative_to(MODELS_DIR))
+                )
 
-                if f.name.endswith("_model.pkl"):
-
-                    feature_file = f.name.replace("_model.pkl", "_features.json")
-
-                    models.append({
-                        "control_group": cg_dir.name,
-                        "model_file": f"{cg_dir.name}/{f.name}",
-                        "features_file": f"{cg_dir.name}/{feature_file}"
-                    })
-
-        return models, HTTPStatus.OK
+    return model_paths, HTTPStatus.OK
