@@ -1,12 +1,26 @@
-def list_dir(self, path: Path) -> list[Path]:
-    """Implement directory listing for local storage"""
+@authenticate(UserRole.ADMIN)
+def get(self):
+    """Handle GET request to this endpoint."""
 
-    path = self._dir / path
+    models = []
 
-    if not path.exists():
-        return []
+    # first level (control groups)
+    control_groups = cache.list_dir(MODELS_DIR)
 
-    items = path.glob("*")
-    items = (f.relative_to(self._dir) for f in items)
+    for cg in control_groups:
 
-    return list(sorted(items))
+        # list files inside control group folder
+        files = cache.list_dir(cg)
+
+        for f in files:
+
+            if f.name.endswith("_model.pkl"):
+
+                feature_file = f.name.replace("_model.pkl", "_features.json")
+
+                models.append({
+                    "model": str(f),
+                    "features": str(f.parent / feature_file)
+                })
+
+    return models, HTTPStatus.OK
