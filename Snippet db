@@ -1,103 +1,26 @@
-from pathlib import Path
-from typing import Iterator, List, Tuple
-import csv
+def _prediction_to_json(self, model_output):
 
-from lentil.model.controls import ControlGroup
-from lentil.model.business_exception import BusinessException
+    prediction = []
 
+    for p in model_output:
 
-class ExceptionsFetcher:
-    """
-    Fetch and load EPE exception CSV files stored locally.
-    """
+        features = []
 
-    def __init__(self):
+        for fi in p.features:
+            features.append({
+                "key": fi.key,
+                "value": fi.value,
+                "importance": float(fi.importance)
+            })
 
-        # root folder where exception CSVs are stored
-        self._epe_store_path = Path("epe_data")
+        prediction.append(
+            {
+                "key": p.key,
+                "value": p.value,
+                "confidence": float(p.confidence),
+                "timestamp": p.timestamp.isoformat(),
+                "features": features
+            }
+        )
 
-        # create folder if missing
-        self._epe_store_path.mkdir(parents=True, exist_ok=True)
-
-    # ---------------------------------------------------
-    # LIST FILES
-    # ---------------------------------------------------
-
-    def list_paths(self) -> List[Path]:
-        """
-        List all CSV files downloaded into epe_data.
-        """
-
-        listed_dirs: List[Path] = []
-
-        for control_group in ControlGroup:
-
-            subdir = self._epe_store_path / control_group.value
-
-            if not subdir.exists():
-                continue
-
-            for p in subdir.iterdir():
-
-                if p.suffix == ".csv":
-                    listed_dirs.append(p)
-
-        return listed_dirs
-
-    # ---------------------------------------------------
-
-    def list_processed_paths(self) -> List[Tuple[Path, ControlGroup]]:
-        """
-        List downloaded CSV files along with their control group.
-        Excludes filtered.csv output file.
-        """
-
-        listed_dirs: List[Tuple[Path, ControlGroup]] = []
-
-        for control_group in ControlGroup:
-
-            subdir = self._epe_store_path / control_group.value
-
-            if not subdir.exists():
-                continue
-
-            for p in subdir.iterdir():
-
-                if p.name == "filtered.csv":
-                    continue
-
-                if p.suffix == ".csv":
-                    listed_dirs.append((p, control_group))
-
-        return listed_dirs
-
-    # ---------------------------------------------------
-    # LOAD CSV DATA
-    # ---------------------------------------------------
-
-    def fetch_paths(
-        self,
-        paths: List[Path],
-    ) -> Iterator[BusinessException]:
-        """
-        Load exceptions from multiple CSV files.
-        """
-
-        for path in paths:
-
-            yield from self._load_csv(path)
-
-    # ---------------------------------------------------
-
-    def _load_csv(self, path: Path) -> Iterator[BusinessException]:
-        """
-        Load a single CSV file and convert rows into BusinessException objects.
-        """
-
-        with open(path, newline="", encoding="utf-8") as f:
-
-            reader = csv.DictReader(f)
-
-            for row in reader:
-
-                yield BusinessException(row)
+    return prediction
