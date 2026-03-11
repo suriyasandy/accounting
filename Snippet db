@@ -1,90 +1,40 @@
-<script lang="ts">
+predictions: List[PredictorModelOutput] = []
 
-import FeatureImportanceBarChart from "$lib/components/FeatureImportanceBarChart.svelte";
-import { type FeatureImportance, type PredictorModelOutput } from "$lib/interfaces";
+for model in self.models:
 
-export let modelOutput: PredictorModelOutput;
+    try:
 
-/* Feature importance chart labels */
-let featureChartLabels =
-    modelOutput.features?.map((feat: FeatureImportance) => {
-        return [`${feat.key}`, `${feat.value}`];
-    }) ?? [];
+        logger.info(f"Model features keys: {model.feature_keys}")
 
-/* Feature importance chart scores */
-let featureChartScores =
-    modelOutput.features?.map((feat: FeatureImportance) => {
-        return 100 * feat.importance;
-    }) ?? [];
+        filtered_features = {}
 
-/* Confidence formatting */
-let confidencePercent = (modelOutput.confidence * 100).toFixed(2);
+        for key in model.feature_keys:
 
-</script>
+            value = b_exc.get(key, None)
 
-<table>
+            if value in [None, "", "NULL", "null"]:
+                value = SimpleEncoder.MISSING
 
-<tr>
-<td>Column</td>
-<td>{modelOutput.key}</td>
-</tr>
+            filtered_features[key] = value
 
-<tr>
-<td>Prediction</td>
-<td>{modelOutput.value}</td>
-</tr>
+        filtered_exception = BusinessException(filtered_features)
 
-<tr>
-<td>Confidence</td>
-<td>{confidencePercent}%</td>
-</tr>
+        prediction = model.inference_single(filtered_exception)
 
-<tr>
-<td>Timestamp</td>
-<td>{modelOutput.timestamp}</td>
-</tr>
+        logger.info(f"Raw Predictions for {b_exc.exception_id}: {prediction}")
 
-{#if modelOutput.root_cause}
-<tr>
-<td>Root Cause</td>
-<td>{modelOutput.root_cause}</td>
-</tr>
-{/if}
+        if prediction is None:
+            continue
 
-</table>
+        if prediction.value == SimpleEncoder.MISSING:
+            continue
 
-{#if modelOutput.features && modelOutput.features.length > 0}
+        prediction.exception_id = b_exc.exception_id
 
-<div class="chartWrapper">
+        predictions.append(prediction)
 
-<FeatureImportanceBarChart
-barLabels={featureChartLabels}
-barValues={featureChartScores}
-/>
+    except Exception as e:
 
-</div>
-
-{/if}
-
-<style>
-
-table {
-width: 720px;
-border-collapse: collapse;
-margin-bottom: 10px;
-}
-
-table tr:nth-child(odd) {
-background-color: #eee;
-}
-
-td {
-padding: 8px;
-}
-
-.chartWrapper {
-width: 1200px;
-height: 400px;
-}
-
-</style>
+        logger.error(
+            f"Prediction failed for exception {b_exc.exception_id}: {e}"
+        )
