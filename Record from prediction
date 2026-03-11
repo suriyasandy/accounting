@@ -1,0 +1,26 @@
+def _record_from_prediction(
+    self,
+    b_exc: BusinessException,
+    model_output: List[PredictorModelOutput],
+):
+
+    if not model_output:
+        raise Exception("Cannot create record from empty predictions")
+
+    control_group = model_output[0].control_group.value
+
+    if control_group == "OMRC":
+        response_code = getattr(b_exc, "reasonCodeId", None)
+        response_description = getattr(b_exc, "lastComment", None)
+    else:
+        response_code = b_exc.response_code
+        response_description = b_exc.response_description
+
+    return {
+        "exceptionId": b_exc.exception_id,
+        "exceptionTimestamp": b_exc.exception_timestamp.isoformat(),
+        "responseCode": response_code,
+        "responseDescription": response_description,
+        "controlGroup": control_group,
+        "prediction": json.dumps(self._prediction_to_json(model_output)),
+    }
