@@ -1,49 +1,156 @@
-import json
+import logging
+from typing import List
+
 import pandas as pd
-from catboost import CatBoostClassifier
+import numpy as np
 
-def select_features(dataset_path, target_column):
+from sklearn.feature_selection import mutual_info_classif
 
-    df = pd.read_csv(dataset_path)
+from lentil.cache import cache
 
-    # Remove target column
-    X = df.drop(columns=[target_column])
+logger = logging.getLogger(__name__)
+
+
+def select_features(dataset_path, target_column: str) -> List[str]:
+    """
+    Select useful features for model training.
+
+    Handles multiple edge cases:
+    - missing dataset
+    - missing target column
+    - null-heavy columns
+    - constant columns
+    - high-cardinality columns
+    - mixed datatype columns
+    """
+
+    logger.info(f"Loading dataset from {dataset_path}")
+
+    # -------------------------------
+    # Load dataset via Lentil cache
+    # -------------------------------
+    try:
+        with cache.open(dataset_path, "r") as f:
+            df = pd.read_csv(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load dataset {dataset_path}: {e}")
+
+    if df.empty:
+        raise RuntimeError("Dataset is empty")
+
+    logger.info(f"Dataset shape: {df.shape}")
+
+    # -------------------------------
+    # Validate target column
+    # -------------------------------
+    if target_column not in df.columns:
+        raise RuntimeError(
+            f"Target column '{target_column}' not found in dataset"
+        )
+
+    # -------------------------------
+    # Replace problematic values
+    # -------------------------------
+    df = df.replace(["NULL", "null", ""], np.nan)
+    df = df.fillna("MISSING")
+
+    # -------------------------------
+    # Split features / target
+    # -------------------------------
     y = df[target_column]
+    X = df.drop(columns=[target_column])
 
-    # Remove columns with >80% NULL
-    null_ratio = X.isnull().mean()
-    X = X.loc[:, null_ratio < 0.8]
+    # -------------------------------
+    # Remove constant columns
+    # -------------------------------
+    constant_cols = [c for c in X.columns if X[c].nunique() <= 1]
 
-    # Fill remaining null
-    X = X.fillna("missing")
+    if constant_cols:
+        logger.info(f"Removing constant columns: {constant_cols}")
+        X = X.drop(columns=constant_cols)
 
-    # Train temporary model
-    model = CatBoostClassifier(
-        iterations=200,
-        depth=6,
-        learning_rate=0.1,
-        verbose=False
-    )
+    # -------------------------------
+    # Remove columns with too many nulls
+    # -------------------------------
+    null_threshold = 0.7
+    null_ratio = X.isin(["MISSING"]).mean()
 
-    model.fit(X, y)
+    null_cols = null_ratio[null_ratio > null_threshold].index.tolist()
 
-    importances = model.get_feature_importance()
+    if null_cols:
+        logger.info(f"Removing null-heavy columns: {null_cols}")
+        X = X.drop(columns=null_cols)
 
-    feature_scores = dict(zip(X.columns, importances))
+    # -------------------------------
+    # Remove high-cardinality columns
+    # -------------------------------
+    high_cardinality_cols = []
 
-    # Sort features
-    sorted_features = sorted(
-        feature_scores.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
+    for col in X.columns:
 
-    # Keep top features
-    selected = [f[0] for f in sorted_features if f[1] > 1]
+        if X[col].dtype == "object":
+            unique_ratio = X[col].nunique() / len(X)
 
-    with open("selected_features.json", "w") as f:
-        json.dump(selected, f)
+            if unique_ratio > 0.9:
+                high_cardinality_cols.append(col)
 
-    print("Selected features:", selected)
+    if high_cardinality_cols:
+        logger.info(
+            f"Removing high-cardinality columns: {high_cardinality_cols}"
+        )
+        X = X.drop(columns=high_cardinality_cols)
+
+    # -------------------------------
+    # Convert categorical → numeric
+    # (temporary encoding for MI)
+    # -------------------------------
+    encoded_X = X.copy()
+
+    for col in encoded_X.columns:
+
+        if encoded_X[col].dtype == "object":
+
+            encoded_X[col] = encoded_X[col].astype("category").cat.codes
+
+    # -------------------------------
+    # Mutual information feature score
+    # -------------------------------
+    try:
+
+        mi_scores = mutual_info_classif(
+            encoded_X,
+            y.astype("category").cat.codes,
+            discrete_features="auto"
+        )
+
+        mi_series = pd.Series(mi_scores, index=encoded_X.columns)
+
+    except Exception as e:
+
+        logger.warning(
+            f"Mutual information failed ({e}), using fallback features"
+        )
+
+        return list(X.columns)
+
+    # -------------------------------
+    # Select top features
+    # -------------------------------
+    mi_series = mi_series.sort_values(ascending=False)
+
+    # keep at least N features
+    min_features = 10
+
+    # remove very weak features
+    threshold = 0.001
+
+    selected = mi_series[mi_series > threshold].index.tolist()
+
+    if len(selected) < min_features:
+        selected = mi_series.head(min_features).index.tolist()
+
+    logger.info(f"Selected {len(selected)} features")
+
+    logger.info(f"Top features: {selected[:10]}")
 
     return selected
