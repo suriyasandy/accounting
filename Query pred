@@ -1,70 +1,37 @@
-def query_predictions(self, start_row, end_row, sort_model, filter_model):
+where_clauses = []
+params = []
 
-    limit = end_row - start_row
+# FILTER
+if isinstance(filter_model, list):
 
-    where_clauses = []
-    params = []
+    for filter_data in filter_model:
 
-    # -------- FILTERING --------
-    if filter_model:
-        for col, filter_data in filter_model.items():
+        col = filter_data.get("colId")
+        value = filter_data.get("filter")
 
-            value = filter_data.get("filter")
+        if col and value:
+            where_clauses.append(f"{col} LIKE ?")
+            params.append(f"%{value}%")
 
-            if value:
-                where_clauses.append(f"{col} LIKE ?")
-                params.append(f"%{value}%")
+where_sql = ""
+if where_clauses:
+    where_sql = "WHERE " + " AND ".join(where_clauses)
 
-    where_sql = ""
-    if where_clauses:
-        where_sql = "WHERE " + " AND ".join(where_clauses)
 
-    # -------- SORTING --------
-    order_sql = ""
-    if sort_model:
-        col = sort_model[0]["colId"]
-        direction = sort_model[0]["sort"].upper()
-        order_sql = f"ORDER BY {col} {direction}"
+# SORT
+order_sql = ""
+if sort_model:
+    col = sort_model[0]["colId"]
+    direction = sort_model[0]["sort"].upper()
+    order_sql = f"ORDER BY {col} {direction}"
 
-    # -------- MAIN QUERY --------
-    query = f"""
-    SELECT *
-    FROM predictions
-    {where_sql}
-    {order_sql}
-    LIMIT ? OFFSET ?
-    """
 
-    params.extend([limit, start_row])
+query = f"""
+SELECT *
+FROM predictions
+{where_sql}
+{order_sql}
+LIMIT ? OFFSET ?
+"""
 
-    cursor = self.conn.cursor()
-
-    rows = cursor.execute(query, params).fetchall()
-
-    row_data = []
-
-    for row in rows:
-
-        prediction = json.loads(row["prediction"])
-
-        row_data.append({
-            "exceptionId": row["exceptionId"],
-            "exceptionTimestamp": row["exceptionTimestamp"],
-            "responseCode": row["responseCode"],
-            "responseDescription": row["responseDescription"],
-            "controlGroup": row["controlGroup"],
-            "prediction.timestamp": [p["timestamp"] for p in prediction],
-            "prediction.key": [p["key"] for p in prediction],
-            "prediction.value": [p["value"] for p in prediction],
-        })
-
-    # total count
-    count_query = f"SELECT COUNT(*) FROM predictions {where_sql}"
-    row_count = cursor.execute(count_query, params[:-2]).fetchone()[0]
-
-    cursor.close()
-
-    return {
-        "rowData": row_data,
-        "rowCount": row_count
-    }
+params.extend([limit, start_row])
