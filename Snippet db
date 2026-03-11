@@ -1,23 +1,21 @@
 @authenticate(UserRole.ADMIN)
 def get(self):
-    """Handle GET request to this endpoint."""
+
+    print("MODELS_DIR =", MODELS_DIR)
+    print("Exists:", MODELS_DIR.exists())
+    print("Content:", list(MODELS_DIR.glob("**/*")))
 
     models = []
 
-    for cg_dir in MODELS_DIR.iterdir():
+    for model_file in MODELS_DIR.glob("**/*_model.pkl"):
 
-        if not cg_dir.is_dir():
-            continue
+        feature_file = model_file.with_name(
+            model_file.name.replace("_model.pkl", "_features.json")
+        )
 
-        for f in cg_dir.iterdir():
-
-            if f.name.endswith("_model.pkl"):
-
-                feature_file = f.name.replace("_model.pkl", "_features.json")
-
-                models.append({
-                    "model": f"{cg_dir.name}/{f.name}",
-                    "features": f"{cg_dir.name}/{feature_file}"
-                })
+        models.append({
+            "model": str(model_file.relative_to(MODELS_DIR)),
+            "features": str(feature_file.relative_to(MODELS_DIR))
+        })
 
     return models, HTTPStatus.OK
