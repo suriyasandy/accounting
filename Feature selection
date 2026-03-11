@@ -1,0 +1,49 @@
+import json
+import pandas as pd
+from catboost import CatBoostClassifier
+
+def select_features(dataset_path, target_column):
+
+    df = pd.read_csv(dataset_path)
+
+    # Remove target column
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    # Remove columns with >80% NULL
+    null_ratio = X.isnull().mean()
+    X = X.loc[:, null_ratio < 0.8]
+
+    # Fill remaining null
+    X = X.fillna("missing")
+
+    # Train temporary model
+    model = CatBoostClassifier(
+        iterations=200,
+        depth=6,
+        learning_rate=0.1,
+        verbose=False
+    )
+
+    model.fit(X, y)
+
+    importances = model.get_feature_importance()
+
+    feature_scores = dict(zip(X.columns, importances))
+
+    # Sort features
+    sorted_features = sorted(
+        feature_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    # Keep top features
+    selected = [f[0] for f in sorted_features if f[1] > 1]
+
+    with open("selected_features.json", "w") as f:
+        json.dump(selected, f)
+
+    print("Selected features:", selected)
+
+    return selected
