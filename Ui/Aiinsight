@@ -1,0 +1,45 @@
+<script>
+export let prediction;
+
+let features = prediction.features || [];
+
+let sorted = [...features]
+    .sort((a,b) => b.importance - a.importance)
+    .slice(0,3);
+
+function recommendation(reason){
+    const map = {
+        "MKD-Reuters": "Check Reuters market data feed latency.",
+        "1OFF-Upstream Feed Issue": "Verify upstream data feed pipeline.",
+        "BD-Unmapped": "Validate instrument mapping in reference data."
+    };
+
+    return map[reason] || "Manual investigation recommended.";
+}
+
+function confidenceLabel(conf){
+    if(conf > 0.8) return "Strong Confidence";
+    if(conf > 0.5) return "Moderate Confidence";
+    return "Low Confidence";
+}
+</script>
+
+<div class="insights">
+
+<h3>AI Insights</h3>
+
+<p><b>Prediction:</b> {prediction.value}</p>
+<p><b>Confidence:</b> {(prediction.confidence*100).toFixed(2)}%</p>
+<p><b>Confidence Level:</b> {confidenceLabel(prediction.confidence)}</p>
+
+<h4>Top Drivers</h4>
+<ul>
+{#each sorted as f}
+<li>{f.key} ({(f.importance*100).toFixed(1)}%)</li>
+{/each}
+</ul>
+
+<h4>Recommended Action</h4>
+<p>{recommendation(prediction.value)}</p>
+
+</div>
