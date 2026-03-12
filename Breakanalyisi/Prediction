@@ -1,50 +1,89 @@
 import joblib
 import pandas as pd
 
+########################################
+# Load Model and Encoder
+########################################
+
 model = joblib.load("break_rootcause_model.pkl")
 encoder = joblib.load("root_cause_encoder.pkl")
 
+########################################
+# Load Testing Data
+########################################
 
-def predict_root_cause(data):
+df = pd.read_csv("testing.csv", encoding="latin1", low_memory=False)
 
-    df = pd.DataFrame([data])
+print("Testing data shape:", df.shape)
 
-    prediction = model.predict(df)
+########################################
+# Data Preprocessing (same as training)
+########################################
 
-    root_cause = encoder.inverse_transform(prediction)
+df["BREAK AMOUNT GBP"] = pd.to_numeric(df["BREAK AMOUNT GBP"], errors="coerce")
+df["ABS GBP"] = pd.to_numeric(df["ABS GBP"], errors="coerce")
+df["Age Days"] = pd.to_numeric(df["Age Days"], errors="coerce")
 
-    return root_cause[0]
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
+df["year"] = df["Date"].dt.year
+df["month"] = df["Date"].dt.month
+df["day"] = df["Date"].dt.day
 
-##########################################
-# Example Break
-##########################################
+df["Comments"] = df["Comments"].fillna("No Comment")
 
-new_break = {
+numeric_cols = ["BREAK AMOUNT GBP","ABS GBP","Age Days"]
 
-"Asset Class": "Rates",
-"Team": "Accounting",
-"Entity": "CIB",
-"Type of break": "Valuation",
-"Account Group": "Derivatives",
-"Products Reconciled": "IRS",
-"TRADE CCY": "USD",
-"Bucket": "1-5 days",
-"True/Systemic Breaks": "True",
-"Cash/Non Cash": "Non Cash",
+for col in numeric_cols:
+    df[col] = df[col].fillna(df[col].median())
 
-"BREAK AMOUNT GBP": 250000,
-"ABS GBP": 250000,
-"Age Days": 2,
+df.fillna("UNKNOWN", inplace=True)
 
-"year": 2025,
-"month": 3,
-"day": 10,
+########################################
+# Select Features (same as training)
+########################################
 
-"Comments": "FX rate mismatch"
+features = [
 
-}
+"Asset Class",
+"Team",
+"Entity",
+"Type of break",
+"Account Group",
+"Products Reconciled",
+"TRADE CCY",
+"Bucket",
+"True/Systemic Breaks",
+"Cash/Non Cash",
 
-result = predict_root_cause(new_break)
+"BREAK AMOUNT GBP",
+"ABS GBP",
+"Age Days",
 
-print("Predicted Root Cause:", result)
+"year",
+"month",
+"day",
+
+"Comments"
+
+]
+
+X = df[features]
+
+########################################
+# Prediction
+########################################
+
+predictions = model.predict(X)
+
+predicted_labels = encoder.inverse_transform(predictions)
+
+df["Predicted_Root_Cause"] = predicted_labels
+
+########################################
+# Save Results
+########################################
+
+df.to_csv("break_predictions.csv", index=False)
+
+print("Predictions saved to break_predictions.csv")
