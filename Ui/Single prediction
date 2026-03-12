@@ -1,0 +1,27 @@
+<div class="layout">
+
+<div class="left">
+    <!-- existing UI -->
+</div>
+
+<div class="right">
+    <AIInsights prediction={modelOutput}/>
+</div>
+
+</div>
+
+.layout{
+display:flex;
+gap:30px;
+}
+
+.left{
+flex:2;
+}
+
+.right{
+flex:1;
+background:#f8f8f8;
+padding:20px;
+border-radius:6px;
+}
