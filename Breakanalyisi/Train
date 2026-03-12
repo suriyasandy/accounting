@@ -1,0 +1,217 @@
+import pandas as pd
+import numpy as np
+
+from catboost import CatBoostClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
+import joblib
+
+
+#############################################
+# 1 LOAD DATA
+#############################################
+
+df = pd.read_csv("accounting_breaks.csv")
+
+print("Dataset shape:", df.shape)
+
+
+#############################################
+# 2 DATA CLEANING
+#############################################
+
+numeric_cols = [
+    "BREAK AMOUNT GBP",
+    "ABS GBP",
+    "Age Days"
+]
+
+for col in numeric_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+
+#############################################
+# 3 FEATURE ENGINEERING
+#############################################
+
+df["year"] = df["Date"].dt.year
+df["month"] = df["Date"].dt.month
+df["day"] = df["Date"].dt.day
+
+
+#############################################
+# 4 HANDLE MISSING VALUES
+#############################################
+
+df["Comments"] = df["Comments"].fillna("No Comment")
+
+for col in numeric_cols:
+    df[col] = df[col].fillna(df[col].median())
+
+df.fillna("UNKNOWN", inplace=True)
+
+
+#############################################
+# 5 TARGET COLUMN
+#############################################
+
+target = "Root Cause identified"
+
+df = df[df[target] != "UNKNOWN"]
+
+
+#############################################
+# 6 FEATURE SELECTION
+#############################################
+
+features = [
+
+"Asset Class",
+"Team",
+"Entity",
+"Type of break",
+"Account Group",
+"Products Reconciled",
+"TRADE CCY",
+"Bucket",
+"True/Systemic Breaks",
+"Cash/Non Cash",
+
+"BREAK AMOUNT GBP",
+"ABS GBP",
+"Age Days",
+
+"year",
+"month",
+"day",
+
+"Comments"
+
+]
+
+X = df[features]
+y = df[target]
+
+
+#############################################
+# 7 ENCODE TARGET
+#############################################
+
+label_encoder = LabelEncoder()
+
+y = label_encoder.fit_transform(y)
+
+joblib.dump(label_encoder, "root_cause_encoder.pkl")
+
+
+#############################################
+# 8 TRAIN TEST SPLIT
+#############################################
+
+X_train, X_test, y_train, y_test = train_test_split(
+
+    X,
+    y,
+    test_size=0.2,
+    random_state=42
+)
+
+
+#############################################
+# 9 CATEGORICAL FEATURES
+#############################################
+
+categorical_features = [
+
+"Asset Class",
+"Team",
+"Entity",
+"Type of break",
+"Account Group",
+"Products Reconciled",
+"TRADE CCY",
+"Bucket",
+"True/Systemic Breaks",
+"Cash/Non Cash",
+"Comments"
+
+]
+
+cat_features_index = [X.columns.get_loc(col) for col in categorical_features]
+
+
+#############################################
+# 10 TRAIN CATBOOST MODEL
+#############################################
+
+model = CatBoostClassifier(
+
+    iterations=500,
+    depth=6,
+    learning_rate=0.05,
+    loss_function="MultiClass",
+    eval_metric="Accuracy",
+    random_seed=42,
+    verbose=100
+
+)
+
+model.fit(
+
+    X_train,
+    y_train,
+    cat_features=cat_features_index,
+    eval_set=(X_test, y_test)
+
+)
+
+
+#############################################
+# 11 MODEL EVALUATION
+#############################################
+
+preds = model.predict(X_test)
+
+print("\nClassification Report:\n")
+print(classification_report(y_test, preds))
+
+
+#############################################
+# 12 FEATURE IMPORTANCE
+#############################################
+
+importance = model.get_feature_importance()
+
+feature_importance = pd.DataFrame({
+
+    "feature": X.columns,
+    "importance": importance
+
+}).sort_values(by="importance", ascending=False)
+
+print("\nFeature Importance:\n")
+
+print(feature_importance)
+
+
+plt.figure(figsize=(10,6))
+
+plt.barh(feature_importance["feature"], feature_importance["importance"])
+
+plt.title("Feature Importance")
+
+plt.show()
+
+
+#############################################
+# 13 SAVE MODEL
+#############################################
+
+joblib.dump(model, "break_rootcause_model.pkl")
+
+print("\nModel saved successfully")
