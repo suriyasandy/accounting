@@ -1,27 +1,189 @@
-<div class="layout">
+<script lang="ts">
 
-<div class="left">
-    <!-- existing UI -->
+import FeatureImportanceBarChart from "$lib/components/FeatureImportanceBarChart.svelte";
+import { type FeatureImportance, type PredictorModelOutput } from "$lib/interfaces";
+
+export let modelOutput: PredictorModelOutput;
+
+/* Feature importance chart labels */
+let featureChartLabels =
+    modelOutput.features?.map((feat: FeatureImportance) => {
+        return [`${feat.key}`, `${feat.value}`];
+    }) ?? [];
+
+/* Feature importance chart scores */
+let featureChartScores =
+    modelOutput.features?.map((feat: FeatureImportance) => {
+        return 100 * feat.importance;
+    }) ?? [];
+
+/* Confidence formatting */
+let confidencePercent = (modelOutput.confidence * 100).toFixed(2);
+
+</script>
+
+
+<div class="predictionLayout">
+
+<!-- LEFT SIDE (Existing UI) -->
+<div class="leftPanel">
+
+<table>
+
+<tr>
+<td>Column</td>
+<td>{modelOutput.key}</td>
+</tr>
+
+<tr>
+<td>Prediction</td>
+<td>{modelOutput.value}</td>
+</tr>
+
+<tr>
+<td>Confidence</td>
+<td>{confidencePercent}%</td>
+</tr>
+
+<tr>
+<td>Timestamp</td>
+<td>{modelOutput.timestamp}</td>
+</tr>
+
+{#if modelOutput.root_cause}
+<tr>
+<td>Prediction Driver</td>
+<td>{modelOutput.root_cause}</td>
+</tr>
+{/if}
+
+</table>
+
+
+{#if modelOutput.features && modelOutput.features.length > 0}
+
+<div class="chartWrapper">
+
+<FeatureImportanceBarChart
+barLabels={featureChartLabels}
+barValues={featureChartScores}
+/>
+
 </div>
 
-<div class="right">
-    <AIInsights prediction={modelOutput}/>
-</div>
+{/if}
 
 </div>
 
-.layout{
-display:flex;
-gap:30px;
+
+<!-- RIGHT SIDE (NEW INSIGHTS PANEL) -->
+
+<div class="rightPanel">
+
+<h3>AI Insights</h3>
+
+<p><b>Prediction:</b> {modelOutput.value}</p>
+
+<p><b>Confidence:</b> {confidencePercent}%</p>
+
+
+<h4>Top Drivers</h4>
+
+{#if modelOutput.features && modelOutput.features.length > 0}
+
+<ul>
+
+{#each modelOutput.features
+.sort((a,b)=>b.importance-a.importance)
+.slice(0,3) as feat}
+
+<li>
+<b>{feat.key}</b> ({(feat.importance * 100).toFixed(1)}%)
+</li>
+
+{/each}
+
+</ul>
+
+{/if}
+
+
+<h4>Suggested Action</h4>
+
+<p>
+
+{#if modelOutput.value === "MKD-Reuters"}
+Check Reuters market data feed for delay or outage.
+
+{:else if modelOutput.value === "1OFF-Upstream Feed Issue"}
+Verify upstream feed pipeline and ingestion service.
+
+{:else if modelOutput.value === "BD-Unmapped"}
+Validate instrument mapping in reference data.
+
+{:else if modelOutput.value === "EUC-Rejected"}
+Check EUC validation rules and input formatting.
+
+{:else}
+
+Manual investigation recommended.
+
+{/if}
+
+</p>
+
+</div>
+
+</div>
+
+
+<style>
+
+table {
+width: 720px;
+border-collapse: collapse;
+margin-bottom: 10px;
 }
 
-.left{
+table tr:nth-child(odd) {
+background-color: #eee;
+}
+
+td {
+padding: 8px;
+}
+
+.chartWrapper {
+width: 650px;
+height: 400px;
+}
+
+/* NEW LAYOUT */
+
+.predictionLayout{
+display:flex;
+gap:40px;
+align-items:flex-start;
+}
+
+.leftPanel{
 flex:2;
 }
 
-.right{
+.rightPanel{
 flex:1;
-background:#f8f8f8;
+background:#f7f7f7;
 padding:20px;
 border-radius:6px;
+border:1px solid #ddd;
 }
+
+.rightPanel h3{
+margin-top:0;
+}
+
+.rightPanel ul{
+padding-left:20px;
+}
+
+</style>
