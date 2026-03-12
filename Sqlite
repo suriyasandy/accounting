@@ -30,9 +30,9 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         self._init_tables()
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
     # CREATE TABLE
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
 
     def _init_tables(self):
 
@@ -49,7 +49,6 @@ class LentilDatabaseSQLite(LentilDatabase):
                 controlGroup TEXT,
                 prediction TEXT,
                 insertedAt TEXT
-
             )
             """
         )
@@ -61,12 +60,19 @@ class LentilDatabaseSQLite(LentilDatabase):
             """
         )
 
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_exception_timestamp
+            ON predictions(exceptionTimestamp)
+            """
+        )
+
         self.conn.commit()
         cursor.close()
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
     # CONVERT MODEL OUTPUT
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
 
     def _prediction_to_json(self, model_output):
 
@@ -74,26 +80,39 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         for p in model_output:
 
-            for fi in p.feature_importances:
+            features = []
 
-                prediction.append(
+            for fi in p.features:
+
+                features.append(
                     {
-                        "timestamp": p.timestamp.isoformat(),
                         "key": fi.key,
-                        "value": fi.value
+                        "value": fi.value,
+                        "importance": float(fi.importance)
                     }
                 )
 
+            prediction.append(
+                {
+                    "key": p.key,
+                    "value": p.value,
+                    "confidence": float(p.confidence),
+                    "timestamp": p.timestamp.isoformat(),
+                    "root_cause": getattr(p, "root_cause", None),
+                    "features": features
+                }
+            )
+
         return prediction
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
     # CREATE RECORD
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
 
     def _record_from_prediction(
-        self,
-        b_exc: BusinessException,
-        model_output: List[PredictorModelOutput],
+            self,
+            b_exc: BusinessException,
+            model_output: List[PredictorModelOutput],
     ) -> Mapping[str, Any]:
 
         if not model_output:
@@ -101,11 +120,10 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         control_group = model_output[0].control_group.value
 
-        # OMRC special handling
         if control_group == "OMRC":
 
-            response_code = b_exc.get("reasonCodeId")
-            response_description = b_exc.get("lastComment")
+            response_code = b_exc.get("controlObjectName")
+            response_description = b_exc.get("omrctradeAlertdescription")
 
         else:
 
@@ -124,57 +142,61 @@ class LentilDatabaseSQLite(LentilDatabase):
 
         }
 
-def insert_prediction(
-    self,
-    b_exc: BusinessException,
-    model_output: List[PredictorModelOutput],
-):
+    # ---------------------------------------------------------
+    # INSERT SINGLE
+    # ---------------------------------------------------------
 
-    cursor = self.conn.cursor()
+    def insert_prediction(
+            self,
+            b_exc: BusinessException,
+            model_output: List[PredictorModelOutput],
+    ):
 
-    record = self._record_from_prediction(b_exc, model_output)
+        cursor = self.conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT INTO predictions
-        (exceptionId, exceptionTimestamp, responseCode,
-         responseDescription, controlGroup, prediction, insertedAt)
+        record = self._record_from_prediction(b_exc, model_output)
 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        cursor.execute(
+            """
+            INSERT INTO predictions
+            (exceptionId, exceptionTimestamp, responseCode,
+             responseDescription, controlGroup, prediction, insertedAt)
 
-        ON CONFLICT(exceptionId)
-        DO UPDATE SET
-            exceptionTimestamp=excluded.exceptionTimestamp,
-            responseCode=excluded.responseCode,
-            responseDescription=excluded.responseDescription,
-            controlGroup=excluded.controlGroup,
-            prediction=excluded.prediction,
-            insertedAt=excluded.insertedAt
-        """,
-        (
-            record["exceptionId"],
-            record["exceptionTimestamp"],
-            record["responseCode"],
-            record["responseDescription"],
-            record["controlGroup"],
-            record["prediction"],
-            record["insertedAt"],
-        ),
-    )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
 
-    self.conn.commit()
-    cursor.close()
+            ON CONFLICT(exceptionId)
+            DO UPDATE SET
 
+                exceptionTimestamp=excluded.exceptionTimestamp,
+                responseCode=excluded.responseCode,
+                responseDescription=excluded.responseDescription,
+                controlGroup=excluded.controlGroup,
+                prediction=excluded.prediction,
+                insertedAt=excluded.insertedAt
+            """,
+            (
+                record["exceptionId"],
+                record["exceptionTimestamp"],
+                record["responseCode"],
+                record["responseDescription"],
+                record["controlGroup"],
+                record["prediction"],
+                record["insertedAt"],
+            ),
+        )
 
-    # --------------------------------------------------------
-    # INSERT MULTIPLE
-    # --------------------------------------------------------
+        self.conn.commit()
+        cursor.close()
+
+    # ---------------------------------------------------------
+    # INSERT BULK
+    # ---------------------------------------------------------
 
     def insert_predictions(
-        self,
-        predictions: Iterator[
-            Tuple[BusinessException, List[PredictorModelOutput]]
-        ],
+            self,
+            predictions: Iterator[
+                Tuple[BusinessException, List[PredictorModelOutput]]
+            ],
     ):
 
         cursor = self.conn.cursor()
@@ -207,6 +229,7 @@ def insert_prediction(
 
             ON CONFLICT(exceptionId)
             DO UPDATE SET
+
                 exceptionTimestamp=excluded.exceptionTimestamp,
                 responseCode=excluded.responseCode,
                 responseDescription=excluded.responseDescription,
@@ -222,17 +245,11 @@ def insert_prediction(
 
         self.logger.debug(f"Inserted {len(records)} predictions")
 
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
     # QUERY GRID
-    # --------------------------------------------------------
+    # ---------------------------------------------------------
 
-    def query_predictions(
-        self,
-        start_row: int,
-        end_row: int,
-        sort_model,
-        filter_model,
-    ) -> Dict[str, Any]:
+    def query_predictions(self, start_row, end_row, sort_model, filter_model):
 
         limit = end_row - start_row
 
@@ -242,6 +259,7 @@ def insert_prediction(
             """
             SELECT *
             FROM predictions
+            ORDER BY exceptionTimestamp DESC
             LIMIT ? OFFSET ?
             """,
             (limit, start_row),
@@ -253,83 +271,29 @@ def insert_prediction(
 
             prediction = json.loads(row["prediction"])
 
-            row_data.append(
-                {
-                    "exceptionId": row["exceptionId"],
-                    "exceptionTimestamp": row["exceptionTimestamp"],
-                    "responseCode": row["responseCode"],
-                    "responseDescription": row["responseDescription"],
-                    "controlGroup": row["controlGroup"],
-                    "prediction.timestamp": [
-                        datetime.fromisoformat(p["timestamp"])
-                        for p in prediction
-                    ],
-                    "prediction.key": [p["key"] for p in prediction],
-                    "prediction.value": [p["value"] for p in prediction],
-                }
-            )
+            row_data.append({
 
-        row_count = self.count_query_predictions()
+                "exceptionId": row["exceptionId"],
+                "exceptionTimestamp": row["exceptionTimestamp"],
+                "responseCode": row["responseCode"],
+                "responseDescription": row["responseDescription"],
+                "controlGroup": row["controlGroup"],
 
-        cursor.close()
+                "prediction.timestamp": [p["timestamp"] for p in prediction],
+                "prediction.key": [p["key"] for p in prediction],
+                "prediction.value": [p["value"] for p in prediction],
 
-        return {
-            "rowData": row_data,
-            "rowCount": row_count,
-        }
+            })
 
-    # --------------------------------------------------------
-    # COUNT
-    # --------------------------------------------------------
-
-    def count_query_predictions(self):
-
-        cursor = self.conn.cursor()
-
-        result = cursor.execute(
+        row_count = cursor.execute(
             "SELECT COUNT(*) FROM predictions"
-        ).fetchone()
+        ).fetchone()[0]
 
         cursor.close()
-
-        return result[0]
-
-    # --------------------------------------------------------
-    # EXCEPTION DETAILS
-    # --------------------------------------------------------
-
-    def get_predictions_by_exception_id(
-        self,
-        exception_id: str,
-    ):
-
-        cursor = self.conn.cursor()
-
-        row = cursor.execute(
-            """
-            SELECT *
-            FROM predictions
-            WHERE exceptionId = ?
-            """,
-            (exception_id,),
-        ).fetchone()
-
-        cursor.close()
-
-        if row is None:
-            return {}
-
-        prediction = json.loads(row["prediction"])
 
         return {
-            "exceptionId": row["exceptionId"],
-            "exceptionTimestamp": row["exceptionTimestamp"],
-            "responseCode": row["responseCode"],
-            "responseDescription": row["responseDescription"],
-            "controlGroup": row["controlGroup"],
-            "prediction.timestamp": [
-                datetime.fromisoformat(p["timestamp"]) for p in prediction
-            ],
-            "prediction.key": [p["key"] for p in prediction],
-            "prediction.value": [p["value"] for p in prediction],
+
+            "rowData": row_data,
+            "rowCount": row_count
+
         }
