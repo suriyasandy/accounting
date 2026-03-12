@@ -1,50 +1,106 @@
-def get_predictions_by_exception_id(
-        self,
-        exception_id: str,
-):
+def query_predictions(self, start_row, end_row, sort_model, filter_model):
+
+    limit = end_row - start_row
+
+    where_clauses = []
+    params = []
+
+    # -----------------------------
+    # FILTER
+    # -----------------------------
+    if isinstance(filter_model, list):
+
+        for filter_data in filter_model:
+
+            col = filter_data.get("colId")
+            value = filter_data.get("filter")
+
+            if col and value:
+                where_clauses.append(f"{col} LIKE ?")
+                params.append(f"%{value}%")
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    # -----------------------------
+    # SORT
+    # -----------------------------
+    order_sql = ""
+
+    if sort_model:
+
+        col = sort_model[0]["colId"]
+        direction = sort_model[0]["sort"].upper()
+
+        # only allow safe DB columns
+        allowed_cols = [
+            "exceptionId",
+            "exceptionTimestamp",
+            "responseCode",
+            "responseDescription",
+            "controlGroup",
+            "insertedAt"
+        ]
+
+        if col in allowed_cols:
+            order_sql = f"ORDER BY {col} {direction}"
+
+    query = f"""
+        SELECT *
+        FROM predictions
+        {where_sql}
+        {order_sql}
+        LIMIT ? OFFSET ?
+    """
+
+    params.extend([limit, start_row])
 
     cursor = self.conn.cursor()
 
-    row = cursor.execute(
-        """
-        SELECT *
-        FROM predictions
-        WHERE exceptionId = ?
-        """,
-        (exception_id,),
-    ).fetchone()
+    rows = cursor.execute(query, params).fetchall()
+
+    row_data = []
+
+    for row in rows:
+
+        prediction = json.loads(row["prediction"])
+
+        row_data.append({
+
+            "exceptionId": row["exceptionId"],
+            "exceptionTimestamp": row["exceptionTimestamp"],
+            "responseCode": row["responseCode"],
+            "responseDescription": row["responseDescription"],
+            "controlGroup": row["controlGroup"],
+
+            "prediction.timestamp": [
+                p["timestamp"] for p in prediction
+            ],
+
+            "prediction.key": [
+                p["key"] for p in prediction
+            ],
+
+            "prediction.value": [
+                p["value"] for p in prediction
+            ],
+
+        })
+
+    # -----------------------------
+    # COUNT
+    # -----------------------------
+    count_query = f"SELECT COUNT(*) FROM predictions {where_sql}"
+
+    row_count = cursor.execute(
+        count_query,
+        params[:-2]
+    ).fetchone()[0]
 
     cursor.close()
 
-    if row is None:
-        return {}
-
-    prediction_json = row["prediction"]
-
-    if prediction_json:
-        prediction = json.loads(prediction_json)
-    else:
-        prediction = []
-
     return {
-
-        "exceptionId": row["exceptionId"],
-        "exceptionTimestamp": row["exceptionTimestamp"],
-        "responseCode": row["responseCode"],
-        "responseDescription": row["responseDescription"],
-        "controlGroup": row["controlGroup"],
-
-        "prediction.timestamp": [
-            p.get("timestamp") for p in prediction
-        ],
-
-        "prediction.key": [
-            p.get("key") for p in prediction
-        ],
-
-        "prediction.value": [
-            p.get("value") for p in prediction
-        ],
-
-        "prediction": prediction
+        "rowData": row_data,
+        "rowCount": row_count
     }
