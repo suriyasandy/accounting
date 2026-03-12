@@ -1,6 +1,8 @@
 import csv
 from typing import Iterator
+
 from lentil.interfaces import BusinessException
+from lentil.interfaces import BusinessExceptionHeader
 
 
 class LocalExceptionLoader:
@@ -16,10 +18,16 @@ class LocalExceptionLoader:
 
             for row in reader:
 
-                # Convert CSV row to BusinessException
-                b_exc = BusinessException()
+                # Build header
+                header = BusinessExceptionHeader(
+                    exception_id=row.get("exceptionId"),
+                    control_group=row.get("controlGroup", "OMRC")
+                )
 
-                for k, v in row.items():
-                    b_exc[k] = v
+                # Create BusinessException properly
+                b_exc = BusinessException(
+                    header=header,
+                    attributes=row
+                )
 
                 yield b_exc
