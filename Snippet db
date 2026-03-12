@@ -1,63 +1,50 @@
-def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
+def get_predictions_by_exception_id(
+        self,
+        exception_id: str,
+):
 
-    encoded = self.encode(b_exc)
+    cursor = self.conn.cursor()
 
-    # Prediction probabilities
-    prediction_probs = self._classifier.predict_proba(encoded)
+    row = cursor.execute(
+        """
+        SELECT *
+        FROM predictions
+        WHERE exceptionId = ?
+        """,
+        (exception_id,),
+    ).fetchone()
 
-    # Feature importance
-    importances = self._classifier.get_feature_importance()
+    cursor.close()
 
-    best_class_i = np.argmax(prediction_probs)
+    if row is None:
+        return {}
 
-    confidence = float(prediction_probs[best_class_i])
+    prediction_json = row["prediction"]
 
-    predicted_value = self._encoder.decode(
-        self._classifier.classes_[best_class_i]
-    )
+    if prediction_json:
+        prediction = json.loads(prediction_json)
+    else:
+        prediction = []
 
-    # Build feature importance list
-    features = []
+    return {
 
-    for i, key in enumerate(self._feature_keys):
+        "exceptionId": row["exceptionId"],
+        "exceptionTimestamp": row["exceptionTimestamp"],
+        "responseCode": row["responseCode"],
+        "responseDescription": row["responseDescription"],
+        "controlGroup": row["controlGroup"],
 
-        features.append(
-            FeatureImportance(
-                key=key,
-                value=b_exc.get(key),
-                importance=float(importances[i])
-            )
-        )
+        "prediction.timestamp": [
+            p.get("timestamp") for p in prediction
+        ],
 
-    # ----------------------------------------------------
-    # ROOT CAUSE FROM FEATURE CONTRIBUTION
-    # ----------------------------------------------------
+        "prediction.key": [
+            p.get("key") for p in prediction
+        ],
 
-    root_cause = None
+        "prediction.value": [
+            p.get("value") for p in prediction
+        ],
 
-    try:
-
-        contrib = self._classifier.get_feature_importance(
-            encoded,
-            type="PredictionValuesChange"
-        )
-
-        contrib = np.array(contrib)
-
-        idx = int(np.argmax(contrib))
-
-        root_cause = self._feature_keys[idx]
-
-    except Exception as e:
-
-        logging.warning(f"Root cause calculation failed: {e}")
-
-    return PredictorModelOutput(
-        control_group=self.control_group,
-        key=self._predict_key,
-        value=predicted_value,
-        confidence=confidence,
-        timestamp=datetime.now(),
-        features=features,
-        root_cause=root_cause
-    )
+        "prediction": prediction
+    }
