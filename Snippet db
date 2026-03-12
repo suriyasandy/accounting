@@ -1,26 +1,29 @@
-for model in self.models:
+    @staticmethod
+    def remove_unusable_columns(columns: List[str]) -> List[str]:
+        """
+        Filters out columns that should not be used for ML training.
+        These fields are populated only AFTER analysts start working
+        on an exception and would leak future information.
+        """
 
-    try:
+        columns_set = set(columns)
 
-        logger.info(f"Model features keys: {model.feature_keys}")
+        columns_set -= {
+            "assignedQueue",
+            "assignedUser",
+            "closedMode",
+            "lastExecutiveSummary",
+            "omrctradeComment",
+            "priority",
+            "processAdditionalInformation",
+            "processInstanceId",
+            "processParticipants",
+            "reasonCodeId",
+            "updatedBy",
+            "updatedDate",
+            "version",
+            "workflowAction",
+            "workflowStatus",
+        }
 
-        prediction = model.inference_single(b_exc)
-
-        logger.info(
-            f"Raw Predictions for {b_exc.exception_id}: {prediction}"
-        )
-
-        if prediction is None:
-            continue
-
-        if prediction.value == SimpleEncoder.MISSING:
-            continue
-
-        prediction.exception_id = b_exc.exception_id
-        predictions.append(prediction)
-
-    except Exception as e:
-
-        logger.error(
-            f"Prediction failed for exception {b_exc.exception_id}: {e}"
-        )
+        return list(columns_set)
