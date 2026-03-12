@@ -1,16 +1,16 @@
 def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
 
-    # -----------------------------
+    # -------------------------
     # Encode features
-    # -----------------------------
+    # -------------------------
     encoded = self.encode(b_exc)
     encoded = np.array(encoded).reshape(1, -1)
 
     pool = Pool(encoded)
 
-    # -----------------------------
+    # -------------------------
     # Prediction
-    # -----------------------------
+    # -------------------------
     prediction_probs = self._classifier.predict_proba(pool)[0]
 
     best_class_i = int(np.argmax(prediction_probs))
@@ -20,10 +20,11 @@ def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
         self._classifier.classes_[best_class_i]
     )
 
-    # -----------------------------
-    # Feature importance (SHAP)
-    # -----------------------------
+    # -------------------------
+    # Feature Importance (SHAP)
+    # -------------------------
     try:
+
         shap_values = self._classifier.get_feature_importance(
             pool,
             type="ShapValues"
@@ -31,10 +32,10 @@ def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
 
         shap_values = np.array(shap_values)
 
-        # shape = (1, features + bias)
+        # Shape: (1 , features + 1)
         shap_values = shap_values[0]
 
-        # remove bias column
+        # remove bias
         shap_values = shap_values[:-1]
 
         # absolute contribution
@@ -50,36 +51,43 @@ def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
         logger.warning(f"Feature importance failed: {e}")
         contrib = np.zeros(len(self._feature_keys))
 
-    # -----------------------------
+    # -------------------------
     # Build feature list
-    # -----------------------------
+    # -------------------------
     features = []
 
     for i, key in enumerate(self._feature_keys):
 
-        importance = float(contrib[i]) if i < len(contrib) else 0.0
+        if i < len(contrib):
+            importance = float(contrib[i])
+        else:
+            importance = 0.0
 
-        features.append({
-            "key": key,
-            "value": b_exc.get(key),
-            "importance": importance
-        })
+        features.append(
+            FeatureImportance(
+                key=key,
+                value=b_exc.get(key),
+                importance=importance
+            )
+        )
 
-    # -----------------------------
-    # Root cause
-    # -----------------------------
+    # -------------------------
+    # Root Cause
+    # -------------------------
     root_cause = None
 
     try:
+
         if len(contrib) > 0:
             idx = int(np.argmax(contrib))
             root_cause = self._feature_keys[idx]
+
     except Exception as e:
         logger.warning(f"Root cause calculation failed: {e}")
 
-    # -----------------------------
+    # -------------------------
     # Return prediction
-    # -----------------------------
+    # -------------------------
     return PredictorModelOutput(
         control_group=self.control_group,
         key=self._predict_key,
@@ -87,5 +95,5 @@ def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
         confidence=confidence,
         timestamp=datetime.now(),
         features=features,
-        root_cause=root_cause
+        root_cause=root_cause,
     )
