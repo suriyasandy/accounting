@@ -1,130 +1,90 @@
-<script lang="ts">
-import backend from "$lib/backend";
-import { onMount } from "svelte";
-import SinglePrediction from "$lib/components/SinglePrediction.svelte";
+def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
 
-export let data;
+    # -----------------------------
+    # Encode features
+    # -----------------------------
+    encoded = self.encode(b_exc)
 
-let result = {
-    exceptionId: "",
-    exceptionTimestamp: "",
-    controlGroup: "",
-    responseCode: "",
-    responseDescription: "",
-    prediction: []
-};
+    import numpy as np
+    from catboost import Pool
 
-onMount(async () => {
+    encoded = np.array(encoded).reshape(1, -1)
 
-    result = {
-        exceptionId: data.exceptionId,
-        exceptionTimestamp: "loading...",
-        controlGroup: "loading...",
-        responseCode: "loading...",
-        responseDescription: "loading...",
-        prediction: []
-    };
+    pool = Pool(encoded)
 
-    try {
+    # -----------------------------
+    # Prediction
+    # -----------------------------
+    prediction_probs = self._classifier.predict_proba(pool)[0]
 
-        let response = await backend.getPredictionsForExceptionId(
-            data.exceptionId
-        );
+    best_class_i = int(np.argmax(prediction_probs))
+    confidence = float(prediction_probs[best_class_i])
 
-        console.log("Prediction API response:", response);
+    predicted_value = self._encoder.decode(
+        self._classifier.classes_[best_class_i]
+    )
 
-        // FIX: handle wrapped API response
-        if (response?.data) {
-            result = response.data;
-        } else {
-            result = response;
-        }
+    # -----------------------------
+    # Feature importance
+    # -----------------------------
+    try:
 
-    } catch (err) {
+        contrib = self._classifier.get_feature_importance(
+            pool,
+            type="PredictionValuesChange"
+        )
 
-        console.error("Prediction API failed:", err);
+        contrib = np.array(contrib)
 
-        result = {
-            exceptionId: `${data.exceptionId} not found`,
-            exceptionTimestamp: "",
-            controlGroup: "",
-            responseCode: "",
-            responseDescription: "",
-            prediction: []
-        };
-    }
+        # CatBoost sometimes returns [[...]]
+        if contrib.ndim > 1:
+            contrib = contrib[0]
 
-});
-</script>
+        contrib = np.nan_to_num(contrib)
 
-<h3>Exception ID {result.exceptionId}</h3>
+    except Exception as e:
 
-<table>
+        logger.warning(f"Feature importance failed: {e}")
+        contrib = np.zeros(len(self._feature_keys))
 
-<tr>
-<td>Control Group</td>
-<td>{result.controlGroup}</td>
-</tr>
+    # -----------------------------
+    # Build feature list
+    # -----------------------------
+    features = []
 
-{#if result.controlGroup === "OMRC"}
+    for i, key in enumerate(self._feature_keys):
 
-<tr>
-<td>Control Object</td>
-<td>{result.responseCode}</td>
-</tr>
+        importance = float(contrib[i]) if i < len(contrib) else 0.0
 
-<tr>
-<td>Alert Description</td>
-<td>{result.responseDescription}</td>
-</tr>
+        features.append({
+            "key": key,
+            "value": b_exc.get(key),
+            "importance": importance
+        })
 
-{:else}
+    # -----------------------------
+    # Root cause
+    # -----------------------------
+    root_cause = None
 
-<tr>
-<td>Response Code</td>
-<td>{result.responseCode}</td>
-</tr>
+    try:
 
-<tr>
-<td>Response Description</td>
-<td>{result.responseDescription}</td>
-</tr>
+        if len(contrib) > 0:
+            idx = int(np.argmax(contrib))
+            root_cause = self._feature_keys[idx]
 
-{/if}
+    except Exception as e:
+        logger.warning(f"Root cause calculation failed: {e}")
 
-</table>
-
-<h3>Predicted Outcomes</h3>
-
-{#if result.prediction && result.prediction.length > 0}
-
-{#each result.prediction as prediction}
-
-<SinglePrediction
-    modelOutput={prediction}
-/>
-
-{/each}
-
-{:else}
-
-<p>No predictions available.</p>
-
-{/if}
-
-<style>
-
-table {
-    width: 720px;
-    border-collapse: collapse;
-}
-
-table tr:nth-child(odd) {
-    background-color: #eee;
-}
-
-td {
-    padding: 8px;
-}
-
-</style>
+    # -----------------------------
+    # Return result
+    # -----------------------------
+    return PredictorModelOutput(
+        control_group=self.control_group,
+        key=self._predict_key,
+        value=predicted_value,
+        confidence=confidence,
+        timestamp=datetime.now(),
+        features=features,
+        root_cause=root_cause,
+    )
