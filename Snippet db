@@ -1,43 +1,27 @@
-def get_predictions_by_exception_id(self, exception_id: str):
+pool = Pool(encoded)
 
-    cursor = self.conn.cursor()
+contrib = self._classifier.get_feature_importance(
+    pool,
+    type="PredictionValuesChange"
+)
 
-    row = cursor.execute(
-        """
-        SELECT *
-        FROM predictions
-        WHERE exceptionId = ?
-        """,
-        (exception_id,),
-    ).fetchone()
+contrib = np.array(contrib)
 
-    cursor.close()
+best_class_i = np.argmax(prediction_probs)
 
-    if row is None:
-        return {}
+confidence = float(prediction_probs[best_class_i])
 
-    prediction_json = row["prediction"]
+predicted_value = self._encoder.decode(
+    self._classifier.classes_[best_class_i]
+)
 
-    # FIX
-    if prediction_json:
-        prediction = json.loads(prediction_json)
-    else:
-        prediction = []
+features = []
 
-    return {
-        "exceptionId": row["exceptionId"],
-        "exceptionTimestamp": row["exceptionTimestamp"],
-        "responseCode": row["responseCode"],
-        "responseDescription": row["responseDescription"],
-        "controlGroup": row["controlGroup"],
-        "prediction.timestamp": [
-            p.get("timestamp") for p in prediction
-        ],
-        "prediction.key": [
-            p.get("key") for p in prediction
-        ],
-        "prediction.value": [
-            p.get("value") for p in prediction
-        ],
-        "prediction": prediction,
-    }
+for i, key in enumerate(self._feature_keys):
+    features.append(
+        FeatureImportance(
+            key=key,
+            value=b_exc.get(key),
+            importance=float(contrib[i])
+        )
+    )
