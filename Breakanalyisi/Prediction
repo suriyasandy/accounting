@@ -1,0 +1,50 @@
+import joblib
+import pandas as pd
+
+model = joblib.load("break_rootcause_model.pkl")
+encoder = joblib.load("root_cause_encoder.pkl")
+
+
+def predict_root_cause(data):
+
+    df = pd.DataFrame([data])
+
+    prediction = model.predict(df)
+
+    root_cause = encoder.inverse_transform(prediction)
+
+    return root_cause[0]
+
+
+##########################################
+# Example Break
+##########################################
+
+new_break = {
+
+"Asset Class": "Rates",
+"Team": "Accounting",
+"Entity": "CIB",
+"Type of break": "Valuation",
+"Account Group": "Derivatives",
+"Products Reconciled": "IRS",
+"TRADE CCY": "USD",
+"Bucket": "1-5 days",
+"True/Systemic Breaks": "True",
+"Cash/Non Cash": "Non Cash",
+
+"BREAK AMOUNT GBP": 250000,
+"ABS GBP": 250000,
+"Age Days": 2,
+
+"year": 2025,
+"month": 3,
+"day": 10,
+
+"Comments": "FX rate mismatch"
+
+}
+
+result = predict_root_cause(new_break)
+
+print("Predicted Root Cause:", result)
