@@ -1,135 +1,323 @@
 import logging
-
-from argparse import ArgumentParser, Namespace
-from csv import DictReader
+import pickle
+import joblib
+from datetime import datetime
 from pathlib import Path
+from typing import Iterator, List
 
-from lentil.cache import cache, MODELS_DIR
+import json
+import numpy as np
+
+from catboost import CatBoostClassifier, Pool
+from numpy.typing import NDArray
+from sklearn import metrics
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+
+from lentil.cache import MODELS_DIR, cache
 from lentil.data_fetch.epe.controls import ControlGroup
-from lentil.model.business_exception import be_from_dict
-from lentil.model.predictor_model import PredictorModel
+from lentil.model.business_exception import BusinessException
+from lentil.model.output import FeatureImportance, PredictorModelOutput
+from lentil.model.simple_encoder import SimpleEncoder
 from lentil.utilities.log import get_logger
-
 
 logger = get_logger(__name__)
 
 
-# --------------------------------------------------
-# DEFINE FEATURE WHITELIST
-# --------------------------------------------------
+class PredictorModel:
+    """
+    ML model used for predicting missing values in exceptions
+    """
 
-ALLOWED_FEATURES = [
-    "exceptionAge",
-    "omrctradeBasecurrency",
-    "omrctradeOriglegalentity",
-    "omrctradeProduct",
-    "omrctradeTrader",
-    "omrctradeDesk",
-    "omrctradeRegion",
-    "omrctradeTransactiontype",
-    "omrctradeMarketsector",
-    "omrctradeReportingccy",
-    "omrctradeLocation",
-    "lastComment"
-]
+    def __init__(
+        self,
+        control_group: ControlGroup,
+        feature_keys: List[str],
+        predict_key: str,
+    ) -> None:
 
+        self.control_group = control_group
+        self._encoder = SimpleEncoder()
+        self._feature_keys = feature_keys
+        self._predict_key = predict_key
 
-# --------------------------------------------------
-# CLI ARGUMENTS
-# --------------------------------------------------
+        self._classifier = self._init_new_classifier()
 
-def add_args(parser: ArgumentParser) -> ArgumentParser:
+        # TF-IDF root cause model
+        self._tfidf = TfidfVectorizer(max_features=5000, stop_words="english")
+        self._text_model = LogisticRegression(max_iter=1000)
 
-    parser.add_argument(
-        "--control-group",
-        help="Select the control group on which to run this command.",
-        choices=[cg.value for cg in ControlGroup],
-    )
+        self.model_name = self._get_model_name(control_group, predict_key)
 
-    parser.add_argument(
-        "--predict",
-        help="Select the data column that the model should be trained to predict.",
-        metavar="column_key",
-    )
+    # ---------------------------------------------------------
 
-    return parser
+    @staticmethod
+    def _get_model_name(control_group: ControlGroup, predict: str) -> str:
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{control_group.value}_{predict}_{timestamp}.pkl"
 
-# --------------------------------------------------
-# MAIN TRAINING FUNCTION
-# --------------------------------------------------
+    # ---------------------------------------------------------
 
-def main(args: Namespace) -> PredictorModel:
+    def save(self, dir_path: Path):
 
-    # Convert CLI string → Enum
-    if isinstance(args.control_group, str):
-        args.control_group = ControlGroup(args.control_group)
+        with cache.open(dir_path / f"{self.model_name}", "wb") as f:
+            pickle.dump(self, f)
 
-    logger.info(f"Using control group: {args.control_group}")
+    # ---------------------------------------------------------
 
-    dataset_path = Path("epe_data") / args.control_group.value / "filtered.csv"
+    def encode(self, b_exc: BusinessException) -> NDArray[np.int64]:
 
-    logger.info(f"Loading dataset from: {dataset_path}")
+        encoded_row = np.zeros(len(self._feature_keys), dtype=np.int64)
 
-    with cache.open(dataset_path, "r") as f:
+        for i, key in enumerate(self._feature_keys):
 
-        reader = DictReader(f)
+            val = b_exc.get(key)
 
-        fieldnames = reader.fieldnames
+            # ignore comment + label columns
+            if key in ["lastComment", "reasonCodeId"]:
+                val = None
 
-        if fieldnames is None:
-            raise Exception(
-                f"Input file {dataset_path} must contain a header row"
+            val = self._encoder._encode(val, frozen=True)
+            encoded_row[i] = val
+
+        return encoded_row
+
+    # ---------------------------------------------------------
+
+    def inference_single(self, b_exc: BusinessException) -> PredictorModelOutput:
+
+        encoded = self.encode(b_exc)
+
+        pool = Pool(data=[encoded])
+
+        prediction_probs = self._classifier.predict_proba(pool)[0]
+
+        best_class_i = int(np.argmax(prediction_probs))
+        confidence = float(prediction_probs[best_class_i])
+
+        predicted_value = self._encoder.decode(
+            self._classifier.classes_[best_class_i]
+        )
+
+        # feature importance
+        importances = self._classifier.get_feature_importance(pool)
+
+        features = []
+
+        for i, key in enumerate(self._feature_keys):
+
+            features.append(
+                FeatureImportance(
+                    key=key,
+                    value=b_exc.get(key),
+                    importance=float(importances[i]),
+                )
             )
 
-        # Remove unusable columns
-        fieldnames = PredictorModel.remove_unusable_columns(list(fieldnames))
+        # -----------------------------------------------------
+        # ROOT CAUSE
+        # -----------------------------------------------------
 
-        # --------------------------------------------------
-        # FILTER FEATURES
-        # --------------------------------------------------
+        root_cause = None
 
-        feature_keys = [f for f in fieldnames if f in ALLOWED_FEATURES]
+        try:
 
-        logger.info(f"Using {len(feature_keys)} features")
-        logger.info(f"Feature list: {feature_keys}")
+            contrib = self._classifier.get_feature_importance(
+                pool,
+                type="PredictionValuesChange",
+            )
 
-        # --------------------------------------------------
-        # CREATE MODEL
-        # --------------------------------------------------
+            idx = int(np.argmax(contrib))
+            root_cause = self._feature_keys[idx]
 
-        model = PredictorModel(
-            control_group=args.control_group,
-            feature_keys=feature_keys,
-            predict_key=args.predict,
+        except Exception as e:
+
+            logger.warning(f"Root cause calculation failed: {e}")
+
+        return PredictorModelOutput(
+            control_group=self.control_group,
+            key=self._predict_key,
+            value=predicted_value,
+            confidence=confidence,
+            timestamp=datetime.now(),
+            features=features,
+            root_cause=root_cause,
         )
 
-        # Convert CSV rows → BusinessException
-        business_exceptions = (
-            be_from_dict(row) for row in reader
+    # ---------------------------------------------------------
+
+    def inference_bulk(
+        self,
+        exceptions: Iterator[BusinessException],
+    ) -> Iterator[PredictorModelOutput]:
+
+        for exc in exceptions:
+            yield self.inference_single(exc)
+
+    # ---------------------------------------------------------
+
+    def train(self, rows: Iterator[BusinessException]):
+
+        self._encoder = SimpleEncoder()
+
+        rows = list(rows)
+
+        logger.info("Encoding dataset")
+
+        (x_rows, y_rows) = self._encoder.encode_rows(
+            rows,
+            feature_keys=self._feature_keys,
+            predict_key=self._predict_key,
+            frozen=False,
         )
 
-        logger.info("Training model...")
+        # -----------------------------------------------------
+        # REMOVE RARE LABELS
+        # -----------------------------------------------------
 
-        model.train(business_exceptions)
+        from collections import Counter
 
-    logger.info("Saving trained model...")
+        label_counts = Counter(y_rows)
 
-    model.save(MODELS_DIR)
+        valid_idx = [
+            i for i, y in enumerate(y_rows)
+            if label_counts[y] > 1
+        ]
 
-    logger.info("Training complete")
+        x_rows = x_rows[valid_idx]
+        y_rows = y_rows[valid_idx]
 
-    return model
+        logger.info(f"Dataset size after filtering: {len(y_rows)}")
 
+        # -----------------------------------------------------
+        # TFIDF ROOT CAUSE MODEL
+        # -----------------------------------------------------
 
-# --------------------------------------------------
-# ENTRY POINT
-# --------------------------------------------------
+        comments = []
+        root_labels = []
 
-if __name__ == "__main__":
+        for r in rows:
 
-    parser = ArgumentParser()
+            comment = r.get("lastComment")
+            reason = r.get("reasonCodeId", "UNKNOWN")
 
-    args = add_args(parser).parse_args()
+            if comment is None:
+                continue
 
-    main(args)
+            comment = str(comment).strip()
+
+            if len(comment.split()) < 2:
+                continue
+
+            comments.append(comment)
+            root_labels.append(reason)
+
+        if len(comments) > 0:
+
+            logger.info("Training TFIDF root cause model")
+
+            x_text = self._tfidf.fit_transform(comments)
+            self._text_model.fit(x_text, root_labels)
+
+        else:
+
+            logger.warning("Skipping TFIDF model training")
+
+        # -----------------------------------------------------
+        # SPLIT DATA
+        # -----------------------------------------------------
+
+        x_train, x_val, y_train, y_val = train_test_split(
+            x_rows,
+            y_rows,
+            test_size=0.2,
+            shuffle=True,
+            stratify=y_rows,
+        )
+
+        train_pool = Pool(data=x_train, label=y_train)
+        val_pool = Pool(data=x_val, label=y_val)
+
+        logger.info("Training CatBoost model")
+
+        self._classifier.fit(
+            train_pool,
+            eval_set=val_pool,
+            verbose=True,
+            early_stopping_rounds=100,
+        )
+
+        self._fscore_report(y_train, x_val, y_val)
+
+    # ---------------------------------------------------------
+
+    def _fscore_report(
+        self,
+        y_train: NDArray[np.int64],
+        x_val: NDArray[np.int64],
+        y_val: NDArray[np.int64],
+    ):
+
+        y_val_pred = self._classifier.predict(x_val)
+
+        label_ids = np.unique(y_train)
+
+        target_names = [
+            str(self._encoder.decode(col))
+            for col in label_ids
+        ]
+
+        report = metrics.classification_report(
+            y_val,
+            y_val_pred,
+            labels=label_ids,
+            target_names=target_names,
+            zero_division=np.nan,
+        )
+
+        logger.info(f"\n{report}")
+
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _init_new_classifier() -> CatBoostClassifier:
+
+        return CatBoostClassifier(
+            depth=5,
+            iterations=500,
+            learning_rate=0.05,
+            loss_function="MultiClass",
+            verbose=False,
+        )
+
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def load_from_pkl(path):
+
+        path = Path(path)
+
+        if str(path).startswith("models"):
+            path = Path(*path.parts[1:])
+
+        full_path = MODELS_DIR / path
+
+        if not full_path.exists():
+            raise FileNotFoundError(f"Model not found: {full_path}")
+
+        model = joblib.load(full_path)
+
+        features_path = path.with_name(
+            path.name.replace("_model.pkl", "_features.json")
+        )
+
+        features_full = MODELS_DIR / features_path
+
+        with open(features_full) as f:
+            feature_keys = json.load(f)
+
+        model._feature_keys = feature_keys
+
+        return model
