@@ -1,29 +1,43 @@
-    @staticmethod
-    def remove_unusable_columns(columns: List[str]) -> List[str]:
+def get_predictions_by_exception_id(self, exception_id: str):
+
+    cursor = self.conn.cursor()
+
+    row = cursor.execute(
         """
-        Filters out columns that should not be used for ML training.
-        These fields are populated only AFTER analysts start working
-        on an exception and would leak future information.
-        """
+        SELECT *
+        FROM predictions
+        WHERE exceptionId = ?
+        """,
+        (exception_id,),
+    ).fetchone()
 
-        columns_set = set(columns)
+    cursor.close()
 
-        columns_set -= {
-            "assignedQueue",
-            "assignedUser",
-            "closedMode",
-            "lastExecutiveSummary",
-            "omrctradeComment",
-            "priority",
-            "processAdditionalInformation",
-            "processInstanceId",
-            "processParticipants",
-            "reasonCodeId",
-            "updatedBy",
-            "updatedDate",
-            "version",
-            "workflowAction",
-            "workflowStatus",
-        }
+    if row is None:
+        return {}
 
-        return list(columns_set)
+    prediction_json = row["prediction"]
+
+    # FIX
+    if prediction_json:
+        prediction = json.loads(prediction_json)
+    else:
+        prediction = []
+
+    return {
+        "exceptionId": row["exceptionId"],
+        "exceptionTimestamp": row["exceptionTimestamp"],
+        "responseCode": row["responseCode"],
+        "responseDescription": row["responseDescription"],
+        "controlGroup": row["controlGroup"],
+        "prediction.timestamp": [
+            p.get("timestamp") for p in prediction
+        ],
+        "prediction.key": [
+            p.get("key") for p in prediction
+        ],
+        "prediction.value": [
+            p.get("value") for p in prediction
+        ],
+        "prediction": prediction,
+    }
