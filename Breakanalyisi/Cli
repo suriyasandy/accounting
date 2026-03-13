@@ -1,0 +1,50 @@
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+from .config import ProjectConfig
+from .pipeline import BreakMLPipeline
+
+
+def read_file(path: str) -> pd.DataFrame:
+    if path.lower().endswith('.csv'):
+        return pd.read_csv(path)
+    if path.lower().endswith(('.xlsx', '.xls')):
+        return pd.read_excel(path)
+    raise ValueError('Unsupported file type. Use CSV or XLSX.')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest='cmd')
+
+    train_p = sub.add_parser('train')
+    train_p.add_argument('--file', required=True)
+    train_p.add_argument('--target', required=True)
+    train_p.add_argument('--output', default='artifacts')
+
+    infer_p = sub.add_parser('infer')
+    infer_p.add_argument('--file', required=True)
+    infer_p.add_argument('--bundle', required=True)
+    infer_p.add_argument('--output', default='artifacts/predictions.csv')
+
+    args = parser.parse_args()
+    pipe = BreakMLPipeline(ProjectConfig())
+
+    if args.cmd == 'train':
+        df = read_file(args.file)
+        summary = pipe.train_for_target(df, args.target, args.output)
+        print(summary)
+    elif args.cmd == 'infer':
+        df = read_file(args.file)
+        preds = pipe.batch_inference(df, args.bundle)
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        preds.to_csv(args.output, index=False)
+        print({'rows': len(preds), 'output': args.output})
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()
