@@ -1,0 +1,41 @@
+# Accounting Control Breaks ML Project
+
+This project builds a pre-LLM machine learning pipeline for accounting control breaks using CatBoost and Streamlit.
+
+## What it does
+- Cleans and validates your monthly accounting breaks dataset.
+- Trains ML models for the labels that already exist in your data.
+- Generates evaluation reports, confusion matrices, feature importance, and prediction exports.
+- Supports live single-record inference and batch inference.
+- Handles common edge cases such as missing columns, duplicate rows, unseen categories, imbalanced classes, invalid numeric values, rare classes, and empty text.
+
+## Recommended ML targets before any LLM step
+1. `True/Systemic Breaks` -> binary classification
+2. `ISSUE CATEGORY` -> multiclass classification
+3. `ISSUE RAG RATING` -> multiclass classification
+
+Do **not** try to model `Root Cause identified` yet because your screenshots show it is fully null.
+
+## Project structure
+- `streamlit_app.py` - UI for training, evaluation, batch inference, and live inference
+- `src/config.py` - central configuration
+- `src/data_utils.py` - cleaning, validation, splitting, edge-case handling
+- `src/modeling.py` - CatBoost training and prediction wrapper
+- `src/evaluation.py` - metrics, plots, exports
+- `src/pipeline.py` - orchestration helpers used by UI and CLI
+- `src/cli.py` - optional command-line training and inference entry points
+
+## Quick start
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+## Expected input file
+CSV or XLSX containing your accounting control break columns.
+
+## Key assumptions
+- Date-like columns are parsed safely with coercion.
+- Numeric fields are cleaned from commas, currency symbols, blanks, and text noise.
+- Rare target labels below configurable frequency are grouped into `OTHER_RARE`.
+- If stratified split is not possible because of low class counts, the code falls back to random split with warnings.
