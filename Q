@@ -1,0 +1,12 @@
+query = """
+select 
+    ts: string (date + time),
+    bid,
+    ask
+from unkey .md.query `feed`sym`startEndTimes`columns!(
+    `primary;
+    `AUDUSD;
+    (2026.03.12D00:00:00;2026.03.12D23:59:59);
+    `date`time`bid`ask
+)
+"""
