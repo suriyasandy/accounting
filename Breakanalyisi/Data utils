@@ -1,33 +1,400 @@
-from dataclasses import dataclass, field
-from typing import Dict, List
+import re
+import warnings
+from typing import Dict, List, Tuple
 
-@dataclass
-class ProjectConfig:
-    random_state: int = 42
-    test_size: float = 0.2
-    valid_size: float = 0.2
-    rare_class_min_count: int = 20
-    min_rows_for_training: int = 200
-    text_fill_value: str = 'MISSING_TEXT'
-    cat_fill_value: str = 'UNKNOWN'
-    numeric_fill_value: float = 0.0
-    id_columns: List[str] = field(default_factory=lambda: ['TRADE REF'])
-    preferred_targets: Dict[str, str] = field(default_factory=lambda: {
-        'true_systemic': 'True/Systemic Breaks',
-        'issue_category': 'ISSUE CATEGORY',
-        'rag_rating': 'ISSUE RAG RATING'
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+from .config import ProjectConfig
+
+
+# ──────────────────────────────────────────────────────────
+# Column alias normalisation
+# ──────────────────────────────────────────────────────────
+ALIASES = {
+    'Rec Name': 'Rec Name (as per Rec Cube)',
+    'Rec Name(as per Rec Cube)': 'Rec Name (as per Rec Cube)',
+    'BREAK AMOUNT GBP ': 'BREAK AMOUNT GBP',
+    'ABS GBP ': 'ABS GBP',
+    'True/Systematic Breaks': 'True/Systemic Breaks'
+}
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [ALIASES.get(c.strip(), c.strip()) for c in df.columns]
+    return df
+
+
+# ──────────────────────────────────────────────────────────
+# Numeric helpers
+# ──────────────────────────────────────────────────────────
+def safe_to_numeric(series: pd.Series) -> pd.Series:
+    """Strip currency symbols, commas, stray text; coerce to float."""
+    cleaned = (
+        series.astype(str)
+        .str.replace(r"[,£$€₹]", "", regex=True)
+        .str.replace(r"[^0-9.\-]", "", regex=True)
+        .replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def safe_binary_normalize(series: pd.Series) -> pd.Series:
+    mapping = {
+        "true": "TRUE", "systemic": "SYSTEMIC", "systematic": "SYSTEMIC",
+        "yes": "TRUE", "no": "SYSTEMIC", "1": "TRUE", "0": "SYSTEMIC",
+        "t": "TRUE", "f": "SYSTEMIC", "break": "TRUE",
+    }
+    s = (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .map(mapping)
+        .fillna(series.astype(str).str.strip().str.upper())
+    )
+    return s.replace({"NAN": np.nan, "": np.nan})
+
+
+# ──────────────────────────────────────────────────────────
+# DATA EXPLORATION (DE) METHODS
+# ──────────────────────────────────────────────────────────
+
+def get_data_summary(df: pd.DataFrame) -> Dict:
+    """High-level dataset summary: shape, memory, dtype breakdown."""
+    dtype_counts = df.dtypes.astype(str).value_counts().to_dict()
+    return {
+        "rows": len(df),
+        "columns": df.shape[1],
+        "memory_mb": round(df.memory_usage(deep=True).sum() / 1024 ** 2, 2),
+        "dtype_breakdown": dtype_counts,
+        "complete_rows": int(df.dropna().shape[0]),
+        "fully_null_cols": int((df.isna().all()).sum()),
+        "fully_populated_cols": int((df.notna().all()).sum()),
+        "duplicate_rows": int(df.duplicated().sum()),
+    }
+
+
+def get_null_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-column null count, null %, dtype, and a simple recommendation."""
+    null_count = df.isna().sum()
+    null_pct = (df.isna().mean() * 100).round(2)
+    dtypes = df.dtypes.astype(str)
+    recommendations = []
+    for col in df.columns:
+        pct = null_pct[col]
+        if pct == 0:
+            recommendations.append("OK")
+        elif pct < 5:
+            recommendations.append("Impute (few nulls)")
+        elif pct < 30:
+            recommendations.append("Impute with caution")
+        elif pct < 80:
+            recommendations.append("Consider dropping or grouping")
+        else:
+            recommendations.append("High null - exclude from training")
+    return pd.DataFrame({
+        "column": df.columns.tolist(),
+        "null_count": null_count.values,
+        "null_pct": null_pct.values,
+        "dtype": dtypes.values,
+        "recommendation": recommendations,
+    }).sort_values("null_pct", ascending=False).reset_index(drop=True)
+
+
+def get_class_distribution(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Value counts, %, and balance flag for a single column."""
+    if col not in df.columns:
+        return pd.DataFrame(columns=["label", "count", "pct", "flag"])
+    vc = df[col].astype(str).value_counts(dropna=False)
+    total = vc.sum()
+    pct = (vc / total * 100).round(2)
+    flags = []
+    for cnt in vc.values:
+        p = cnt / total * 100
+        if p < 1:
+            flags.append("RARE (<1%)")
+        elif p < 5:
+            flags.append("LOW (1-5%)")
+        elif p > 60:
+            flags.append("DOMINANT (>60%)")
+        else:
+            flags.append("OK")
+    return pd.DataFrame({
+        "label": vc.index.astype(str),
+        "count": vc.values,
+        "pct": pct.values,
+        "flag": flags,
     })
-    text_columns: List[str] = field(default_factory=lambda: [
-        'Comments', 'JIRA DESC', 'EPIC DESC', 'Type of break', 'Products Reconciled'
-    ])
-    categorical_columns: List[str] = field(default_factory=lambda: [
-        'Asset Class', 'Team', 'Rec Name (as per Rec Cube)', 'Entity', 'Type of break',
-        'Account Group', 'Products Reconciled', 'TRADE CCY', 'Bucket', 'Cash/Non Cash',
-        'Journals Posted', 'ISSUE CATEGORY', 'ISSUE CATEGORY2', 'JIRA PRIORITY',
-        'EPIC', 'SYSTEM TO BE FIXED', 'High Level Product', 'FIX REQUIRED',
-        'Month', 'Thematic', 'Type of issue', 'Action', 'B/S Cert'
-    ])
-    numeric_columns: List[str] = field(default_factory=lambda: [
-        'Period', 'BREAK AMOUNT CCY', 'BREAK AMOUNT GBP', 'Age Days', 'ABS GBP'
-    ])
-    date_columns: List[str] = field(default_factory=lambda: ['Date'])
+
+
+def get_numeric_stats(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
+    """Descriptive stats + outlier count (IQR method) for numeric columns."""
+    rows = []
+    for col in config.numeric_columns:
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(s) == 0:
+            continue
+        q1, q3 = s.quantile(0.25), s.quantile(0.75)
+        iqr = q3 - q1
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        outliers = int(((s < lower) | (s > upper)).sum())
+        rows.append({
+            "column": col,
+            "count": len(s),
+            "mean": round(float(s.mean()), 2),
+            "median": round(float(s.median()), 2),
+            "std": round(float(s.std()), 2),
+            "min": round(float(s.min()), 2),
+            "max": round(float(s.max()), 2),
+            "q1": round(float(q1), 2),
+            "q3": round(float(q3), 2),
+            "iqr_outliers": outliers,
+            "outlier_pct": round(outliers / len(s) * 100, 2),
+        })
+    return pd.DataFrame(rows)
+
+
+def get_categorical_stats(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
+    """Cardinality, null %, most frequent value for categorical columns."""
+    rows = []
+    for col in config.categorical_columns:
+        if col not in df.columns:
+            continue
+        s = df[col].astype(str).replace({"nan": np.nan, "None": np.nan})
+        null_pct = round(s.isna().mean() * 100, 2)
+        vc = s.value_counts(dropna=True)
+        rows.append({
+            "column": col,
+            "cardinality": int(s.nunique(dropna=True)),
+            "null_pct": null_pct,
+            "top_label": str(vc.index[0]) if len(vc) > 0 else "",
+            "top_label_pct": round(vc.iloc[0] / len(s) * 100, 2) if len(vc) > 0 else 0,
+            "rare_labels_lt1pct": int((vc / len(s) * 100 < 1).sum()),
+        })
+    return pd.DataFrame(rows).sort_values("cardinality", ascending=False).reset_index(drop=True)
+
+
+def get_target_readiness(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
+    """Check which preferred target columns are modelable."""
+    rows = []
+    for alias, col in config.preferred_targets.items():
+        present = col in df.columns
+        if not present:
+            rows.append({"target_alias": alias, "column": col, "present": False,
+                         "labelled_rows": 0, "classes": 0, "min_class_count": 0,
+                         "status": "MISSING - Column not in file"})
+            continue
+        s = df[col].dropna().astype(str).str.strip()
+        s = s[s != ""].astype(str)
+        labelled = len(s)
+        classes = s.nunique()
+        min_class_count = int(s.value_counts().min()) if classes > 0 else 0
+        if labelled == 0:
+            status = "NOT MODELABLE - All null"
+        elif classes < 2:
+            status = "NOT MODELABLE - Only 1 class"
+        elif labelled < config.min_rows_for_training:
+            status = f"NOT MODELABLE - Need {config.min_rows_for_training}+ labelled rows"
+        elif min_class_count < config.rare_class_min_count:
+            status = f"WARN - Some classes have <{config.rare_class_min_count} rows (will be grouped)"
+        else:
+            status = "READY"
+        rows.append({
+            "target_alias": alias, "column": col, "present": True,
+            "labelled_rows": labelled, "classes": classes,
+            "min_class_count": min_class_count, "status": status
+        })
+    return pd.DataFrame(rows)
+
+
+def detect_outliers(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Return rows where numeric col is an IQR outlier, with direction."""
+    if col not in df.columns:
+        return pd.DataFrame()
+    s = pd.to_numeric(df[col], errors="coerce")
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    mask = (s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)
+    result = df[mask].copy()
+    result["_outlier_direction"] = np.where(s[mask] < q1 - 1.5 * iqr, "LOW", "HIGH")
+    return result
+
+
+def get_break_age_bands(df: pd.DataFrame) -> pd.DataFrame:
+    """Bucket Age Days into meaningful bands and return counts."""
+    if "Age Days" not in df.columns:
+        return pd.DataFrame()
+    age = pd.to_numeric(df["Age Days"], errors="coerce").dropna()
+    bins = [0, 1, 5, 10, 20, 30, 60, 90, 180, 365, np.inf]
+    labels = ["0", "1-5", "6-10", "11-20", "21-30", "31-60", "61-90", "91-180", "181-365", "365+"]
+    band = pd.cut(age, bins=bins, labels=labels, right=False)
+    vc = band.value_counts().sort_index().reset_index()
+    vc.columns = ["age_band", "count"]
+    return vc
+
+
+def get_break_amount_profile(df: pd.DataFrame) -> pd.DataFrame:
+    """Summary of break amounts by bucket/band."""
+    if "ABS GBP" not in df.columns:
+        return pd.DataFrame()
+    amount = pd.to_numeric(df["ABS GBP"], errors="coerce").dropna()
+    bins = [0, 1_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, np.inf]
+    labels = ["<1K", "1K-10K", "10K-50K", "50K-100K", "100K-500K", "500K-1M", ">1M"]
+    band = pd.cut(amount, bins=bins, labels=labels, right=False)
+    vc = band.value_counts().sort_index().reset_index()
+    vc.columns = ["amount_band", "count"]
+    vc["pct"] = (vc["count"] / vc["count"].sum() * 100).round(2)
+    return vc
+
+
+def get_period_trend(df: pd.DataFrame) -> pd.DataFrame:
+    """Break count and avg ABS GBP per Period (YYYYMM)."""
+    if "Period" not in df.columns:
+        return pd.DataFrame()
+    g = df.copy()
+    g["Period"] = pd.to_numeric(g["Period"], errors="coerce")
+    g = g.dropna(subset=["Period"])
+    g["Period"] = g["Period"].astype(int)
+    agg = g.groupby("Period").agg(
+        break_count=("Period", "count"),
+        avg_abs_gbp=("ABS GBP", lambda x: round(pd.to_numeric(x, errors="coerce").mean(), 0))
+        if "ABS GBP" in g.columns else ("Period", "count")
+    ).reset_index()
+    return agg
+
+
+def get_asset_class_profile(df: pd.DataFrame) -> pd.DataFrame:
+    """Break count and total ABS GBP per Asset Class."""
+    if "Asset Class" not in df.columns:
+        return pd.DataFrame()
+    g = df.copy()
+    g["ABS GBP_num"] = pd.to_numeric(g.get("ABS GBP", pd.Series(dtype=float)), errors="coerce")
+    return (
+        g.groupby("Asset Class")
+        .agg(break_count=("Asset Class", "count"), total_abs_gbp=("ABS GBP_num", "sum"))
+        .reset_index()
+        .sort_values("break_count", ascending=False)
+    )
+
+
+# ──────────────────────────────────────────────────────────
+# VALIDATE MINIMUM COLUMNS
+# ──────────────────────────────────────────────────────────
+def validate_minimum_columns(df: pd.DataFrame, config: ProjectConfig) -> Dict[str, List[str]]:
+    expected = set(
+        config.text_columns
+        + config.categorical_columns
+        + config.numeric_columns
+        + config.date_columns
+        + list(config.preferred_targets.values())
+    )
+    present = set(df.columns)
+    return {
+        "present": sorted(list(expected.intersection(present))),
+        "missing": sorted(list(expected.difference(present))),
+    }
+
+
+# ──────────────────────────────────────────────────────────
+# PREPROCESSING
+# ──────────────────────────────────────────────────────────
+def preprocess_dataframe(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
+    df = normalize_columns(df)
+    df = df.copy()
+
+    for col in config.id_columns:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+            df = df.drop_duplicates(subset=[col], keep="last")
+
+    for col in config.date_columns:
+        if col in df.columns:
+            dt = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+            df[f"{col}_year"] = dt.dt.year.fillna(0).astype(int)
+            df[f"{col}_month"] = dt.dt.month.fillna(0).astype(int)
+            df[f"{col}_day"] = dt.dt.day.fillna(0).astype(int)
+
+    for col in config.numeric_columns:
+        if col in df.columns:
+            df[col] = safe_to_numeric(df[col]).fillna(config.numeric_fill_value)
+
+    if "Age Days" in df.columns:
+        df["Age Days"] = df["Age Days"].clip(lower=0, upper=3650)
+    if "ABS GBP" in df.columns and "BREAK AMOUNT GBP" in df.columns:
+        abs_missing = df["ABS GBP"].eq(0) | df["ABS GBP"].isna()
+        df.loc[abs_missing, "ABS GBP"] = df.loc[abs_missing, "BREAK AMOUNT GBP"].abs()
+
+    for col in set(config.text_columns + config.categorical_columns):
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .replace({"nan": config.cat_fill_value, "None": config.cat_fill_value, "": config.cat_fill_value})
+                .fillna(config.cat_fill_value)
+                .str.strip()
+            )
+
+    if "Comments" in df.columns and "JIRA DESC" in df.columns:
+        df["combined_text"] = (
+            df["Comments"].fillna("") + " | " + df["JIRA DESC"].fillna("")
+        ).str.strip()
+    elif "Comments" in df.columns:
+        df["combined_text"] = df["Comments"].fillna(config.text_fill_value)
+    elif "JIRA DESC" in df.columns:
+        df["combined_text"] = df["JIRA DESC"].fillna(config.text_fill_value)
+    else:
+        df["combined_text"] = config.text_fill_value
+
+    if "True/Systemic Breaks" in df.columns:
+        df["True/Systemic Breaks"] = safe_binary_normalize(df["True/Systemic Breaks"])
+
+    return df
+
+
+# ──────────────────────────────────────────────────────────
+# FEATURE SELECTION & SPLITTING
+# ──────────────────────────────────────────────────────────
+def select_features(
+    df: pd.DataFrame, target_col: str, config: ProjectConfig
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    ignore = set(config.id_columns + [target_col] + config.date_columns)
+    feature_cols = [c for c in df.columns if c not in ignore]
+    X = df[feature_cols].copy()
+    categorical_features = [c for c in feature_cols if X[c].dtype == "object"]
+    for col in feature_cols:
+        if col not in categorical_features:
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(config.numeric_fill_value)
+        else:
+            X[col] = X[col].astype(str).fillna(config.cat_fill_value)
+    return X, feature_cols, categorical_features
+
+
+def compress_rare_classes(y: pd.Series, min_count: int) -> pd.Series:
+    counts = y.value_counts(dropna=False)
+    rare = counts[counts < min_count].index
+    return y.astype(str).where(~y.astype(str).isin(rare), "OTHER_RARE")
+
+
+def make_splits(X: pd.DataFrame, y: pd.Series, config: ProjectConfig):
+    stratify = y if y.nunique() > 1 and y.value_counts().min() >= 2 else None
+    if stratify is None:
+        warnings.warn("Stratified split not possible; using random split.")
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y,
+        test_size=config.test_size + config.valid_size,
+        random_state=config.random_state,
+        stratify=stratify,
+    )
+    temp_ratio = config.valid_size / (config.test_size + config.valid_size)
+    stratify_temp = y_temp if y_temp.nunique() > 1 and y_temp.value_counts().min() >= 2 else None
+    X_valid, X_test, y_valid, y_test = train_test_split(
+        X_temp, y_temp,
+        test_size=1 - temp_ratio,
+        random_state=config.random_state,
+        stratify=stratify_temp,
+    )
+    return X_train, X_valid, X_test, y_train, y_valid, y_test
