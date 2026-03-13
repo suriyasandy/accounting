@@ -1,0 +1,33 @@
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+@dataclass
+class ProjectConfig:
+    random_state: int = 42
+    test_size: float = 0.2
+    valid_size: float = 0.2
+    rare_class_min_count: int = 20
+    min_rows_for_training: int = 200
+    text_fill_value: str = 'MISSING_TEXT'
+    cat_fill_value: str = 'UNKNOWN'
+    numeric_fill_value: float = 0.0
+    id_columns: List[str] = field(default_factory=lambda: ['TRADE REF'])
+    preferred_targets: Dict[str, str] = field(default_factory=lambda: {
+        'true_systemic': 'True/Systemic Breaks',
+        'issue_category': 'ISSUE CATEGORY',
+        'rag_rating': 'ISSUE RAG RATING'
+    })
+    text_columns: List[str] = field(default_factory=lambda: [
+        'Comments', 'JIRA DESC', 'EPIC DESC', 'Type of break', 'Products Reconciled'
+    ])
+    categorical_columns: List[str] = field(default_factory=lambda: [
+        'Asset Class', 'Team', 'Rec Name (as per Rec Cube)', 'Entity', 'Type of break',
+        'Account Group', 'Products Reconciled', 'TRADE CCY', 'Bucket', 'Cash/Non Cash',
+        'Journals Posted', 'ISSUE CATEGORY', 'ISSUE CATEGORY2', 'JIRA PRIORITY',
+        'EPIC', 'SYSTEM TO BE FIXED', 'High Level Product', 'FIX REQUIRED',
+        'Month', 'Thematic', 'Type of issue', 'Action', 'B/S Cert'
+    ])
+    numeric_columns: List[str] = field(default_factory=lambda: [
+        'Period', 'BREAK AMOUNT CCY', 'BREAK AMOUNT GBP', 'Age Days', 'ABS GBP'
+    ])
+    date_columns: List[str] = field(default_factory=lambda: ['Date'])
