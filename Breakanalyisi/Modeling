@@ -1,47 +1,342 @@
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
+import warnings
 
+import joblib
+import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_score, recall_score
-import plotly.express as px
+from catboost import CatBoostClassifier, Pool
+
+from .config import ProjectConfig
 
 
-def evaluate_classifier(model, bundle, X_test, y_test, output_dir: Path):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    preds = model.predict(X_test).reshape(-1)
-    proba = model.predict_proba(X_test)
+# ──────────────────────────────────────────────────────────
+# ModelBundle  — persisted metadata alongside every .cbm
+# ──────────────────────────────────────────────────────────
+@dataclass
+class ModelBundle:
+    target_col: str
+    feature_cols: List[str]
+    categorical_features: List[str]
+    label_values: List[str]           # sorted unique classes seen at train time
+    model_path: str
+    threshold: float = 0.5            # used for binary classification
+    class_weights: Dict[str, float] = field(default_factory=dict)
+    training_rows: int = 0
+    catboost_params: Dict = field(default_factory=dict)
+    version: str = "1.0"
 
-    metrics = {
-        'target': bundle.target_col,
-        'accuracy': accuracy_score(y_test, preds),
-        'precision_weighted': precision_score(y_test, preds, average='weighted', zero_division=0),
-        'recall_weighted': recall_score(y_test, preds, average='weighted', zero_division=0),
-        'f1_weighted': f1_score(y_test, preds, average='weighted', zero_division=0),
-        'f1_macro': f1_score(y_test, preds, average='macro', zero_division=0),
-        'rows_tested': len(y_test)
-    }
-    pd.DataFrame([metrics]).to_csv(output_dir / f'{bundle.target_col}_metrics.csv', index=False)
 
-    report = classification_report(y_test, preds, output_dict=True, zero_division=0)
-    pd.DataFrame(report).transpose().to_csv(output_dir / f'{bundle.target_col}_classification_report.csv')
+# ──────────────────────────────────────────────────────────
+# CatBoost parameter builder
+# ──────────────────────────────────────────────────────────
+def _build_catboost_params(n_classes: int, random_state: int) -> Dict:
+    """Return CatBoost init kwargs based on number of classes."""
+    is_binary = n_classes <= 2
+    return dict(
+        iterations=500,
+        learning_rate=0.05,
+        depth=6,
+        l2_leaf_reg=3.0,
+        border_count=64,
+        loss_function="Logloss" if is_binary else "MultiClass",
+        eval_metric="F1" if is_binary else "TotalF1",
+        auto_class_weights="Balanced",
+        random_seed=random_state,
+        verbose=100,
+        allow_writing_files=False,
+        early_stopping_rounds=50,
+    )
 
-    labels = sorted(pd.Series(y_test).astype(str).unique().tolist())
-    cm = confusion_matrix(y_test, preds, labels=labels)
-    cm_df = pd.DataFrame(cm, index=labels, columns=labels)
-    cm_df.to_csv(output_dir / f'{bundle.target_col}_confusion_matrix.csv')
 
-    fig = px.imshow(cm_df, text_auto=True, color_continuous_scale='Blues', title=f'Confusion Matrix - {bundle.target_col}')
-    fig.write_html(output_dir / f'{bundle.target_col}_confusion_matrix.html')
+# ──────────────────────────────────────────────────────────
+# Trainer
+# ──────────────────────────────────────────────────────────
+class BreakModelTrainer:
+    def __init__(self, config: ProjectConfig):
+        self.config = config
 
+    # ── main train entry point ──────────────────────────────
+    def train_classifier(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_valid: pd.DataFrame,
+        y_valid: pd.Series,
+        categorical_features: List[str],
+        output_dir: Path,
+        target_col: str,
+    ) -> Tuple[CatBoostClassifier, ModelBundle]:
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        n_classes = y_train.nunique()
+
+        # ── guard: CatBoost needs at least 2 classes ─────────
+        if n_classes < 2:
+            raise ValueError(
+                f"Target '{target_col}' has only {n_classes} unique class after "
+                "rare-class compression. Cannot train."
+            )
+
+        # ── guard: cat features must be in X_train ──────────
+        categorical_features = [c for c in categorical_features if c in X_train.columns]
+
+        params = _build_catboost_params(n_classes, self.config.random_state)
+        model = CatBoostClassifier(**params)
+
+        train_pool = Pool(X_train, y_train, cat_features=categorical_features)
+        valid_pool = Pool(X_valid, y_valid, cat_features=categorical_features)
+        model.fit(train_pool, eval_set=valid_pool, use_best_model=True)
+
+        # ── persist model ─────────────────────────────────────
+        model_path = output_dir / f"{target_col}_catboost.cbm"
+        model.save_model(str(model_path))
+
+        # ── build & persist bundle ────────────────────────────
+        bundle = ModelBundle(
+            target_col=target_col,
+            feature_cols=list(X_train.columns),
+            categorical_features=categorical_features,
+            label_values=sorted(y_train.astype(str).unique().tolist()),
+            model_path=str(model_path),
+            threshold=0.5,
+            class_weights=_compute_class_weights(y_train),
+            training_rows=len(X_train),
+            catboost_params=params,
+            version="1.0",
+        )
+        bundle_path = output_dir / f"{target_col}_bundle.joblib"
+        joblib.dump(bundle, bundle_path)
+        return model, bundle
+
+    # ── retrain on extended data (keeps same hyper-params) ──
+    def retrain(
+        self,
+        bundle_path: str,
+        X_new: pd.DataFrame,
+        y_new: pd.Series,
+        X_valid: pd.DataFrame,
+        y_valid: pd.Series,
+    ) -> Tuple[CatBoostClassifier, ModelBundle]:
+        """Load existing bundle and retrain model on new data."""
+        bundle = load_bundle(bundle_path)
+        X_aligned = align_inference_features(
+            X_new, bundle,
+            self.config.numeric_fill_value,
+            self.config.cat_fill_value,
+        )
+        output_dir = Path(bundle.model_path).parent
+        return self.train_classifier(
+            X_aligned, y_new, X_valid, y_valid,
+            bundle.categorical_features, output_dir, bundle.target_col,
+        )
+
+
+# ──────────────────────────────────────────────────────────
+# Prediction helpers
+# ──────────────────────────────────────────────────────────
+def predict(
+    model: CatBoostClassifier,
+    bundle: ModelBundle,
+    X: pd.DataFrame,
+    return_proba: bool = True,
+) -> pd.DataFrame:
+    """
+    Safe predict wrapper.
+    Returns a DataFrame with columns:
+        predicted_<target>  — class label
+        proba_<class>       — one column per class (if return_proba=True)
+        confidence          — max probability across classes
+    """
+    if X.empty:
+        raise ValueError("Input DataFrame is empty. Cannot predict.")
+
+    preds = model.predict(X).reshape(-1)
+    result = pd.DataFrame({"predicted_" + bundle.target_col: preds})
+
+    if return_proba:
+        proba = model.predict_proba(X)
+        class_names = [str(c) for c in model.classes_]
+        if len(class_names) != proba.shape[1]:
+            class_names = [f"class_{i}" for i in range(proba.shape[1])]
+        prob_df = pd.DataFrame(proba, columns=[f"proba_{c}" for c in class_names])
+        result = pd.concat([result.reset_index(drop=True), prob_df.reset_index(drop=True)], axis=1)
+        result["confidence"] = proba.max(axis=1).round(4)
+
+    return result
+
+
+def predict_with_threshold(
+    model: CatBoostClassifier,
+    bundle: ModelBundle,
+    X: pd.DataFrame,
+    threshold: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Binary-only: apply custom probability threshold to override default 0.5.
+    Falls back to standard predict() for multiclass.
+    """
+    n_classes = len(bundle.label_values)
+    if n_classes != 2:
+        warnings.warn(
+            "predict_with_threshold() is designed for binary targets. "
+            "Falling back to standard predict()."
+        )
+        return predict(model, bundle, X)
+
+    thr = threshold if threshold is not None else bundle.threshold
+    proba = model.predict_proba(X)
+    positive_idx = 1
+    preds = np.where(proba[:, positive_idx] >= thr,
+                     bundle.label_values[positive_idx],
+                     bundle.label_values[0])
+    result = pd.DataFrame({"predicted_" + bundle.target_col: preds})
+    prob_df = pd.DataFrame(proba, columns=[f"proba_{c}" for c in bundle.label_values])
+    result = pd.concat([result.reset_index(drop=True), prob_df.reset_index(drop=True)], axis=1)
+    result["confidence"] = proba.max(axis=1).round(4)
+    result["threshold_used"] = thr
+    return result
+
+
+def get_feature_importance(
+    model: CatBoostClassifier,
+    bundle: ModelBundle,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """Return top_n features by CatBoost internal importance score."""
     fi = model.get_feature_importance(prettified=True)
-    fi.to_csv(output_dir / f'{bundle.target_col}_feature_importance.csv', index=False)
+    fi.columns = ["feature", "importance"]
+    fi["is_categorical"] = fi["feature"].isin(bundle.categorical_features)
+    return fi.head(top_n).reset_index(drop=True)
 
-    scored = X_test.copy()
-    scored['actual'] = y_test.values
-    scored['predicted'] = preds
-    if hasattr(proba, 'shape') and len(proba.shape) == 2:
-        prob_df = pd.DataFrame(proba, columns=[f'proba_{c}' for c in model.classes_])
-        scored = pd.concat([scored.reset_index(drop=True), prob_df.reset_index(drop=True)], axis=1)
-    scored.to_csv(output_dir / f'{bundle.target_col}_scored_test_data.csv', index=False)
 
-    return metrics
+def get_model_metadata(bundle: ModelBundle) -> Dict:
+    """Return a human-readable dict of bundle metadata for governance/audit."""
+    return {
+        "target_col": bundle.target_col,
+        "version": bundle.version,
+        "training_rows": bundle.training_rows,
+        "n_features": len(bundle.feature_cols),
+        "n_categorical_features": len(bundle.categorical_features),
+        "classes": bundle.label_values,
+        "n_classes": len(bundle.label_values),
+        "threshold": bundle.threshold,
+        "model_path": bundle.model_path,
+        "catboost_params": bundle.catboost_params,
+    }
+
+
+# ──────────────────────────────────────────────────────────
+# Persistence helpers
+# ──────────────────────────────────────────────────────────
+def load_bundle(bundle_path: str) -> ModelBundle:
+    """Load persisted ModelBundle from disk."""
+    path = Path(bundle_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Bundle not found: {bundle_path}")
+    return joblib.load(bundle_path)
+
+
+def load_model(model_path: str) -> CatBoostClassifier:
+    """Load persisted CatBoost model from .cbm file."""
+    path = Path(model_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    model = CatBoostClassifier()
+    model.load_model(str(path))
+    return model
+
+
+def load_model_from_bundle(bundle: ModelBundle) -> CatBoostClassifier:
+    """Convenience: load the model referenced inside a bundle object."""
+    return load_model(bundle.model_path)
+
+
+# ──────────────────────────────────────────────────────────
+# Inference alignment
+# ──────────────────────────────────────────────────────────
+def align_inference_features(
+    df: pd.DataFrame,
+    bundle: ModelBundle,
+    numeric_fill_value: float = 0.0,
+    cat_fill_value: str = "UNKNOWN",
+) -> pd.DataFrame:
+    """
+    Align a raw DataFrame to the exact feature schema seen at training time.
+
+    Edge cases handled:
+    - Missing columns → filled with fill value
+    - Extra columns → silently dropped
+    - Numeric columns with string noise → coerced
+    - Categorical columns with nulls → filled with cat_fill_value
+    - Empty DataFrame → raises ValueError
+    """
+    if df.empty:
+        raise ValueError("align_inference_features() received an empty DataFrame.")
+
+    X = df.copy()
+
+    # Add any columns present in training but missing in inference data
+    missing_cols = [c for c in bundle.feature_cols if c not in X.columns]
+    if missing_cols:
+        warnings.warn(
+            f"{len(missing_cols)} feature(s) missing at inference time and will be imputed: "
+            f"{missing_cols[:5]}{'...' if len(missing_cols) > 5 else ''}"
+        )
+    for col in missing_cols:
+        X[col] = cat_fill_value if col in bundle.categorical_features else numeric_fill_value
+
+    # Keep only training columns in correct order
+    X = X[bundle.feature_cols].copy()
+
+    # Type coercion
+    for col in bundle.feature_cols:
+        if col in bundle.categorical_features:
+            X[col] = (
+                X[col].astype(str)
+                .replace({"nan": cat_fill_value, "None": cat_fill_value, "": cat_fill_value})
+                .fillna(cat_fill_value)
+            )
+        else:
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(numeric_fill_value)
+
+    return X
+
+
+def validate_inference_schema(
+    df: pd.DataFrame,
+    bundle: ModelBundle,
+) -> Dict:
+    """
+    Pre-flight check before running inference.
+    Returns a report dict with missing cols, type mismatches, empty check.
+    """
+    missing = [c for c in bundle.feature_cols if c not in df.columns]
+    extra = [c for c in df.columns if c not in bundle.feature_cols]
+    type_issues = []
+    for col in bundle.feature_cols:
+        if col not in df.columns:
+            continue
+        if col not in bundle.categorical_features:
+            converted = pd.to_numeric(df[col], errors="coerce")
+            bad_pct = round(converted.isna().mean() * 100, 1)
+            if bad_pct > 20:
+                type_issues.append({"column": col, "non_numeric_pct": bad_pct})
+    return {
+        "missing_columns": missing,
+        "extra_columns": extra,
+        "type_issues": type_issues,
+        "row_count": len(df),
+        "is_empty": df.empty,
+        "status": "OK" if not missing and not df.empty else "WARN",
+    }
+
+
+# ──────────────────────────────────────────────────────────
+# Private helpers
+# ──────────────────────────────────────────────────────────
+def _compute_class_weights(y: pd.Series) -> Dict[str, float]:
+    """Inverse-frequency class weights for audit/reporting purposes."""
+    vc = y.value_counts(normalize=True)
+    return {str(k): round(1.0 / v, 4) for k, v in vc.items()}
