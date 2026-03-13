@@ -1,0 +1,120 @@
+import glob
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+from src.config import ProjectConfig
+from src.pipeline import BreakMLPipeline
+from src.data_utils import preprocess_dataframe
+
+st.set_page_config(page_title='Accounting Breaks ML Studio', layout='wide')
+st.title('Accounting Control Breaks - ML Studio')
+
+config = ProjectConfig()
+pipeline = BreakMLPipeline(config)
+
+
+def read_uploaded(uploaded):
+    if uploaded.name.lower().endswith('.csv'):
+        return pd.read_csv(uploaded)
+    return pd.read_excel(uploaded)
+
+
+uploaded = st.sidebar.file_uploader('Upload CSV/XLSX', type=['csv', 'xlsx', 'xls'])
+page = st.sidebar.radio('Page', ['Data Review', 'Train Model', 'Batch Inference', 'Live Inference'])
+
+if uploaded is not None:
+    raw_df = read_uploaded(uploaded)
+    df = preprocess_dataframe(raw_df, config)
+else:
+    raw_df, df = None, None
+
+if page == 'Data Review':
+    st.subheader('Dataset Review')
+    if df is None:
+        st.info('Upload a file to start.')
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric('Rows', len(df))
+        c2.metric('Columns', df.shape[1])
+        c3.metric('Duplicate TRADE REF', int(df['TRADE REF'].duplicated().sum()) if 'TRADE REF' in df.columns else 0)
+        c4.metric('Null % avg', round((raw_df.isna().mean().mean() * 100), 2))
+        st.dataframe(df.head(50), use_container_width=True)
+        if 'True/Systemic Breaks' in df.columns:
+            fig = px.histogram(df, x='True/Systemic Breaks', title='Target Distribution - True/Systemic Breaks')
+            st.plotly_chart(fig, use_container_width=True)
+        if 'ISSUE CATEGORY' in df.columns:
+            topn = df['ISSUE CATEGORY'].astype(str).value_counts().head(15).reset_index()
+            topn.columns = ['label', 'count']
+            fig2 = px.bar(topn, x='label', y='count', title='Top ISSUE CATEGORY Labels')
+            st.plotly_chart(fig2, use_container_width=True)
+
+elif page == 'Train Model':
+    st.subheader('Model Training')
+    if df is None:
+        st.info('Upload a labelled file.')
+    else:
+        available_targets = [c for c in ['True/Systemic Breaks', 'ISSUE CATEGORY', 'ISSUE RAG RATING'] if c in df.columns]
+        target = st.selectbox('Select target', available_targets)
+        output_root = st.text_input('Artifact folder', 'artifacts')
+        if st.button('Train Model'):
+            with st.spinner('Training CatBoost model...'):
+                summary = pipeline.train_for_target(raw_df, target, output_root)
+            st.success('Training complete')
+            st.json(summary)
+            target_dir = Path(output_root) / target.replace('/', '_').replace(' ', '_')
+            for csv_file in sorted(target_dir.glob('*.csv')):
+                st.write(f'Generated: {csv_file.name}')
+                st.dataframe(pd.read_csv(csv_file).head(50), use_container_width=True)
+            for html_file in sorted(target_dir.glob('*confusion_matrix.html')):
+                st.components.v1.html(open(html_file, 'r', encoding='utf-8').read(), height=450, scrolling=True)
+
+elif page == 'Batch Inference':
+    st.subheader('Batch Inference')
+    bundles = glob.glob('artifacts/**/*_bundle.joblib', recursive=True)
+    if df is None:
+        st.info('Upload an inference file.')
+    elif not bundles:
+        st.warning('Train a model first so bundle files exist.')
+    else:
+        bundle = st.selectbox('Model bundle', bundles)
+        if st.button('Run Batch Inference'):
+            out = pipeline.batch_inference(raw_df, bundle)
+            st.dataframe(out.head(100), use_container_width=True)
+            csv = out.to_csv(index=False).encode('utf-8')
+            st.download_button('Download predictions', csv, file_name='batch_predictions.csv', mime='text/csv')
+
+elif page == 'Live Inference':
+    st.subheader('Single Break Live Inference')
+    bundles = glob.glob('artifacts/**/*_bundle.joblib', recursive=True)
+    if not bundles:
+        st.warning('Train a model first.')
+    else:
+        bundle = st.selectbox('Model bundle', bundles)
+        st.caption('Fill only the fields you know. Missing fields are safely imputed.')
+        record = {
+            'Asset Class': st.text_input('Asset Class', 'Equity'),
+            'Team': st.text_input('Team', 'OMRC'),
+            'Entity': st.text_input('Entity', 'UK'),
+            'Type of break': st.text_input('Type of break', 'Timing mismatch'),
+            'Account Group': st.text_input('Account Group', 'Cash'),
+            'Products Reconciled': st.text_input('Products Reconciled', 'Equities'),
+            'TRADE REF': st.text_input('TRADE REF', 'TRD123'),
+            'TRADE CCY': st.text_input('TRADE CCY', 'GBP'),
+            'BREAK AMOUNT GBP': st.number_input('BREAK AMOUNT GBP', value=125000.0),
+            'Age Days': st.number_input('Age Days', value=4),
+            'Bucket': st.text_input('Bucket', '0-5'),
+            'Comments': st.text_area('Comments', 'Trade booked on T+1 but rec expected T+0'),
+            'JIRA DESC': st.text_area('JIRA DESC', 'Investigate timing issue and posting delay')
+        }
+        if st.button('Predict'):
+            pred_df = pipeline.batch_inference(pd.DataFrame([record]), bundle)
+            st.dataframe(pred_df, use_container_width=True)
+            prob_cols = [c for c in pred_df.columns if c.startswith('proba_')]
+            if prob_cols:
+                plot_df = pred_df[prob_cols].T.reset_index()
+                plot_df.columns = ['class', 'probability']
+                fig = px.bar(plot_df, x='class', y='probability', title='Prediction Probability by Class')
+                st.plotly_chart(fig, use_container_width=True)
