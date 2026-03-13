@@ -1,0 +1,62 @@
+from pathlib import Path
+from typing import Dict
+
+import pandas as pd
+
+from .config import ProjectConfig
+from .data_utils import compress_rare_classes, make_splits, preprocess_dataframe, select_features, validate_minimum_columns
+from .evaluation import evaluate_classifier
+from .modeling import BreakModelTrainer, align_inference_features, load_bundle, load_model
+
+
+class BreakMLPipeline:
+    def __init__(self, config: ProjectConfig | None = None):
+        self.config = config or ProjectConfig()
+        self.trainer = BreakModelTrainer(self.config)
+
+    def train_for_target(self, raw_df: pd.DataFrame, target_col: str, output_root: str = 'artifacts'):
+        df = preprocess_dataframe(raw_df, self.config)
+        if target_col not in df.columns:
+            raise ValueError(f'Target column not found: {target_col}')
+        df = df[df[target_col].notna()].copy()
+        if len(df) < self.config.min_rows_for_training:
+            raise ValueError(f'Not enough labelled rows for {target_col}. Need at least {self.config.min_rows_for_training}.')
+
+        y = df[target_col].astype(str)
+        y = compress_rare_classes(y, self.config.rare_class_min_count)
+        if y.nunique() < 2:
+            raise ValueError(f'Target {target_col} has fewer than 2 classes after preprocessing.')
+
+        X, feature_cols, categorical_features = select_features(df, target_col, self.config)
+        X_train, X_valid, X_test, y_train, y_valid, y_test = make_splits(X, y, self.config)
+
+        output_dir = Path(output_root) / target_col.replace('/', '_').replace(' ', '_')
+        model, bundle = self.trainer.train_classifier(
+            X_train, y_train, X_valid, y_valid, categorical_features, output_dir, target_col.replace('/', '_').replace(' ', '_')
+        )
+        metrics = evaluate_classifier(model, bundle, X_test, y_test, output_dir)
+
+        summary = {
+            'target': target_col,
+            'rows_used': len(df),
+            'classes': y.nunique(),
+            'train_rows': len(X_train),
+            'valid_rows': len(X_valid),
+            'test_rows': len(X_test),
+            **metrics,
+            'bundle_path': str(output_dir / f"{target_col.replace('/', '_').replace(' ', '_')}_bundle.joblib")
+        }
+        pd.DataFrame([summary]).to_csv(output_dir / 'training_summary.csv', index=False)
+        return summary
+
+    def batch_inference(self, raw_df: pd.DataFrame, bundle_path: str):
+        df = preprocess_dataframe(raw_df, self.config)
+        bundle = load_bundle(bundle_path)
+        model = load_model(bundle.model_path)
+        X = align_inference_features(df, bundle, self.config.numeric_fill_value, self.config.cat_fill_value)
+        preds = model.predict(X).reshape(-1)
+        proba = model.predict_proba(X)
+        out = raw_df.copy().reset_index(drop=True)
+        out[f'pred_{bundle.target_col}'] = preds
+        prob_df = pd.DataFrame(proba, columns=[f'proba_{c}' for c in model.classes_])
+        return pd.concat([out, prob_df], axis=1)
