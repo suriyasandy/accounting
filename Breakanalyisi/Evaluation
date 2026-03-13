@@ -1,0 +1,47 @@
+from pathlib import Path
+from typing import Dict
+
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_score, recall_score
+import plotly.express as px
+
+
+def evaluate_classifier(model, bundle, X_test, y_test, output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    preds = model.predict(X_test).reshape(-1)
+    proba = model.predict_proba(X_test)
+
+    metrics = {
+        'target': bundle.target_col,
+        'accuracy': accuracy_score(y_test, preds),
+        'precision_weighted': precision_score(y_test, preds, average='weighted', zero_division=0),
+        'recall_weighted': recall_score(y_test, preds, average='weighted', zero_division=0),
+        'f1_weighted': f1_score(y_test, preds, average='weighted', zero_division=0),
+        'f1_macro': f1_score(y_test, preds, average='macro', zero_division=0),
+        'rows_tested': len(y_test)
+    }
+    pd.DataFrame([metrics]).to_csv(output_dir / f'{bundle.target_col}_metrics.csv', index=False)
+
+    report = classification_report(y_test, preds, output_dict=True, zero_division=0)
+    pd.DataFrame(report).transpose().to_csv(output_dir / f'{bundle.target_col}_classification_report.csv')
+
+    labels = sorted(pd.Series(y_test).astype(str).unique().tolist())
+    cm = confusion_matrix(y_test, preds, labels=labels)
+    cm_df = pd.DataFrame(cm, index=labels, columns=labels)
+    cm_df.to_csv(output_dir / f'{bundle.target_col}_confusion_matrix.csv')
+
+    fig = px.imshow(cm_df, text_auto=True, color_continuous_scale='Blues', title=f'Confusion Matrix - {bundle.target_col}')
+    fig.write_html(output_dir / f'{bundle.target_col}_confusion_matrix.html')
+
+    fi = model.get_feature_importance(prettified=True)
+    fi.to_csv(output_dir / f'{bundle.target_col}_feature_importance.csv', index=False)
+
+    scored = X_test.copy()
+    scored['actual'] = y_test.values
+    scored['predicted'] = preds
+    if hasattr(proba, 'shape') and len(proba.shape) == 2:
+        prob_df = pd.DataFrame(proba, columns=[f'proba_{c}' for c in model.classes_])
+        scored = pd.concat([scored.reset_index(drop=True), prob_df.reset_index(drop=True)], axis=1)
+    scored.to_csv(output_dir / f'{bundle.target_col}_scored_test_data.csv', index=False)
+
+    return metrics
