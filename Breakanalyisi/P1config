@@ -1,0 +1,21 @@
+"""Global constants, colors, column definitions."""
+
+COLORS = ["#01696F", "#0C4E54", "#20808D", "#4F98A3", "#A84B2F", "#1B474D", "#BCE2E7", "#944454", "#FFC553"]
+PRIMARY  = "#01696F"
+DARK     = "#28251D"
+MUTED    = "#7A7974"
+BG_LIGHT = "#F7F7F5"
+
+BUCKET_ORDER = ["0-15", "16-30", "31-60", "61-90", "91-180", "181-365", "365+", "Unknown"]
+
+EXPECTED_COLUMNS = [
+    "Period", "Asset Class", "Team", "Rec Name (as per Rec Cube)", "Entity",
+    "Type of break", "Account Group", "Products Reconciled", "TRADE REF",
+    "If Duplicate Trade, provide the CC, etc details", "TRADE CCY",
+    "BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "Date", "Age Days", "Bucket",
+    "True/Systemic Breaks", "Journals Posted", "Comments", "ABS GBP",
+    "Root Cause identified", "B/S Cert",
+]
+
+FILTER_KEYS = ["Period", "Team", "Rec Name (as per Rec Cube)", "Entity",
+               "Asset Class", "Type of break", "True/Systemic Breaks"]
