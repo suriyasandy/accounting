@@ -1,16 +1,46 @@
+@st.cache_data(show_spinner="Loading file...")
+def load_file(file_bytes: bytes, filename: str) -> pl.DataFrame:
+    buf = BytesIO(file_bytes)
+    if filename.lower().endswith(".csv"):
+        # Read everything as string — no schema inference delay
+        return pl.read_csv(buf, infer_schema_length=0, ignore_errors=True)
+    try:
+        return pl.read_excel(buf, engine="calamine")
+    except Exception:
+        return pl.read_excel(buf, engine="openpyxl")
+
+
+def detect_date_format(series: pl.Series) -> str:
+    from datetime import datetime
+    sample = series.drop_nulls().cast(pl.Utf8).head(10).to_list()
+    formats = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y",
+               "%Y%m%d", "%d %b %Y", "%d-%b-%Y", "%Y/%m/%d"]
+    for fmt in formats:
+        try:
+            matched = sum(1 for s in sample if _try_parse(s.strip(), fmt))
+            if matched == len(sample):
+                return fmt
+        except Exception:
+            continue
+    return "%Y-%m-%d"
+
+
+def _try_parse(s, fmt):
+    from datetime import datetime
+    try:
+        datetime.strptime(s, fmt)
+        return True
+    except ValueError:
+        return False
+
+
 @st.cache_data(show_spinner="Cleaning & processing data...")
 def clean_data(file_bytes: bytes, filename: str):
-    """
-    Optimised Polars LazyFrame pipeline — single .collect() at the end.
-    Violation counting done AFTER collect on the already-materialised DataFrame.
-    """
-    raw = load_file(file_bytes, filename)
+    raw     = load_file(file_bytes, filename)
     col_map = build_col_map(raw.columns)
+    lf      = raw.lazy()
 
-    # ── Build the FULL expression graph first, collect ONCE ──
-    lf = raw.lazy()
-
-    # Amount columns
+    # ── 1. All amount columns — single with_columns pass ──
     amount_exprs = []
     for key in ["BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "ABS GBP"]:
         if key not in col_map: continue
@@ -18,16 +48,14 @@ def clean_data(file_bytes: bytes, filename: str):
         amount_exprs.append(
             pl.col(col).cast(pl.Utf8)
               .str.strip_chars()
-              .str.replace_all(r"[£$€¥,]", "")
-              .str.replace(r"(?i)^(GBP|USD|EUR|JPY|CHF|AUD|CAD)\s*", "")
-              .str.strip_chars()
+              .str.replace_all(r"[£$€¥,\s]|^(GBP|USD|EUR|JPY|CHF|AUD|CAD)", "")
               .cast(pl.Float64, strict=False)
               .alias(col)
         )
     if amount_exprs:
-        lf = lf.with_columns(amount_exprs)  # All 3 in ONE pass
+        lf = lf.with_columns(amount_exprs)
 
-    # Age Days
+    # ── 2. Age Days ──
     if "Age Days" in col_map:
         col = col_map["Age Days"]
         lf = lf.with_columns(
@@ -37,16 +65,17 @@ def clean_data(file_bytes: bytes, filename: str):
               .alias(col)
         )
 
-    # Date
+    # ── 3. Date — explicit format (fast single-pass) ──
     if "Date" in col_map:
         col = col_map["Date"]
+        date_fmt = detect_date_format(raw[col])   # sniff from raw, only 10 rows
         lf = lf.with_columns(
-            pl.col(col).cast(pl.Utf8)
-              .str.to_date(format=None, strict=False)
+            pl.col(col).cast(pl.Utf8).str.strip_chars()
+              .str.to_date(format=date_fmt, strict=False)
               .alias(col)
         )
 
-    # Period → last day of month (arithmetic, no string round-trip)
+    # ── 4. Period → last day of month (pure arithmetic, no string round-trip) ──
     if "Period" in col_map:
         col = col_map["Period"]
         lf = lf.with_columns(
@@ -55,7 +84,6 @@ def clean_data(file_bytes: bytes, filename: str):
             (pl.col(col) // 100).cast(pl.Int32).alias("_yr"),
             (pl.col(col) % 100).cast(pl.Int32).alias("_mo"),
         ]).with_columns(
-            # Use date_ranges trick: first day of next month minus 1 day
             pl.when(pl.col("_mo") == 12)
               .then(pl.date(pl.col("_yr") + 1, 1, 1))
               .otherwise(pl.date(pl.col("_yr"), pl.col("_mo") + 1, 1))
@@ -65,14 +93,19 @@ def clean_data(file_bytes: bytes, filename: str):
             pl.col("_Period_date").dt.strftime("%Y-%m").alias("_Period_label")
         ).drop(["_yr", "_mo"])
 
-    # Ageing computed columns
-    if "Date" in col_map:
+    # ── 5. Ageing computed cols — all in ONE with_columns pass ──
+    if "Date" in col_map and "Period" in col_map:
         date_col = col_map["Date"]
-        lf = lf.with_columns(
-            (pl.col("_Period_date").dt.epoch(time_unit="d") -
-             pl.col(date_col).dt.epoch(time_unit="d"))
+        age_col  = col_map.get("Age Days")
+        bkt_col  = col_map.get("Bucket")
+
+        computed_exprs = [
+            (pl.col("_Period_date").dt.epoch("d") - pl.col(date_col).dt.epoch("d"))
             .alias("_Computed_Age_Days")
-        ).with_columns(
+        ]
+        lf = lf.with_columns(computed_exprs)
+
+        bucket_and_flags = [
             pl.when(pl.col("_Computed_Age_Days").is_null()).then(pl.lit("Unknown"))
             .when(pl.col("_Computed_Age_Days") <= 15).then(pl.lit("0-15"))
             .when(pl.col("_Computed_Age_Days") <= 30).then(pl.lit("16-30"))
@@ -82,56 +115,39 @@ def clean_data(file_bytes: bytes, filename: str):
             .when(pl.col("_Computed_Age_Days") <= 365).then(pl.lit("181-365"))
             .otherwise(pl.lit("365+"))
             .alias("_Computed_Bucket")
-        )
+        ]
+        if age_col:
+            bucket_and_flags.append(
+                ((pl.col(age_col) - pl.col("_Computed_Age_Days")).abs() <= 1)
+                .alias("_Age_Match")
+            )
+        if bkt_col:
+            bucket_and_flags.append(
+                (pl.col(bkt_col).cast(pl.Utf8).str.strip_chars() ==
+                 pl.col("_Computed_Bucket"))
+                .alias("_Bucket_Match")
+            )
+        lf = lf.with_columns(bucket_and_flags)  # single pass for all 3
 
-    # Match flags
-    if "Age Days" in col_map:
-        age_col = col_map["Age Days"]
-        lf = lf.with_columns(
-            ((pl.col(age_col) - pl.col("_Computed_Age_Days")).abs() <= 1)
-            .alias("_Age_Match")
-        )
-    if "Bucket" in col_map:
-        bucket_col = col_map["Bucket"]
-        lf = lf.with_columns(
-            (pl.col(bucket_col).cast(pl.Utf8).str.strip_chars() ==
-             pl.col("_Computed_Bucket"))
-            .alias("_Bucket_Match")
-        )
+    # ── 6. SINGLE COLLECT — no streaming (faster for in-memory 600K) ──
+    df = lf.collect()
 
-    # ── SINGLE COLLECT — entire expression graph executes here ──
-    df = lf.collect(streaming=True)   # streaming=True for 600K+ rows
-
-    # ── Violation counting AFTER collect (cheap, already materialised) ──
+    # ── 7. Violation counts (post-collect, already materialised — near instant) ──
     type_violations = []
-    for key in ["BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "ABS GBP"]:
+    for key in ["BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "ABS GBP", "Age Days"]:
         if key not in col_map: continue
-        col = col_map[key]
-        original_nulls = raw[col].null_count()
-        new_nulls      = df[col].null_count()
-        gained = new_nulls - original_nulls
+        col    = col_map[key]
+        gained = df[col].null_count() - raw[col].null_count()
         if gained > 0:
             sample = raw[col].cast(pl.Utf8).drop_nulls().head(3).to_list()
             type_violations.append({
-                "Column": col, "Expected Type": "Float64",
+                "Column": col,
+                "Expected Type": "Float64",
                 "Violation Count": gained,
-                "Sample Values": ", ".join(str(s) for s in sample)
+                "Sample Values": ", ".join(str(s) for s in sample),
             })
 
-    if "Age Days" in col_map:
-        col = col_map["Age Days"]
-        original_nulls = raw[col].null_count()
-        new_nulls      = df[col].null_count()
-        gained = new_nulls - original_nulls
-        if gained > 0:
-            sample = raw[col].cast(pl.Utf8).drop_nulls().head(3).to_list()
-            type_violations.append({
-                "Column": col, "Expected Type": "Float64",
-                "Violation Count": gained,
-                "Sample Values": ", ".join(str(s) for s in sample)
-            })
-
-    # Filter options
+    # ── 8. Filter options (post-collect — cheap unique+sort) ──
     filter_options = {}
     for key in ["Period","Team","Rec Name (as per Rec Cube)","Entity",
                 "Asset Class","Type of break","True/Systemic Breaks"]:
@@ -142,15 +158,3 @@ def clean_data(file_bytes: bytes, filename: str):
         pd.DataFrame(columns=["Column","Expected Type","Violation Count","Sample Values"])
 
     return df, col_map, filter_options, type_violations_df
-
-
-@st.cache_data(show_spinner="Loading file...")
-def load_file(file_bytes: bytes, filename: str) -> pl.DataFrame:
-    buf = BytesIO(file_bytes)
-    if filename.lower().endswith(".csv"):
-        return pl.read_csv(buf, infer_schema_length=10000, ignore_errors=True)
-    # fastexcel is Rust-based — install with: pip install fastexcel
-    try:
-        return pl.read_excel(buf, engine="calamine")   # calamine = fastexcel
-    except Exception:
-        return pl.read_excel(buf, engine="openpyxl")   # fallback
