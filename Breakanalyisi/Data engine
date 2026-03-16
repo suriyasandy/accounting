@@ -1,0 +1,50 @@
+"""
+Core data engine.
+  - Loads CSV/XLSX into Polars
+  - Cleans and type-coerces with Polars expressions (lazy)
+  - Registers Arrow table in DuckDB for all analytical queries
+  - All aggregations run as DuckDB SQL → .arrow() → zero-copy
+"""
+
+import io
+import re
+import duckdb
+import polars as pl
+import streamlit as st
+from datetime import datetime
+from config import EXPECTED_COLUMNS, FILTER_KEYS, BUCKET_ORDER
+
+
+# ── DuckDB connection: one per session ──────────────────────────────────────
+
+@st.cache_resource
+def get_duckdb_conn():
+    """Persistent in-memory DuckDB connection (one per Streamlit session)."""
+    conn = duckdb.connect(database=":memory:")
+    conn.execute("PRAGMA threads=4;")          # parallelism
+    conn.execute("PRAGMA memory_limit='2GB';") # safety cap
+    return conn
+
+
+# ── Column mapping ───────────────────────────────────────────────────────────
+
+def _fuzzy_match(uploaded_cols: list[str], target: str) -> str | None:
+    t = target.lower().strip()
+    for c in uploaded_cols:
+        if c.lower().strip() == t:
+            return c
+    for c in uploaded_cols:
+        cl = c.lower().strip()
+        if t in cl or cl in t:
+            return c
+    return None
+
+
+def build_col_map(cols: list[str]) -> dict[str, str]:
+    return {exp: m for exp in EXPECTED_COLUMNS if (m := _fuzzy_match(cols, exp))}
+
+
+# ── Loaders ─────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner="Reading file…")
+def load_file(
