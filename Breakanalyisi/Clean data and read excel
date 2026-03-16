@@ -2,23 +2,26 @@ def convert_to_parquet(file_bytes: bytes, filename: str) -> bytes:
     """
     Fastest CSV/Excel → Parquet conversion.
     CSV  → DuckDB read_csv_auto() → Parquet  (~0.3s for 600K rows)
-    XLSX → fastexcel Arrow batches → Parquet  (~1–2s for 600K rows)
+    XLSX → DuckDB spatial ext    → Parquet  (~1–2s for 600K rows)
+           Fallback: calamine via Polars     (~3–6s for 600K rows)
     """
     name_lower = filename.lower()
 
     if name_lower.endswith(".parquet"):
-        return file_bytes   # already Parquet
+        return file_bytes
 
     if name_lower.endswith(".csv"):
         with st.spinner("⚡ Converting CSV → Parquet via DuckDB..."):
             return _csv_to_parquet_duckdb(file_bytes)
 
-    with st.spinner("⚡ Converting Excel → Parquet via fastexcel..."):
-        return _xlsx_to_parquet_fastexcel(file_bytes)
+    with st.spinner("⚡ Converting Excel → Parquet..."):
+        return _xlsx_to_parquet(file_bytes)
 
 
 def _csv_to_parquet_duckdb(file_bytes: bytes) -> bytes:
-    import tempfile, os
+    import tempfile
+    import os
+
     con = duckdb.connect()
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f_in:
         f_in.write(file_bytes)
@@ -28,7 +31,11 @@ def _csv_to_parquet_duckdb(file_bytes: bytes) -> bytes:
     try:
         con.execute(f"""
             COPY (
-                SELECT * FROM read_csv_auto('{csv_path}', ignore_errors=true, all_varchar=true)
+                SELECT * FROM read_csv_auto(
+                    '{csv_path}',
+                    ignore_errors=true,
+                    all_varchar=true
+                )
             )
             TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
@@ -40,19 +47,58 @@ def _csv_to_parquet_duckdb(file_bytes: bytes) -> bytes:
         con.close()
 
 
-def _xlsx_to_parquet_fastexcel(file_bytes: bytes) -> bytes:
-    import pyarrow.parquet as pq
+def _xlsx_to_parquet(file_bytes: bytes) -> bytes:
+    """
+    Excel → Parquet without fastexcel.
+    Primary:  DuckDB spatial extension (st_read / xlsx reader)
+    Fallback: calamine via Polars
+    Final fallback: openpyxl via Polars
+    """
+    import tempfile
+    import os
+
+    # ── Write Excel bytes to temp file (both methods need a file path) ──
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f_in:
+        f_in.write(file_bytes)
+        xlsx_path = f_in.name
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f_out:
+        pq_path = f_out.name
+
+    # ── Primary: DuckDB spatial extension ──
     try:
-        import fastexcel
-        wb    = fastexcel.read_buffer(BytesIO(file_bytes))
-        sheet = wb.load_sheet(0)
-        arrow_table = sheet.to_arrow()
-        buf = BytesIO()
-        pq.write_table(arrow_table, buf, compression="zstd")
-        return buf.getvalue()
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        con.execute(f"""
+            COPY (
+                SELECT * FROM st_read('{xlsx_path}')
+            )
+            TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+        with open(pq_path, "rb") as f:
+            result = f.read()
+        return result
+
     except Exception:
-        # Fallback: calamine via Polars
-        df  = pl.read_excel(BytesIO(file_bytes), engine="calamine")
-        buf = BytesIO()
-        df.write_parquet(buf, compression="zstd")
-        return buf.getvalue()
+        # ── Fallback 1: calamine via Polars ──
+        try:
+            df  = pl.read_excel(BytesIO(file_bytes), engine="calamine")
+            buf = BytesIO()
+            df.write_parquet(buf, compression="zstd")
+            return buf.getvalue()
+
+        except Exception:
+            # ── Fallback 2: openpyxl via Polars ──
+            df  = pl.read_excel(BytesIO(file_bytes), engine="openpyxl")
+            buf = BytesIO()
+            df.write_parquet(buf, compression="zstd")
+            return buf.getvalue()
+
+    finally:
+        os.unlink(xlsx_path)
+        # Only unlink pq_path if it exists (DuckDB may not have created it)
+        if os.path.exists(pq_path):
+            os.unlink(pq_path)
+        try:
+            con.close()
+        except Exception:
+            pass
