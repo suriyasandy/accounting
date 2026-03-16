@@ -1,0 +1,1182 @@
+"""
+Accounting Control AI Platform - Phase 1
+Streamlit dashboard for data quality, ageing validation, and trend analysis.
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from io import BytesIO
+from datetime import datetime, timedelta
+import re
+
+# Try AgGrid import with fallback
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+    HAS_AGGRID = True
+except ImportError:
+    HAS_AGGRID = False
+
+# ─────────────────────────── Page Config ───────────────────────────
+st.set_page_config(
+    page_title="Accounting Control AI Platform",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────── Color Palette ───────────────────────────
+COLORS = ["#01696F", "#0C4E54", "#20808D", "#4F98A3", "#A84B2F", "#1B474D", "#BCE2E7", "#944454", "#FFC553"]
+PRIMARY = "#01696F"
+DARK = "#28251D"
+MUTED = "#7A7974"
+BG_LIGHT = "#F7F7F5"
+
+# ─────────────────────────── Global CSS ───────────────────────────
+st.markdown(f"""
+<style>
+    .main .block-container {{padding-top: 1rem; padding-bottom: 1rem;}}
+    h1 {{color: {DARK}; font-size: 1.6rem !important;}}
+    h2 {{color: {DARK}; font-size: 1.25rem !important;}}
+    h3 {{color: {DARK}; font-size: 1.05rem !important;}}
+    .stTabs [data-baseweb="tab-list"] {{gap: 8px;}}
+    .stTabs [data-baseweb="tab"] {{
+        background-color: {BG_LIGHT}; border-radius: 6px 6px 0 0;
+        padding: 8px 16px; font-weight: 600; color: {DARK};
+    }}
+    .stTabs [aria-selected="true"] {{
+        background-color: {PRIMARY} !important; color: white !important;
+    }}
+    .kpi-card {{
+        background: white; border-left: 4px solid {PRIMARY};
+        border-radius: 6px; padding: 12px 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }}
+    .kpi-value {{font-size: 1.5rem; font-weight: 700; color: {DARK}; margin: 0;}}
+    .kpi-label {{font-size: 0.78rem; color: {MUTED}; margin: 0; text-transform: uppercase; letter-spacing: 0.5px;}}
+    .kpi-delta-pos {{color: #A84B2F; font-size: 0.8rem;}}
+    .kpi-delta-neg {{color: #01696F; font-size: 0.8rem;}}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────── Utility Functions ───────────────────────────
+
+def kpi_card(label: str, value, delta: str = None, invert: bool = False):
+    """Render a compact KPI card."""
+    delta_html = ""
+    if delta:
+        css_class = "kpi-delta-neg" if (invert and not delta.startswith("-")) or (not invert and delta.startswith("-")) else "kpi-delta-pos"
+        if not invert:
+            css_class = "kpi-delta-neg" if delta.startswith("-") else "kpi-delta-pos"
+        else:
+            css_class = "kpi-delta-pos" if delta.startswith("-") else "kpi-delta-neg"
+        delta_html = f'<p class="{css_class}">{delta}</p>'
+    st.markdown(f"""
+    <div class="kpi-card">
+        <p class="kpi-label">{label}</p>
+        <p class="kpi-value">{value}</p>
+        {delta_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def safe_mom_pct(current, previous):
+    """Compute MoM percentage safely."""
+    if previous is None or previous == 0:
+        return None
+    return round(((current - previous) / abs(previous)) * 100, 1)
+
+
+def format_number(n, prefix="", decimal=0):
+    """Format number with commas."""
+    if pd.isna(n):
+        return "N/A"
+    if decimal > 0:
+        return f"{prefix}{n:,.{decimal}f}"
+    return f"{prefix}{int(n):,}"
+
+
+def period_to_datetime(period_val):
+    """Convert int period like 202501 to datetime (last day of month)."""
+    try:
+        p = int(period_val)
+        year = p // 100
+        month = p % 100
+        if month < 1 or month > 12:
+            return pd.NaT
+        if month == 12:
+            return pd.Timestamp(year + 1, 1, 1) - pd.Timedelta(days=1)
+        return pd.Timestamp(year, month + 1, 1) - pd.Timedelta(days=1)
+    except (ValueError, TypeError):
+        return pd.NaT
+
+
+def parse_amount(val):
+    """Strip currency symbols and parse to float."""
+    if pd.isna(val):
+        return np.nan
+    s = str(val).strip()
+    # Remove currency symbols and commas
+    s = re.sub(r'[£$€¥]', '', s)
+    s = s.replace(',', '').strip()
+    # Remove currency codes at start
+    s = re.sub(r'^(GBP|USD|EUR|JPY|CHF|AUD|CAD)\s*', '', s, flags=re.IGNORECASE).strip()
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return np.nan
+
+
+def parse_age_days(val):
+    """Parse age days, stripping non-numeric suffixes."""
+    if pd.isna(val):
+        return np.nan
+    s = str(val).strip()
+    if s in ('', 'N/A', 'n/a', '-'):
+        return np.nan
+    # Extract leading number
+    m = re.match(r'^[~]?(-?\d+)', s)
+    if m:
+        return float(m.group(1))
+    return np.nan
+
+
+def age_to_bucket(age):
+    """Derive bucket from age days."""
+    if pd.isna(age):
+        return "Unknown"
+    age = int(age)
+    if age <= 15:
+        return "0-15"
+    elif age <= 30:
+        return "16-30"
+    elif age <= 60:
+        return "31-60"
+    elif age <= 90:
+        return "61-90"
+    elif age <= 180:
+        return "91-180"
+    elif age <= 365:
+        return "181-365"
+    else:
+        return "365+"
+
+
+BUCKET_ORDER = ["0-15", "16-30", "31-60", "61-90", "91-180", "181-365", "365+", "Unknown"]
+
+
+def fuzzy_col_match(uploaded_cols, target):
+    """Find best matching column name (case-insensitive, stripped)."""
+    target_lower = target.lower().strip()
+    for c in uploaded_cols:
+        if c.lower().strip() == target_lower:
+            return c
+    # Partial match
+    for c in uploaded_cols:
+        if target_lower in c.lower().strip() or c.lower().strip() in target_lower:
+            return c
+    return None
+
+
+EXPECTED_COLUMNS = [
+    "Period", "Asset Class", "Team", "Rec Name (as per Rec Cube)", "Entity",
+    "Type of break", "Account Group", "Products Reconciled", "TRADE REF",
+    "If Duplicate Trade, provide the CC, etc details", "TRADE CCY",
+    "BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "Date", "Age Days", "Bucket",
+    "True/Systemic Breaks", "Journals Posted", "Comments", "ABS GBP",
+    "Root Cause identified", "B/S Cert",
+]
+
+
+def build_column_mapping(uploaded_cols):
+    """Build a mapping from expected to actual column names."""
+    mapping = {}
+    for expected in EXPECTED_COLUMNS:
+        match = fuzzy_col_match(uploaded_cols, expected)
+        if match:
+            mapping[expected] = match
+    return mapping
+
+
+def render_aggrid(df, height=400, selection=False, key=None):
+    """Render AgGrid table or fallback to st.dataframe."""
+    if HAS_AGGRID and len(df) > 0:
+        gb = GridOptionsBuilder.from_dataframe(df)
+        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        gb.configure_default_column(filterable=True, sortable=True, resizable=True, wrapText=False)
+        if selection:
+            gb.configure_selection("single", use_checkbox=False)
+        grid_opts = gb.build()
+        return AgGrid(
+            df, gridOptions=grid_opts, height=height,
+            theme="streamlit", key=key,
+            allow_unsafe_jscode=True,
+        )
+    else:
+        st.dataframe(df, height=height, use_container_width=True)
+        return None
+
+
+def to_excel_download(df, filename="data.xlsx"):
+    """Create download button for Excel."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return buf.getvalue()
+
+
+@st.cache_data
+def load_csv(uploaded_file):
+    """Load CSV file with caching."""
+    return pd.read_csv(uploaded_file, low_memory=False)
+
+
+@st.cache_data
+def load_excel(uploaded_file):
+    """Load Excel file with caching."""
+    return pd.read_excel(uploaded_file, engine="openpyxl")
+
+
+def clean_dataframe(df, col_map):
+    """Apply type coercion and cleaning based on column mapping."""
+    df = df.copy()
+    type_violations = []
+
+    # Parse amount columns
+    for col_key in ["BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "ABS GBP"]:
+        if col_key in col_map and col_map[col_key] in df.columns:
+            actual_col = col_map[col_key]
+            original = df[actual_col].copy()
+            df[actual_col] = df[actual_col].apply(parse_amount)
+            violations = original.notna() & df[actual_col].isna()
+            if violations.sum() > 0:
+                type_violations.append({
+                    "Column": actual_col,
+                    "Expected Type": "float64",
+                    "Violation Count": int(violations.sum()),
+                    "Sample Values": ", ".join(original[violations].head(3).astype(str).tolist())
+                })
+
+    # Parse Age Days
+    if "Age Days" in col_map and col_map["Age Days"] in df.columns:
+        actual_col = col_map["Age Days"]
+        original = df[actual_col].copy()
+        df[actual_col] = df[actual_col].apply(parse_age_days)
+        violations = original.notna() & original.astype(str).str.strip().ne('') & df[actual_col].isna()
+        if violations.sum() > 0:
+            type_violations.append({
+                "Column": actual_col,
+                "Expected Type": "numeric",
+                "Violation Count": int(violations.sum()),
+                "Sample Values": ", ".join(original[violations].head(3).astype(str).tolist())
+            })
+
+    # Parse Date
+    if "Date" in col_map and col_map["Date"] in df.columns:
+        actual_col = col_map["Date"]
+        df[actual_col] = pd.to_datetime(df[actual_col], errors="coerce")
+
+    # Parse Period to datetime helper column
+    if "Period" in col_map and col_map["Period"] in df.columns:
+        actual_col = col_map["Period"]
+        df["_Period_date"] = df[actual_col].apply(period_to_datetime)
+        df["_Period_label"] = df["_Period_date"].dt.strftime("%Y-%m").fillna(df[actual_col].astype(str))
+
+    return df, pd.DataFrame(type_violations) if type_violations else pd.DataFrame(columns=["Column", "Expected Type", "Violation Count", "Sample Values"])
+
+
+def detect_outliers_iqr(series, name="Column"):
+    """Detect outliers using IQR method."""
+    clean = series.dropna()
+    if len(clean) < 10:
+        return pd.DataFrame()
+    q1 = clean.quantile(0.25)
+    q3 = clean.quantile(0.75)
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    outliers = clean[(clean < lower) | (clean > upper)]
+    if len(outliers) == 0:
+        return pd.DataFrame()
+    return pd.DataFrame({
+        "Column": [name],
+        "Outlier Count": [len(outliers)],
+        "Outlier %": [round(len(outliers) / len(clean) * 100, 2)],
+        "IQR Lower": [round(lower, 2)],
+        "IQR Upper": [round(upper, 2)],
+        "Min Outlier": [round(outliers.min(), 2)],
+        "Max Outlier": [round(outliers.max(), 2)],
+    })
+
+
+def apply_global_filters(df, col_map):
+    """Apply sidebar global filters and return filtered df."""
+    filtered = df.copy()
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(f"### 🔍 Global Filters")
+
+    # Period range
+    if "Period" in col_map and col_map["Period"] in filtered.columns:
+        periods_sorted = sorted(filtered[col_map["Period"]].dropna().unique())
+        if len(periods_sorted) >= 2:
+            period_labels = {p: period_to_datetime(p).strftime("%Y-%m") if pd.notna(period_to_datetime(p)) else str(p) for p in periods_sorted}
+            selected_periods = st.sidebar.multiselect(
+                "Period",
+                options=periods_sorted,
+                default=periods_sorted,
+                format_func=lambda x: period_labels.get(x, str(x)),
+                key="filter_period",
+            )
+            if selected_periods:
+                filtered = filtered[filtered[col_map["Period"]].isin(selected_periods)]
+
+    # Team
+    if "Team" in col_map and col_map["Team"] in filtered.columns:
+        teams = sorted(filtered[col_map["Team"]].dropna().unique())
+        sel_teams = st.sidebar.multiselect("Team", teams, default=teams, key="filter_team")
+        if sel_teams:
+            filtered = filtered[filtered[col_map["Team"]].isin(sel_teams)]
+
+    # Rec Name
+    if "Rec Name (as per Rec Cube)" in col_map and col_map["Rec Name (as per Rec Cube)"] in filtered.columns:
+        recs = sorted(filtered[col_map["Rec Name (as per Rec Cube)"]].dropna().unique())
+        sel_recs = st.sidebar.multiselect("Rec Name", recs, default=recs, key="filter_rec")
+        if sel_recs:
+            filtered = filtered[filtered[col_map["Rec Name (as per Rec Cube)"]].isin(sel_recs)]
+
+    # Entity
+    if "Entity" in col_map and col_map["Entity"] in filtered.columns:
+        entities = sorted(filtered[col_map["Entity"]].dropna().unique())
+        sel_ent = st.sidebar.multiselect("Entity", entities, default=entities, key="filter_entity")
+        if sel_ent:
+            filtered = filtered[filtered[col_map["Entity"]].isin(sel_ent)]
+
+    # Asset Class
+    if "Asset Class" in col_map and col_map["Asset Class"] in filtered.columns:
+        ac = sorted(filtered[col_map["Asset Class"]].dropna().unique())
+        sel_ac = st.sidebar.multiselect("Asset Class", ac, default=ac, key="filter_ac")
+        if sel_ac:
+            filtered = filtered[filtered[col_map["Asset Class"]].isin(sel_ac)]
+
+    # Type of break
+    if "Type of break" in col_map and col_map["Type of break"] in filtered.columns:
+        tob = sorted(filtered[col_map["Type of break"]].dropna().unique())
+        sel_tob = st.sidebar.multiselect("Type of Break", tob, default=tob, key="filter_tob")
+        if sel_tob:
+            filtered = filtered[filtered[col_map["Type of break"]].isin(sel_tob)]
+
+    # True/Systemic
+    if "True/Systemic Breaks" in col_map and col_map["True/Systemic Breaks"] in filtered.columns:
+        ts = sorted(filtered[col_map["True/Systemic Breaks"]].dropna().unique())
+        sel_ts = st.sidebar.multiselect("True/Systemic", ts, default=ts, key="filter_ts")
+        if sel_ts:
+            filtered = filtered[filtered[col_map["True/Systemic Breaks"]].isin(sel_ts)]
+
+    return filtered
+
+
+def chart_layout(fig, title="", xaxis_title="", yaxis_title="", height=400):
+    """Apply consistent chart styling."""
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14, color=DARK)),
+        xaxis_title=xaxis_title,
+        yaxis_title=yaxis_title,
+        height=height,
+        margin=dict(l=40, r=20, t=50, b=40),
+        font=dict(family="Inter, sans-serif", size=11, color=DARK),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=dict(font=dict(size=10)),
+    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#ECECEC")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#ECECEC")
+    return fig
+
+
+# ─────────────────────────── Tab 1: Data Quality ───────────────────────────
+
+def tab_data_quality(df, col_map, type_violations_df):
+    """Render Data Quality & Ingestion tab."""
+    st.markdown("## Data Quality & Ingestion Scorecard")
+
+    # KPI cards
+    total_records = len(df)
+    total_cols = len(df.columns)
+    completeness = round(df.notna().sum().sum() / (total_records * total_cols) * 100, 1) if total_records * total_cols > 0 else 0
+    violation_count = int(type_violations_df["Violation Count"].sum()) if len(type_violations_df) > 0 else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("Total Records", format_number(total_records))
+    with c2:
+        kpi_card("Columns", str(total_cols))
+    with c3:
+        kpi_card("Completeness", f"{completeness}%")
+    with c4:
+        kpi_card("Type Violations", format_number(violation_count), invert=True)
+
+    st.markdown("---")
+    col_left, col_right = st.columns(2)
+
+    # Per-column completeness
+    with col_left:
+        st.markdown("### Column Completeness")
+        completeness_data = pd.DataFrame({
+            "Column": df.columns,
+            "Completeness %": [round(df[c].notna().sum() / len(df) * 100, 1) if len(df) > 0 else 0 for c in df.columns]
+        }).sort_values("Completeness %", ascending=True)
+
+        fig = px.bar(
+            completeness_data, x="Completeness %", y="Column",
+            orientation="h", color_discrete_sequence=[PRIMARY],
+        )
+        fig = chart_layout(fig, title="Per-Column Completeness (%)", xaxis_title="Completeness %", height=max(350, len(df.columns) * 18))
+        fig.update_layout(yaxis=dict(tickfont=dict(size=9)))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Type violations
+    with col_right:
+        st.markdown("### Type Violation Details")
+        if len(type_violations_df) > 0:
+            render_aggrid(type_violations_df, height=200, key="tv_grid")
+        else:
+            st.success("No type violations detected.")
+
+        # Outlier detection
+        st.markdown("### Outlier Detection (IQR Method)")
+        amount_cols = []
+        for key in ["BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "ABS GBP"]:
+            if key in col_map and col_map[key] in df.columns:
+                amount_cols.append(col_map[key])
+        if "Age Days" in col_map and col_map["Age Days"] in df.columns:
+            amount_cols.append(col_map["Age Days"])
+
+        outlier_frames = []
+        for c in amount_cols:
+            if df[c].dtype in [np.float64, np.int64, float, int]:
+                ol = detect_outliers_iqr(df[c], c)
+                if len(ol) > 0:
+                    outlier_frames.append(ol)
+        if outlier_frames:
+            outlier_df = pd.concat(outlier_frames, ignore_index=True)
+            render_aggrid(outlier_df, height=200, key="outlier_grid")
+        else:
+            st.info("No outliers detected in amount columns.")
+
+    # Summary stats
+    st.markdown("### Numeric Column Summary Statistics")
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        summary = df[numeric_cols].describe().T.round(2)
+        summary.index.name = "Column"
+        summary = summary.reset_index()
+        render_aggrid(summary, height=300, key="summary_grid")
+    else:
+        st.info("No numeric columns found.")
+
+    # Download cleaned dataset
+    st.markdown("---")
+    st.download_button(
+        "📥 Download Cleaned Dataset (CSV)",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name="cleaned_data.csv",
+        mime="text/csv",
+    )
+
+
+# ─────────────────────────── Tab 2: Ageing Validation ───────────────────────────
+
+def tab_ageing_validation(df, col_map):
+    """Render Ageing Validation tab."""
+    st.markdown("## Ageing Validation")
+
+    period_col = col_map.get("Period")
+    date_col = col_map.get("Date")
+    age_col = col_map.get("Age Days")
+    bucket_col = col_map.get("Bucket")
+    team_col = col_map.get("Team")
+    rec_col = col_map.get("Rec Name (as per Rec Cube)")
+
+    if not all([period_col, date_col, age_col, bucket_col]):
+        st.warning("Required columns (Period, Date, Age Days, Bucket) not found. Cannot run ageing validation.")
+        return
+
+    vdf = df.copy()
+
+    # Compute Age Days = Period end date - Date
+    if "_Period_date" in vdf.columns and date_col in vdf.columns:
+        vdf["_Computed_Age_Days"] = (vdf["_Period_date"] - vdf[date_col]).dt.days
+    else:
+        st.warning("Cannot compute Age Days: Period or Date not properly parsed.")
+        return
+
+    # Derive bucket
+    vdf["_Computed_Bucket"] = vdf["_Computed_Age_Days"].apply(age_to_bucket)
+
+    # Compare
+    vdf["_Age_Match"] = np.isclose(vdf[age_col].fillna(-999), vdf["_Computed_Age_Days"].fillna(-998), atol=1)
+    vdf["_Bucket_Match"] = vdf[bucket_col].astype(str).str.strip() == vdf["_Computed_Bucket"].astype(str).str.strip()
+
+    valid_rows = vdf[vdf["_Computed_Age_Days"].notna() & vdf[age_col].notna()]
+    total_valid = len(valid_rows)
+
+    age_mismatch = int((~valid_rows["_Age_Match"]).sum())
+    bucket_mismatch = int((~valid_rows["_Bucket_Match"]).sum())
+    age_pct = round(age_mismatch / total_valid * 100, 1) if total_valid > 0 else 0
+    bucket_pct = round(bucket_mismatch / total_valid * 100, 1) if total_valid > 0 else 0
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("Records Validated", format_number(total_valid))
+    with c2:
+        kpi_card("Age Days Discrepancies", f"{format_number(age_mismatch)} ({age_pct}%)", invert=True)
+    with c3:
+        kpi_card("Bucket Discrepancies", f"{format_number(bucket_mismatch)} ({bucket_pct}%)", invert=True)
+    with c4:
+        kpi_card("Accuracy Rate", f"{round(100 - max(age_pct, bucket_pct), 1)}%")
+
+    st.markdown("---")
+
+    # Discrepancy table
+    st.markdown("### Discrepancy Records")
+    disc_df = valid_rows[~valid_rows["_Age_Match"] | ~valid_rows["_Bucket_Match"]].copy()
+    if len(disc_df) > 0:
+        show_cols = []
+        for key in ["Period", "Team", "Rec Name (as per Rec Cube)", "Entity", "Date"]:
+            if key in col_map and col_map[key] in disc_df.columns:
+                show_cols.append(col_map[key])
+        show_cols.extend([age_col, "_Computed_Age_Days", bucket_col, "_Computed_Bucket", "_Age_Match", "_Bucket_Match"])
+        display_disc = disc_df[show_cols].head(500).copy()
+        display_disc.columns = [c.replace("_Computed_", "Computed ").replace("_", " ").strip() for c in display_disc.columns]
+
+        if HAS_AGGRID:
+            gb = GridOptionsBuilder.from_dataframe(display_disc)
+            gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+            gb.configure_default_column(filterable=True, sortable=True, resizable=True)
+            # Color code mismatch cells
+            cell_style_jscode = JsCode("""
+            function(params) {
+                if (params.value === false || params.value === 'False') {
+                    return {'backgroundColor': '#FDECEA', 'color': '#A84B2F', 'fontWeight': 'bold'};
+                }
+                if (params.value === true || params.value === 'True') {
+                    return {'backgroundColor': '#E8F5E9', 'color': '#01696F'};
+                }
+                return {};
+            }
+            """)
+            for col_name in display_disc.columns:
+                if "Match" in col_name:
+                    gb.configure_column(col_name, cellStyle=cell_style_jscode)
+            AgGrid(display_disc, gridOptions=gb.build(), height=400, theme="streamlit",
+                   allow_unsafe_jscode=True, key="disc_grid")
+        else:
+            st.dataframe(display_disc, height=400, use_container_width=True)
+    else:
+        st.success("No discrepancies found!")
+
+    st.markdown("---")
+
+    # Charts
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("### Age Days Distribution: Computed vs Pre-populated")
+        hist_data = valid_rows[[age_col, "_Computed_Age_Days"]].dropna()
+        if len(hist_data) > 0:
+            fig = go.Figure()
+            fig.add_trace(go.Histogram(x=hist_data[age_col], name="Pre-populated", opacity=0.6,
+                                       marker_color=COLORS[0], nbinsx=50))
+            fig.add_trace(go.Histogram(x=hist_data["_Computed_Age_Days"], name="Computed", opacity=0.6,
+                                       marker_color=COLORS[4], nbinsx=50))
+            fig.update_layout(barmode="overlay")
+            fig = chart_layout(fig, "Age Days Distribution: Computed vs Pre-populated", "Age Days", "Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col_right:
+        st.markdown("### Bucket Distribution Comparison")
+        bucket_comp = pd.DataFrame({
+            "Pre-populated": valid_rows[bucket_col].value_counts(),
+            "Computed": valid_rows["_Computed_Bucket"].value_counts(),
+        }).reindex(BUCKET_ORDER).fillna(0).reset_index()
+        bucket_comp.columns = ["Bucket", "Pre-populated", "Computed"]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=bucket_comp["Bucket"], y=bucket_comp["Pre-populated"],
+                             name="Pre-populated", marker_color=COLORS[0]))
+        fig.add_trace(go.Bar(x=bucket_comp["Bucket"], y=bucket_comp["Computed"],
+                             name="Computed", marker_color=COLORS[4]))
+        fig.update_layout(barmode="group")
+        fig = chart_layout(fig, "Bucket Distribution: Computed vs Pre-populated", "Bucket", "Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Discrepancy rate by Team/Rec Name
+    if team_col and team_col in valid_rows.columns:
+        st.markdown("### Discrepancy Rate by Team")
+        team_disc = valid_rows.groupby(team_col).apply(
+            lambda g: pd.Series({
+                "Total": len(g),
+                "Age Mismatch": int((~g["_Age_Match"]).sum()),
+                "Bucket Mismatch": int((~g["_Bucket_Match"]).sum()),
+            })
+        ).reset_index()
+        team_disc["Age Disc %"] = (team_disc["Age Mismatch"] / team_disc["Total"] * 100).round(1)
+        team_disc["Bucket Disc %"] = (team_disc["Bucket Mismatch"] / team_disc["Total"] * 100).round(1)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=team_disc[team_col], y=team_disc["Age Disc %"],
+                             name="Age Days Disc %", marker_color=COLORS[0]))
+        fig.add_trace(go.Bar(x=team_disc[team_col], y=team_disc["Bucket Disc %"],
+                             name="Bucket Disc %", marker_color=COLORS[4]))
+        fig.update_layout(barmode="group")
+        fig = chart_layout(fig, "Discrepancy Rate by Team (%)", "Team", "Discrepancy %")
+        st.plotly_chart(fig, use_container_width=True)
+
+    if rec_col and rec_col in valid_rows.columns:
+        st.markdown("### Discrepancy Rate by Rec Name")
+        rec_disc = valid_rows.groupby(rec_col).apply(
+            lambda g: pd.Series({
+                "Total": len(g),
+                "Bucket Mismatch": int((~g["_Bucket_Match"]).sum()),
+            })
+        ).reset_index()
+        rec_disc["Disc %"] = (rec_disc["Bucket Mismatch"] / rec_disc["Total"] * 100).round(1)
+        rec_disc = rec_disc.sort_values("Disc %", ascending=True)
+        fig = px.bar(rec_disc, x="Disc %", y=rec_col, orientation="h", color_discrete_sequence=[COLORS[0]])
+        fig = chart_layout(fig, "Bucket Discrepancy Rate by Rec Name (%)", "Discrepancy %", "", height=max(300, len(rec_disc) * 25))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Download
+    if len(disc_df) > 0:
+        st.download_button(
+            "📥 Download Discrepancy Report (CSV)",
+            disc_df.to_csv(index=False).encode("utf-8"),
+            file_name="ageing_discrepancy_report.csv",
+            mime="text/csv",
+        )
+
+
+# ─────────────────────────── Tab 3: Break Counts ───────────────────────────
+
+def tab_break_counts(df, col_map):
+    """Render Trend Analysis - Break Counts tab."""
+    st.markdown("## Trend Analysis: Break Counts")
+
+    period_col = col_map.get("Period")
+    team_col = col_map.get("Team")
+    rec_col = col_map.get("Rec Name (as per Rec Cube)")
+    ac_col = col_map.get("Asset Class")
+    ts_col = col_map.get("True/Systemic Breaks")
+    bucket_col = col_map.get("Bucket")
+
+    if not period_col or period_col not in df.columns:
+        st.warning("Period column not found.")
+        return
+
+    # Period-level aggregation
+    periods_sorted = sorted(df[period_col].dropna().unique())
+    period_counts = df.groupby(period_col).size().reset_index(name="Break Count")
+    period_counts = period_counts.sort_values(period_col)
+    period_counts["Period Label"] = period_counts[period_col].apply(
+        lambda x: period_to_datetime(x).strftime("%Y-%m") if pd.notna(period_to_datetime(x)) else str(x))
+
+    total_breaks = len(df)
+    latest_period = periods_sorted[-1] if periods_sorted else None
+    prev_period = periods_sorted[-2] if len(periods_sorted) >= 2 else None
+
+    latest_count = int(period_counts[period_counts[period_col] == latest_period]["Break Count"].sum()) if latest_period else 0
+    prev_count = int(period_counts[period_counts[period_col] == prev_period]["Break Count"].sum()) if prev_period else 0
+    mom_pct = safe_mom_pct(latest_count, prev_count)
+    avg_per_period = round(total_breaks / len(periods_sorted), 0) if periods_sorted else 0
+    unique_recs = df[rec_col].nunique() if rec_col and rec_col in df.columns else "N/A"
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("Total Breaks", format_number(total_breaks))
+    with c2:
+        delta_str = f"{'+' if mom_pct and mom_pct > 0 else ''}{mom_pct}% MoM" if mom_pct is not None else "N/A"
+        kpi_card("MoM Change", f"{format_number(latest_count)}", delta_str, invert=True)
+    with c3:
+        kpi_card("Avg Breaks/Period", format_number(avg_per_period))
+    with c4:
+        kpi_card("Unique Recs with Breaks", str(unique_recs))
+
+    st.markdown("---")
+
+    # Chart 1: Total break count by Period (bar + line combo)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=period_counts["Period Label"], y=period_counts["Break Count"],
+                             name="Break Count", marker_color=COLORS[0], opacity=0.8))
+        fig.add_trace(go.Scatter(x=period_counts["Period Label"], y=period_counts["Break Count"],
+                                 name="Trend", line=dict(color=COLORS[4], width=2), mode="lines+markers"))
+        fig = chart_layout(fig, "Break Count Trend by Period", "Period", "Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 2: Break count by Team
+    with col_b:
+        if team_col and team_col in df.columns:
+            team_period = df.groupby([team_col, "_Period_label"]).size().reset_index(name="Count")
+            fig = px.bar(team_period, x="_Period_label", y="Count", color=team_col,
+                         color_discrete_sequence=COLORS, barmode="group")
+            fig = chart_layout(fig, "Break Count by Team Over Periods", "Period", "Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+    col_c, col_d = st.columns(2)
+
+    # Chart 3: Break count by Rec Name (top 10)
+    with col_c:
+        if rec_col and rec_col in df.columns:
+            top_recs = df[rec_col].value_counts().head(10).index.tolist()
+            rec_data = df[df[rec_col].isin(top_recs)]
+            rec_period = rec_data.groupby([rec_col, "_Period_label"]).size().reset_index(name="Count")
+            fig = px.line(rec_period, x="_Period_label", y="Count", color=rec_col,
+                          color_discrete_sequence=COLORS, markers=True)
+            fig = chart_layout(fig, "Break Count by Top 10 Rec Names Over Periods", "Period", "Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 4: Asset Class
+    with col_d:
+        if ac_col and ac_col in df.columns:
+            if latest_period:
+                latest_ac = df[df[period_col] == latest_period].groupby(ac_col).size().reset_index(name="Count")
+                fig = px.pie(latest_ac, values="Count", names=ac_col,
+                             color_discrete_sequence=COLORS, hole=0.4)
+                fig = chart_layout(fig, f"Break Count by Asset Class ({period_to_datetime(latest_period).strftime('%Y-%m')})", height=380)
+                st.plotly_chart(fig, use_container_width=True)
+
+    col_e, col_f = st.columns(2)
+
+    # Chart 5: True vs Systemic
+    with col_e:
+        if ts_col and ts_col in df.columns:
+            ts_period = df.groupby([ts_col, "_Period_label"]).size().reset_index(name="Count")
+            fig = px.bar(ts_period, x="_Period_label", y="Count", color=ts_col,
+                         color_discrete_sequence=[COLORS[0], COLORS[4]], barmode="group")
+            fig = chart_layout(fig, "True vs Systemic Breaks Over Time", "Period", "Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 6: Heatmap Team x Period
+    with col_f:
+        if team_col and team_col in df.columns:
+            heat = df.groupby([team_col, "_Period_label"]).size().reset_index(name="Count")
+            heat_pivot = heat.pivot_table(index=team_col, columns="_Period_label", values="Count", fill_value=0)
+            fig = px.imshow(heat_pivot, color_continuous_scale=["#FFFFFF", PRIMARY],
+                            aspect="auto", text_auto=True)
+            fig = chart_layout(fig, "Heatmap: Team x Period (Break Counts)", "", "", height=350)
+            st.plotly_chart(fig, use_container_width=True)
+
+    col_g, col_h = st.columns(2)
+
+    # Chart 7: Age Bucket distribution over time
+    with col_g:
+        if bucket_col and bucket_col in df.columns:
+            bucket_period = df.groupby([bucket_col, "_Period_label"]).size().reset_index(name="Count")
+            bucket_period[bucket_col] = pd.Categorical(bucket_period[bucket_col], categories=BUCKET_ORDER, ordered=True)
+            bucket_period = bucket_period.sort_values(bucket_col)
+            fig = px.bar(bucket_period, x="_Period_label", y="Count", color=bucket_col,
+                         color_discrete_sequence=COLORS, barmode="stack")
+            fig = chart_layout(fig, "Age Bucket Distribution Over Time", "Period", "Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 8: Top 10 Rec Names horizontal bar
+    with col_h:
+        if rec_col and rec_col in df.columns:
+            top10 = df[rec_col].value_counts().head(10).reset_index()
+            top10.columns = ["Rec Name", "Count"]
+            top10 = top10.sort_values("Count", ascending=True)
+            fig = px.bar(top10, x="Count", y="Rec Name", orientation="h",
+                         color_discrete_sequence=[COLORS[0]])
+            fig = chart_layout(fig, "Top 10 Rec Names by Break Count", "Count", "")
+            st.plotly_chart(fig, use_container_width=True)
+
+
+# ─────────────────────────── Tab 4: Break Amounts ───────────────────────────
+
+def tab_break_amounts(df, col_map):
+    """Render Trend Analysis - Break Amounts tab."""
+    st.markdown("## Trend Analysis: Break Amounts (GBP)")
+
+    period_col = col_map.get("Period")
+    team_col = col_map.get("Team")
+    rec_col = col_map.get("Rec Name (as per Rec Cube)")
+    ac_col = col_map.get("Asset Class")
+    gbp_col = col_map.get("BREAK AMOUNT GBP")
+    abs_col = col_map.get("ABS GBP")
+
+    amt_col = abs_col if (abs_col and abs_col in df.columns) else gbp_col
+    if not amt_col or amt_col not in df.columns:
+        st.warning("Break Amount GBP / ABS GBP column not found.")
+        return
+    if not period_col or period_col not in df.columns:
+        st.warning("Period column not found.")
+        return
+
+    periods_sorted = sorted(df[period_col].dropna().unique())
+
+    # Period-level aggregation
+    period_amt = df.groupby(period_col)[amt_col].sum().reset_index(name="Total Amount")
+    period_amt = period_amt.sort_values(period_col)
+    period_amt["Period Label"] = period_amt[period_col].apply(
+        lambda x: period_to_datetime(x).strftime("%Y-%m") if pd.notna(period_to_datetime(x)) else str(x))
+
+    total_amount = df[amt_col].sum()
+    latest_period = periods_sorted[-1] if periods_sorted else None
+    prev_period = periods_sorted[-2] if len(periods_sorted) >= 2 else None
+    latest_amt = float(period_amt[period_amt[period_col] == latest_period]["Total Amount"].sum()) if latest_period else 0
+    prev_amt = float(period_amt[period_amt[period_col] == prev_period]["Total Amount"].sum()) if prev_period else 0
+    mom_pct = safe_mom_pct(latest_amt, prev_amt)
+    avg_per_period = total_amount / len(periods_sorted) if periods_sorted else 0
+    max_single = df[amt_col].max()
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("Total Break Amount GBP", format_number(total_amount, "£", 0))
+    with c2:
+        delta_str = f"{'+' if mom_pct and mom_pct > 0 else ''}{mom_pct}% MoM" if mom_pct is not None else "N/A"
+        kpi_card("MoM Change", format_number(latest_amt, "£", 0), delta_str, invert=True)
+    with c3:
+        kpi_card("Avg Amount/Period", format_number(avg_per_period, "£", 0))
+    with c4:
+        kpi_card("Max Single Break", format_number(max_single, "£", 0))
+
+    st.markdown("---")
+
+    # Chart 1: Total break amount by Period (bar + line)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=period_amt["Period Label"], y=period_amt["Total Amount"],
+                             name="Amount", marker_color=COLORS[0], opacity=0.8))
+        fig.add_trace(go.Scatter(x=period_amt["Period Label"], y=period_amt["Total Amount"],
+                                 name="Trend", line=dict(color=COLORS[4], width=2), mode="lines+markers"))
+        fig = chart_layout(fig, "Break Amount (GBP) Trend by Period", "Period", "Amount (GBP)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 2: By Team
+    with col_b:
+        if team_col and team_col in df.columns:
+            team_amt = df.groupby([team_col, "_Period_label"])[amt_col].sum().reset_index(name="Amount")
+            fig = px.bar(team_amt, x="_Period_label", y="Amount", color=team_col,
+                         color_discrete_sequence=COLORS, barmode="group")
+            fig = chart_layout(fig, "Break Amount by Team Over Periods", "Period", "Amount (GBP)")
+            st.plotly_chart(fig, use_container_width=True)
+
+    col_c, col_d = st.columns(2)
+
+    # Chart 3: By Rec Name top 10
+    with col_c:
+        if rec_col and rec_col in df.columns:
+            rec_totals = df.groupby(rec_col)[amt_col].sum().abs()
+            top_recs = rec_totals.nlargest(10).index.tolist()
+            rec_data = df[df[rec_col].isin(top_recs)]
+            rec_amt = rec_data.groupby([rec_col, "_Period_label"])[amt_col].sum().reset_index(name="Amount")
+            fig = px.line(rec_amt, x="_Period_label", y="Amount", color=rec_col,
+                          color_discrete_sequence=COLORS, markers=True)
+            fig = chart_layout(fig, "Break Amount by Top 10 Rec Names Over Periods", "Period", "Amount (GBP)")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 4: By Asset Class
+    with col_d:
+        if ac_col and ac_col in df.columns:
+            ac_amt = df.groupby(ac_col)[amt_col].sum().abs().reset_index(name="Amount")
+            fig = px.bar(ac_amt.sort_values("Amount", ascending=True), x="Amount", y=ac_col,
+                         orientation="h", color_discrete_sequence=[COLORS[0]])
+            fig = chart_layout(fig, "Break Amount by Asset Class", "Amount (GBP)", "")
+            st.plotly_chart(fig, use_container_width=True)
+
+    col_e, col_f = st.columns(2)
+
+    # Chart 5: Amount distribution histogram
+    with col_e:
+        st.markdown("### Amount Distribution")
+        log_scale = st.checkbox("Use log scale", value=True, key="amt_log")
+        valid_amt = df[amt_col].dropna()
+        if len(valid_amt) > 0:
+            fig = px.histogram(valid_amt.to_frame(), x=amt_col, nbins=50,
+                               color_discrete_sequence=[COLORS[0]], log_y=log_scale)
+            fig = chart_layout(fig, "Break Amount Distribution (ABS GBP)", "Amount (GBP)", "Frequency")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 6: Heatmap Team x Period
+    with col_f:
+        if team_col and team_col in df.columns:
+            heat = df.groupby([team_col, "_Period_label"])[amt_col].sum().reset_index(name="Amount")
+            heat_pivot = heat.pivot_table(index=team_col, columns="_Period_label", values="Amount", fill_value=0)
+            fig = px.imshow(heat_pivot, color_continuous_scale=["#FFFFFF", PRIMARY],
+                            aspect="auto", text_auto=".0f")
+            fig = chart_layout(fig, "Heatmap: Team x Period (Break Amounts GBP)", "", "", height=350)
+            st.plotly_chart(fig, use_container_width=True)
+
+    col_g, col_h = st.columns(2)
+
+    # Chart 7: Scatter - Amount vs Count by Rec Name
+    with col_g:
+        if rec_col and rec_col in df.columns:
+            scatter_data = df.groupby(rec_col).agg(
+                Count=(amt_col, "size"),
+                Total_Amount=(amt_col, lambda x: x.abs().sum()),
+                Avg_Amount=(amt_col, lambda x: x.abs().mean()),
+            ).reset_index()
+            fig = px.scatter(scatter_data, x="Count", y="Total_Amount", size="Avg_Amount",
+                             hover_name=rec_col, color_discrete_sequence=[COLORS[0]],
+                             size_max=40)
+            fig = chart_layout(fig, "Amount vs Count by Rec Name (Bubble)", "Break Count", "Total Amount (GBP)")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Chart 8: Top 10 largest individual breaks
+    with col_h:
+        st.markdown("### Top 10 Largest Individual Breaks")
+        top_breaks = df.nlargest(10, amt_col)
+        show_cols_keys = ["Period", "Team", "Rec Name (as per Rec Cube)", "Entity", "TRADE REF"]
+        show_cols = [col_map[k] for k in show_cols_keys if k in col_map and col_map[k] in top_breaks.columns]
+        show_cols.append(amt_col)
+        render_aggrid(top_breaks[show_cols].reset_index(drop=True), height=350, key="top_breaks_grid")
+
+    # Download
+    st.markdown("---")
+    st.download_button(
+        "📥 Download Filtered Data (CSV)",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name="break_amounts_filtered.csv",
+        mime="text/csv",
+    )
+
+
+# ─────────────────────────── Tab 5: Drill-Down ───────────────────────────
+
+def tab_drill_down(df, col_map):
+    """Render Detailed Drill-Down tab."""
+    st.markdown("## Detailed Drill-Down Analysis")
+
+    period_col = col_map.get("Period")
+    team_col = col_map.get("Team")
+    rec_col = col_map.get("Rec Name (as per Rec Cube)")
+    entity_col = col_map.get("Entity")
+    product_col = col_map.get("Products Reconciled")
+    gbp_col = col_map.get("BREAK AMOUNT GBP")
+    abs_col = col_map.get("ABS GBP")
+
+    amt_col = abs_col if (abs_col and abs_col in df.columns) else gbp_col
+
+    # Hierarchical selection
+    col_sel1, col_sel2, col_sel3, col_sel4 = st.columns(4)
+
+    with col_sel1:
+        teams = ["All"] + sorted(df[team_col].dropna().unique().tolist()) if team_col and team_col in df.columns else ["All"]
+        sel_team = st.selectbox("Select Team", teams, key="dd_team")
+
+    filtered = df.copy()
+    if sel_team != "All" and team_col:
+        filtered = filtered[filtered[team_col] == sel_team]
+
+    with col_sel2:
+        recs = ["All"] + sorted(filtered[rec_col].dropna().unique().tolist()) if rec_col and rec_col in filtered.columns else ["All"]
+        sel_rec = st.selectbox("Select Rec Name", recs, key="dd_rec")
+
+    if sel_rec != "All" and rec_col:
+        filtered = filtered[filtered[rec_col] == sel_rec]
+
+    with col_sel3:
+        entities = ["All"] + sorted(filtered[entity_col].dropna().unique().tolist()) if entity_col and entity_col in filtered.columns else ["All"]
+        sel_entity = st.selectbox("Select Entity", entities, key="dd_entity")
+
+    if sel_entity != "All" and entity_col:
+        filtered = filtered[filtered[entity_col] == sel_entity]
+
+    with col_sel4:
+        products = ["All"] + sorted(filtered[product_col].dropna().unique().tolist()) if product_col and product_col in filtered.columns else ["All"]
+        sel_product = st.selectbox("Select Product", products, key="dd_product")
+
+    if sel_product != "All" and product_col:
+        filtered = filtered[filtered[product_col] == sel_product]
+
+    st.markdown("---")
+
+    if len(filtered) == 0:
+        st.info("No data matching the selected filters.")
+        return
+
+    # KPIs for drill-down level
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("Filtered Records", format_number(len(filtered)))
+    with c2:
+        if amt_col and amt_col in filtered.columns:
+            kpi_card("Total Amount GBP", format_number(filtered[amt_col].sum(), "£", 0))
+        else:
+            kpi_card("Total Amount GBP", "N/A")
+    with c3:
+        if period_col and period_col in filtered.columns:
+            kpi_card("Periods", str(filtered[period_col].nunique()))
+        else:
+            kpi_card("Periods", "N/A")
+    with c4:
+        if rec_col and rec_col in filtered.columns:
+            kpi_card("Unique Recs", str(filtered[rec_col].nunique()))
+        else:
+            kpi_card("Unique Recs", "N/A")
+
+    st.markdown("---")
+
+    # Trend charts
+    if period_col and period_col in filtered.columns and "_Period_label" in filtered.columns:
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            count_trend = filtered.groupby("_Period_label").size().reset_index(name="Break Count")
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=count_trend["_Period_label"], y=count_trend["Break Count"],
+                                 marker_color=COLORS[0], opacity=0.8, name="Count"))
+            fig.add_trace(go.Scatter(x=count_trend["_Period_label"], y=count_trend["Break Count"],
+                                     line=dict(color=COLORS[4], width=2), mode="lines+markers", name="Trend"))
+            fig = chart_layout(fig, "Break Count Trend (Filtered)", "Period", "Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col_right:
+            if amt_col and amt_col in filtered.columns:
+                amt_trend = filtered.groupby("_Period_label")[amt_col].sum().reset_index(name="Amount")
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=amt_trend["_Period_label"], y=amt_trend["Amount"],
+                                     marker_color=COLORS[0], opacity=0.8, name="Amount"))
+                fig.add_trace(go.Scatter(x=amt_trend["_Period_label"], y=amt_trend["Amount"],
+                                         line=dict(color=COLORS[4], width=2), mode="lines+markers", name="Trend"))
+                fig = chart_layout(fig, "Break Amount (GBP) Trend (Filtered)", "Period", "Amount (GBP)")
+                st.plotly_chart(fig, use_container_width=True)
+
+        # MoM comparison table
+        st.markdown("### Period-over-Period Comparison")
+        periods_sorted = sorted(filtered["_Period_label"].dropna().unique())
+        mom_data = []
+        for pl in periods_sorted:
+            p_df = filtered[filtered["_Period_label"] == pl]
+            count = len(p_df)
+            amount = p_df[amt_col].sum() if amt_col and amt_col in p_df.columns else 0
+            mom_data.append({"Period": pl, "Break Count": count, "Total Amount GBP": round(amount, 2)})
+
+        mom_df = pd.DataFrame(mom_data)
+        if len(mom_df) > 1:
+            mom_df["Count MoM %"] = mom_df["Break Count"].pct_change().mul(100).round(1)
+            mom_df["Amount MoM %"] = mom_df["Total Amount GBP"].pct_change().mul(100).round(1)
+        else:
+            mom_df["Count MoM %"] = np.nan
+            mom_df["Amount MoM %"] = np.nan
+        mom_df["Total Amount GBP"] = mom_df["Total Amount GBP"].apply(lambda x: f"£{x:,.0f}")
+        render_aggrid(mom_df, height=250, key="mom_grid")
+
+    # Full data table
+    st.markdown("### Full Data (Filtered)")
+    display_cols = [col_map[k] for k in [
+        "Period", "Team", "Rec Name (as per Rec Cube)", "Entity", "Products Reconciled",
+        "Type of break", "TRADE REF", "BREAK AMOUNT GBP", "ABS GBP", "Age Days", "Bucket",
+        "True/Systemic Breaks", "Comments"
+    ] if k in col_map and col_map[k] in filtered.columns]
+    if display_cols:
+        render_aggrid(filtered[display_cols].head(1000).reset_index(drop=True), height=400, key="dd_data_grid")
+
+    # Download
+    st.download_button(
+        "📥 Download Drill-Down Data (CSV)",
+        filtered.to_csv(index=False).encode("utf-8"),
+        file_name="drill_down_data.csv",
+        mime="text/csv",
+    )
+
+
+# ─────────────────────────── Main App ───────────────────────────
+
+def main():
+    # Sidebar - branding and upload
+    st.sidebar.markdown(f"""
+    <div style="text-align:center; padding: 10px 0 5px 0;">
+        <h2 style="color:{PRIMARY}; margin:0;">Accounting Control</h2>
+        <p style="color:{MUTED}; font-size:0.8rem; margin:0;">AI Platform &middot; Phase 1</p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.sidebar.markdown("---")
+
+    st.sidebar.markdown("### Data Upload")
+    uploaded_file = st.sidebar.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"], key="file_upload")
+
+    # Load sample data option
+    use_sample = st.sidebar.checkbox("Use sample data", value=uploaded_file is None, key="use_sample")
+
+    df = None
+    if uploaded_file is not None:
+        if uploaded_file.name.endswith(".xlsx"):
+            df = load_excel(uploaded_file)
+        else:
+            df = load_csv(uploaded_file)
+        st.sidebar.success(f"Loaded {len(df):,} rows, {len(df.columns)} cols")
+    elif use_sample:
+        import os
+        sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_breaks_data.csv")
+        if os.path.exists(sample_path):
+            df = pd.read_csv(sample_path, low_memory=False)
+            st.sidebar.info(f"Sample data: {len(df):,} rows")
+        else:
+            st.sidebar.warning("Sample data not found. Run generate_sample_data.py first.")
+
+    if df is None:
+        st.markdown(f"""
+        <div style="text-align:center; padding:100px 20px;">
+            <h1 style="color:{PRIMARY};">Accounting Control AI Platform</h1>
+            <p style="color:{MUTED}; font-size:1.1rem;">Upload a CSV/XLSX file or enable sample data to get started.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    # Column mapping
+    col_map = build_column_mapping(df.columns.tolist())
+
+    # Show column mapping in expander
+    with st.sidebar.expander("Column Mapping", expanded=False):
+        mapped_count = len(col_map)
+        st.write(f"Mapped {mapped_count}/{len(EXPECTED_COLUMNS)} expected columns")
+        for expected, actual in col_map.items():
+            if expected != actual:
+                st.caption(f"{expected} → {actual}")
+
+    # Clean data
+    df, type_violations_df = clean_dataframe(df, col_map)
+
+    # Apply global filters (for tabs 3, 4, 5)
+    filtered_df = apply_global_filters(df, col_map)
+
+    # Header
+    st.markdown(f"""
+    <h1 style="margin-bottom:0;">Accounting Control AI Platform <span style="color:{MUTED}; font-size:0.9rem;">Phase 1</span></h1>
+    """, unsafe_allow_html=True)
+
+    # Tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📋 Data Quality & Ingestion",
+        "⏳ Ageing Validation",
+        "📊 Trend: Break Counts",
+        "💰 Trend: Break Amounts",
+        "🔍 Detailed Drill-Down",
+    ])
+
+    with tab1:
+        tab_data_quality(df, col_map, type_violations_df)
+
+    with tab2:
+        tab_ageing_validation(df, col_map)
+
+    with tab3:
+        tab_break_counts(filtered_df, col_map)
+
+    with tab4:
+        tab_break_amounts(filtered_df, col_map)
+
+    with tab5:
+        tab_drill_down(filtered_df, col_map)
+
+
+if __name__ == "__main__":
+    main()
