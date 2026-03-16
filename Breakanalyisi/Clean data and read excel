@@ -1,0 +1,156 @@
+@st.cache_data(show_spinner="Cleaning & processing data...")
+def clean_data(file_bytes: bytes, filename: str):
+    """
+    Optimised Polars LazyFrame pipeline — single .collect() at the end.
+    Violation counting done AFTER collect on the already-materialised DataFrame.
+    """
+    raw = load_file(file_bytes, filename)
+    col_map = build_col_map(raw.columns)
+
+    # ── Build the FULL expression graph first, collect ONCE ──
+    lf = raw.lazy()
+
+    # Amount columns
+    amount_exprs = []
+    for key in ["BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "ABS GBP"]:
+        if key not in col_map: continue
+        col = col_map[key]
+        amount_exprs.append(
+            pl.col(col).cast(pl.Utf8)
+              .str.strip_chars()
+              .str.replace_all(r"[£$€¥,]", "")
+              .str.replace(r"(?i)^(GBP|USD|EUR|JPY|CHF|AUD|CAD)\s*", "")
+              .str.strip_chars()
+              .cast(pl.Float64, strict=False)
+              .alias(col)
+        )
+    if amount_exprs:
+        lf = lf.with_columns(amount_exprs)  # All 3 in ONE pass
+
+    # Age Days
+    if "Age Days" in col_map:
+        col = col_map["Age Days"]
+        lf = lf.with_columns(
+            pl.col(col).cast(pl.Utf8).str.strip_chars()
+              .str.extract(r"^[~]?(-?\d+)", 1)
+              .cast(pl.Float64, strict=False)
+              .alias(col)
+        )
+
+    # Date
+    if "Date" in col_map:
+        col = col_map["Date"]
+        lf = lf.with_columns(
+            pl.col(col).cast(pl.Utf8)
+              .str.to_date(format=None, strict=False)
+              .alias(col)
+        )
+
+    # Period → last day of month (arithmetic, no string round-trip)
+    if "Period" in col_map:
+        col = col_map["Period"]
+        lf = lf.with_columns(
+            pl.col(col).cast(pl.Int64, strict=False).alias(col)
+        ).with_columns([
+            (pl.col(col) // 100).cast(pl.Int32).alias("_yr"),
+            (pl.col(col) % 100).cast(pl.Int32).alias("_mo"),
+        ]).with_columns(
+            # Use date_ranges trick: first day of next month minus 1 day
+            pl.when(pl.col("_mo") == 12)
+              .then(pl.date(pl.col("_yr") + 1, 1, 1))
+              .otherwise(pl.date(pl.col("_yr"), pl.col("_mo") + 1, 1))
+              .dt.offset_by("-1d")
+              .alias("_Period_date")
+        ).with_columns(
+            pl.col("_Period_date").dt.strftime("%Y-%m").alias("_Period_label")
+        ).drop(["_yr", "_mo"])
+
+    # Ageing computed columns
+    if "Date" in col_map:
+        date_col = col_map["Date"]
+        lf = lf.with_columns(
+            (pl.col("_Period_date").dt.epoch(time_unit="d") -
+             pl.col(date_col).dt.epoch(time_unit="d"))
+            .alias("_Computed_Age_Days")
+        ).with_columns(
+            pl.when(pl.col("_Computed_Age_Days").is_null()).then(pl.lit("Unknown"))
+            .when(pl.col("_Computed_Age_Days") <= 15).then(pl.lit("0-15"))
+            .when(pl.col("_Computed_Age_Days") <= 30).then(pl.lit("16-30"))
+            .when(pl.col("_Computed_Age_Days") <= 60).then(pl.lit("31-60"))
+            .when(pl.col("_Computed_Age_Days") <= 90).then(pl.lit("61-90"))
+            .when(pl.col("_Computed_Age_Days") <= 180).then(pl.lit("91-180"))
+            .when(pl.col("_Computed_Age_Days") <= 365).then(pl.lit("181-365"))
+            .otherwise(pl.lit("365+"))
+            .alias("_Computed_Bucket")
+        )
+
+    # Match flags
+    if "Age Days" in col_map:
+        age_col = col_map["Age Days"]
+        lf = lf.with_columns(
+            ((pl.col(age_col) - pl.col("_Computed_Age_Days")).abs() <= 1)
+            .alias("_Age_Match")
+        )
+    if "Bucket" in col_map:
+        bucket_col = col_map["Bucket"]
+        lf = lf.with_columns(
+            (pl.col(bucket_col).cast(pl.Utf8).str.strip_chars() ==
+             pl.col("_Computed_Bucket"))
+            .alias("_Bucket_Match")
+        )
+
+    # ── SINGLE COLLECT — entire expression graph executes here ──
+    df = lf.collect(streaming=True)   # streaming=True for 600K+ rows
+
+    # ── Violation counting AFTER collect (cheap, already materialised) ──
+    type_violations = []
+    for key in ["BREAK AMOUNT CCY", "BREAK AMOUNT GBP", "ABS GBP"]:
+        if key not in col_map: continue
+        col = col_map[key]
+        original_nulls = raw[col].null_count()
+        new_nulls      = df[col].null_count()
+        gained = new_nulls - original_nulls
+        if gained > 0:
+            sample = raw[col].cast(pl.Utf8).drop_nulls().head(3).to_list()
+            type_violations.append({
+                "Column": col, "Expected Type": "Float64",
+                "Violation Count": gained,
+                "Sample Values": ", ".join(str(s) for s in sample)
+            })
+
+    if "Age Days" in col_map:
+        col = col_map["Age Days"]
+        original_nulls = raw[col].null_count()
+        new_nulls      = df[col].null_count()
+        gained = new_nulls - original_nulls
+        if gained > 0:
+            sample = raw[col].cast(pl.Utf8).drop_nulls().head(3).to_list()
+            type_violations.append({
+                "Column": col, "Expected Type": "Float64",
+                "Violation Count": gained,
+                "Sample Values": ", ".join(str(s) for s in sample)
+            })
+
+    # Filter options
+    filter_options = {}
+    for key in ["Period","Team","Rec Name (as per Rec Cube)","Entity",
+                "Asset Class","Type of break","True/Systemic Breaks"]:
+        if key in col_map and col_map[key] in df.columns:
+            filter_options[key] = df[col_map[key]].drop_nulls().unique().sort().to_list()
+
+    type_violations_df = pd.DataFrame(type_violations) if type_violations else \
+        pd.DataFrame(columns=["Column","Expected Type","Violation Count","Sample Values"])
+
+    return df, col_map, filter_options, type_violations_df
+
+
+@st.cache_data(show_spinner="Loading file...")
+def load_file(file_bytes: bytes, filename: str) -> pl.DataFrame:
+    buf = BytesIO(file_bytes)
+    if filename.lower().endswith(".csv"):
+        return pl.read_csv(buf, infer_schema_length=10000, ignore_errors=True)
+    # fastexcel is Rust-based — install with: pip install fastexcel
+    try:
+        return pl.read_excel(buf, engine="calamine")   # calamine = fastexcel
+    except Exception:
+        return pl.read_excel(buf, engine="openpyxl")   # fallback
