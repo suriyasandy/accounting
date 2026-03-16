@@ -1,0 +1,101 @@
+"""Shared UI helpers: KPI cards, chart layout, formatters."""
+
+import streamlit as st
+import plotly.graph_objects as go
+from config import COLORS, PRIMARY, DARK, MUTED, BG_LIGHT
+
+# ── Formatters ──────────────────────────────────────────────────────────────
+
+def format_short(n, prefix="£") -> str:
+    """£1.2M, £45.3K, etc."""
+    if n is None:
+        return "N/A"
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return "N/A"
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1_000_000_000: return f"{sign}{prefix}{v/1_000_000_000:.1f}B"
+    if v >= 1_000_000:     return f"{sign}{prefix}{v/1_000_000:.1f}M"
+    if v >= 1_000:         return f"{sign}{prefix}{v/1_000:.1f}K"
+    return f"{sign}{prefix}{v:,.0f}"
+
+
+def format_number(n, decimal=0) -> str:
+    if n is None:
+        return "N/A"
+    try:
+        if decimal > 0:
+            return f"{float(n):,.{decimal}f}"
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def safe_mom_pct(current, previous):
+    if previous is None or previous == 0:
+        return None
+    return round(((current - previous) / abs(previous)) * 100, 1)
+
+
+# ── KPI Card ─────────────────────────────────────────────────────────────────
+
+def kpi_card(label: str, value, delta: str = None, invert: bool = False):
+    delta_html = ""
+    if delta:
+        if invert:
+            css = "kpi-delta-pos" if delta.startswith("-") else "kpi-delta-neg"
+        else:
+            css = "kpi-delta-neg" if delta.startswith("-") else "kpi-delta-pos"
+        delta_html = f'<p class="{css}">{delta}</p>'
+    st.markdown(f"""
+    <div class="kpi-card">
+        <p class="kpi-label">{label}</p>
+        <p class="kpi-value">{value}</p>
+        {delta_html}
+    </div>""", unsafe_allow_html=True)
+
+
+# ── Chart Layout ─────────────────────────────────────────────────────────────
+
+def chart_layout(fig, title="", xaxis_title="", yaxis_title="", height=400):
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14, color=DARK)),
+        xaxis_title=xaxis_title, yaxis_title=yaxis_title,
+        height=height,
+        margin=dict(l=40, r=20, t=50, b=40),
+        font=dict(family="Inter, sans-serif", size=11, color=DARK),
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(font=dict(size=10)),
+    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#ECECEC")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#ECECEC")
+    return fig
+
+
+# ── Global CSS ───────────────────────────────────────────────────────────────
+
+def inject_css():
+    st.markdown(f"""
+    <style>
+        .main .block-container {{padding-top:1rem; padding-bottom:1rem;}}
+        h1 {{color:{DARK}; font-size:1.6rem !important;}}
+        h2 {{color:{DARK}; font-size:1.25rem !important;}}
+        h3 {{color:{DARK}; font-size:1.05rem !important;}}
+        .stTabs [data-baseweb="tab-list"] {{gap:8px;}}
+        .stTabs [data-baseweb="tab"] {{
+            background-color:{BG_LIGHT}; border-radius:6px 6px 0 0;
+            padding:8px 16px; font-weight:600; color:{DARK};}}
+        .stTabs [aria-selected="true"] {{
+            background-color:{PRIMARY} !important; color:white !important;}}
+        .kpi-card {{
+            background:white; border-left:4px solid {PRIMARY};
+            padding:12px 16px; border-radius:4px;
+            box-shadow:0 1px 3px rgba(0,0,0,0.08);}}
+        .kpi-label {{color:{MUTED}; font-size:0.75rem; text-transform:uppercase;
+            letter-spacing:0.5px; margin-bottom:2px;}}
+        .kpi-value {{color:{DARK}; font-size:1.4rem; font-weight:700; margin:0;}}
+        .kpi-delta-pos {{color:#A84B2F; font-size:0.8rem;}}
+        .kpi-delta-neg {{color:#01696F; font-size:0.8rem;}}
+    </style>""", unsafe_allow_html=True)
