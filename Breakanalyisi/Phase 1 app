@@ -240,8 +240,10 @@ def load_excel(uploaded_file):
     return pd.read_excel(uploaded_file, engine="openpyxl")
 
 
-def clean_dataframe(df, col_map):
+@st.cache_data(show_spinner="Cleaning data...")
+def clean_dataframe(df, col_map_tuple):
     """Apply type coercion and cleaning based on column mapping."""
+    col_map = dict(col_map_tuple)
     df = df.copy()
     type_violations = []
 
@@ -285,7 +287,16 @@ def clean_dataframe(df, col_map):
         df["_Period_date"] = df[actual_col].apply(period_to_datetime)
         df["_Period_label"] = df["_Period_date"].dt.strftime("%Y-%m").fillna(df[actual_col].astype(str))
 
-    return df, pd.DataFrame(type_violations) if type_violations else pd.DataFrame(columns=["Column", "Expected Type", "Violation Count", "Sample Values"])
+    # Pre-compute unique values for each filterable column to speed up filter rendering
+    filter_options = {}
+    period_col = col_map.get("Period")
+    if period_col and period_col in df.columns:
+        filter_options["Period"] = sorted(df[period_col].dropna().unique().tolist())
+    for fkey in ["Team", "Rec Name (as per Rec Cube)", "Entity", "Asset Class", "Type of break", "True/Systemic Breaks"]:
+        if fkey in col_map and col_map[fkey] in df.columns:
+            filter_options[fkey] = sorted(df[col_map[fkey]].dropna().unique().tolist())
+
+    return df, pd.DataFrame(type_violations) if type_violations else pd.DataFrame(columns=["Column", "Expected Type", "Violation Count", "Sample Values"]), filter_options
 
 
 def detect_outliers_iqr(series, name="Column"):
@@ -312,71 +323,58 @@ def detect_outliers_iqr(series, name="Column"):
     })
 
 
-def apply_global_filters(df, col_map):
-    """Apply sidebar global filters and return filtered df."""
-    filtered = df.copy()
-
+def apply_global_filters(df, col_map, filter_options):
+    """Apply sidebar global filters and return filtered df using pre-computed options."""
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"### 🔍 Global Filters")
 
+    # Build all filter selections first (using pre-computed options), then apply at once
+    selections = {}
+
     # Period range
-    if "Period" in col_map and col_map["Period"] in filtered.columns:
-        periods_sorted = sorted(filtered[col_map["Period"]].dropna().unique())
+    if "Period" in filter_options:
+        periods_sorted = filter_options["Period"]
         if len(periods_sorted) >= 2:
             period_labels = {p: period_to_datetime(p).strftime("%Y-%m") if pd.notna(period_to_datetime(p)) else str(p) for p in periods_sorted}
-            selected_periods = st.sidebar.multiselect(
+            selections["Period"] = st.sidebar.multiselect(
                 "Period",
                 options=periods_sorted,
                 default=periods_sorted,
                 format_func=lambda x: period_labels.get(x, str(x)),
                 key="filter_period",
             )
-            if selected_periods:
-                filtered = filtered[filtered[col_map["Period"]].isin(selected_periods)]
 
     # Team
-    if "Team" in col_map and col_map["Team"] in filtered.columns:
-        teams = sorted(filtered[col_map["Team"]].dropna().unique())
-        sel_teams = st.sidebar.multiselect("Team", teams, default=teams, key="filter_team")
-        if sel_teams:
-            filtered = filtered[filtered[col_map["Team"]].isin(sel_teams)]
+    if "Team" in filter_options:
+        selections["Team"] = st.sidebar.multiselect("Team", filter_options["Team"], default=filter_options["Team"], key="filter_team")
 
     # Rec Name
-    if "Rec Name (as per Rec Cube)" in col_map and col_map["Rec Name (as per Rec Cube)"] in filtered.columns:
-        recs = sorted(filtered[col_map["Rec Name (as per Rec Cube)"]].dropna().unique())
-        sel_recs = st.sidebar.multiselect("Rec Name", recs, default=recs, key="filter_rec")
-        if sel_recs:
-            filtered = filtered[filtered[col_map["Rec Name (as per Rec Cube)"]].isin(sel_recs)]
+    if "Rec Name (as per Rec Cube)" in filter_options:
+        selections["Rec Name (as per Rec Cube)"] = st.sidebar.multiselect("Rec Name", filter_options["Rec Name (as per Rec Cube)"], default=filter_options["Rec Name (as per Rec Cube)"], key="filter_rec")
 
     # Entity
-    if "Entity" in col_map and col_map["Entity"] in filtered.columns:
-        entities = sorted(filtered[col_map["Entity"]].dropna().unique())
-        sel_ent = st.sidebar.multiselect("Entity", entities, default=entities, key="filter_entity")
-        if sel_ent:
-            filtered = filtered[filtered[col_map["Entity"]].isin(sel_ent)]
+    if "Entity" in filter_options:
+        selections["Entity"] = st.sidebar.multiselect("Entity", filter_options["Entity"], default=filter_options["Entity"], key="filter_entity")
 
     # Asset Class
-    if "Asset Class" in col_map and col_map["Asset Class"] in filtered.columns:
-        ac = sorted(filtered[col_map["Asset Class"]].dropna().unique())
-        sel_ac = st.sidebar.multiselect("Asset Class", ac, default=ac, key="filter_ac")
-        if sel_ac:
-            filtered = filtered[filtered[col_map["Asset Class"]].isin(sel_ac)]
+    if "Asset Class" in filter_options:
+        selections["Asset Class"] = st.sidebar.multiselect("Asset Class", filter_options["Asset Class"], default=filter_options["Asset Class"], key="filter_ac")
 
     # Type of break
-    if "Type of break" in col_map and col_map["Type of break"] in filtered.columns:
-        tob = sorted(filtered[col_map["Type of break"]].dropna().unique())
-        sel_tob = st.sidebar.multiselect("Type of Break", tob, default=tob, key="filter_tob")
-        if sel_tob:
-            filtered = filtered[filtered[col_map["Type of break"]].isin(sel_tob)]
+    if "Type of break" in filter_options:
+        selections["Type of break"] = st.sidebar.multiselect("Type of Break", filter_options["Type of break"], default=filter_options["Type of break"], key="filter_tob")
 
     # True/Systemic
-    if "True/Systemic Breaks" in col_map and col_map["True/Systemic Breaks"] in filtered.columns:
-        ts = sorted(filtered[col_map["True/Systemic Breaks"]].dropna().unique())
-        sel_ts = st.sidebar.multiselect("True/Systemic", ts, default=ts, key="filter_ts")
-        if sel_ts:
-            filtered = filtered[filtered[col_map["True/Systemic Breaks"]].isin(sel_ts)]
+    if "True/Systemic Breaks" in filter_options:
+        selections["True/Systemic Breaks"] = st.sidebar.multiselect("True/Systemic", filter_options["True/Systemic Breaks"], default=filter_options["True/Systemic Breaks"], key="filter_ts")
 
-    return filtered
+    # Apply all filters in one pass using boolean indexing
+    mask = pd.Series(True, index=df.index)
+    for col_key, selected_vals in selections.items():
+        if selected_vals and col_key in col_map and col_map[col_key] in df.columns:
+            mask &= df[col_map[col_key]].isin(selected_vals)
+
+    return df.loc[mask]
 
 
 def chart_layout(fig, title="", xaxis_title="", yaxis_title="", height=400):
@@ -648,6 +646,138 @@ def tab_ageing_validation(df, col_map):
         fig = px.bar(rec_disc, x="Disc %", y=rec_col, orientation="h", color_discrete_sequence=[COLORS[0]])
         fig = chart_layout(fig, "Bucket Discrepancy Rate by Rec Name (%)", "Discrepancy %", "", height=max(300, len(rec_disc) * 25))
         st.plotly_chart(fig, use_container_width=True)
+
+    # ──── Trend Analysis Section ────
+    st.markdown("---")
+    st.markdown("## Trend Analysis: Break Ageing")
+
+    if "_Period_label" in vdf.columns and period_col and period_col in vdf.columns:
+        # Prepare period-level ageing aggregation
+        trend_df = vdf[vdf["_Computed_Age_Days"].notna()].copy()
+        trend_df["_Period_label"] = trend_df["_Period_date"].dt.strftime("%Y-%m").fillna(trend_df[period_col].astype(str))
+        period_order = sorted(trend_df["_Period_label"].unique())
+
+        col_t1, col_t2 = st.columns(2)
+
+        # Chart T1: Average Age Days Trend by Period
+        with col_t1:
+            age_trend = trend_df.groupby("_Period_label")["_Computed_Age_Days"].agg(
+                ["mean", "median", "count"]
+            ).reindex(period_order).reset_index()
+            age_trend.columns = ["Period", "Mean Age Days", "Median Age Days", "Break Count"]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=age_trend["Period"], y=age_trend["Mean Age Days"],
+                name="Mean Age Days", marker_color=COLORS[0], opacity=0.8,
+            ))
+            fig.add_trace(go.Scatter(
+                x=age_trend["Period"], y=age_trend["Median Age Days"],
+                name="Median Age Days", line=dict(color=COLORS[4], width=2.5),
+                mode="lines+markers",
+            ))
+            fig = chart_layout(fig, "Average Age Days Trend by Period", "Period", "Days")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Chart T2: Bucket Distribution Over Time (stacked bar)
+        with col_t2:
+            bucket_period = trend_df.groupby(["_Period_label", "_Computed_Bucket"]).size().reset_index(name="Count")
+            bucket_period["_Computed_Bucket"] = pd.Categorical(
+                bucket_period["_Computed_Bucket"], categories=BUCKET_ORDER, ordered=True
+            )
+            bucket_period = bucket_period.sort_values("_Computed_Bucket")
+            fig = px.bar(
+                bucket_period, x="_Period_label", y="Count",
+                color="_Computed_Bucket", color_discrete_sequence=COLORS,
+                barmode="stack", category_orders={"_Period_label": period_order, "_Computed_Bucket": BUCKET_ORDER},
+            )
+            fig.update_layout(legend_title_text="Bucket")
+            fig = chart_layout(fig, "Ageing Bucket Distribution Over Time", "Period", "Break Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+        col_t3, col_t4 = st.columns(2)
+
+        # Chart T3: 90th Percentile Age Days Trend (high-risk ageing)
+        with col_t3:
+            pct_trend = trend_df.groupby("_Period_label")["_Computed_Age_Days"].quantile(0.9).reindex(period_order).reset_index()
+            pct_trend.columns = ["Period", "P90 Age Days"]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=pct_trend["Period"], y=pct_trend["P90 Age Days"],
+                mode="lines+markers+text", text=pct_trend["P90 Age Days"].round(0).astype(int).astype(str),
+                textposition="top center", line=dict(color=COLORS[4], width=2.5),
+                marker=dict(size=8, color=COLORS[4]),
+                name="P90 Age Days",
+            ))
+            fig = chart_layout(fig, "90th Percentile Age Days Trend", "Period", "Days")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Chart T4: Ageing Heatmap by Team x Period
+        with col_t4:
+            if team_col and team_col in trend_df.columns:
+                heat_age = trend_df.groupby([team_col, "_Period_label"])["_Computed_Age_Days"].mean().reset_index(name="Avg Age Days")
+                heat_pivot = heat_age.pivot_table(index=team_col, columns="_Period_label", values="Avg Age Days", fill_value=0)
+                # Reorder columns
+                heat_pivot = heat_pivot.reindex(columns=sorted(heat_pivot.columns))
+                fig = px.imshow(
+                    heat_pivot.round(0), color_continuous_scale=["#E8F5E9", "#FFC553", "#A84B2F"],
+                    aspect="auto", text_auto=".0f",
+                )
+                fig = chart_layout(fig, "Heatmap: Avg Age Days by Team x Period", "", "", height=350)
+                fig.update_layout(coloraxis_colorbar_title="Days")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Team column not available for heatmap.")
+
+        # Chart T5: Proportion of breaks in 365+ bucket over time (risk indicator)
+        col_t5, col_t6 = st.columns(2)
+        with col_t5:
+            high_age_by_period = []
+            for p in period_order:
+                p_data = trend_df[trend_df["_Period_label"] == p]
+                total = len(p_data)
+                over_365 = int((p_data["_Computed_Age_Days"] > 365).sum())
+                over_90 = int((p_data["_Computed_Age_Days"] > 90).sum())
+                high_age_by_period.append({
+                    "Period": p,
+                    "> 365 Days %": round(over_365 / total * 100, 1) if total > 0 else 0,
+                    "> 90 Days %": round(over_90 / total * 100, 1) if total > 0 else 0,
+                })
+            high_df = pd.DataFrame(high_age_by_period)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=high_df["Period"], y=high_df["> 90 Days %"],
+                name="> 90 Days", mode="lines+markers",
+                line=dict(color=COLORS[4], width=2), fill="tozeroy",
+                fillcolor="rgba(168, 75, 47, 0.15)",
+            ))
+            fig.add_trace(go.Scatter(
+                x=high_df["Period"], y=high_df["> 365 Days %"],
+                name="> 365 Days", mode="lines+markers",
+                line=dict(color=COLORS[7], width=2), fill="tozeroy",
+                fillcolor="rgba(148, 68, 84, 0.15)",
+            ))
+            fig = chart_layout(fig, "High-Risk Ageing Proportion Over Time", "Period", "% of Breaks")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Chart T6: MoM Change in Break Count by Bucket
+        with col_t6:
+            bucket_period_count = trend_df.groupby(["_Period_label", "_Computed_Bucket"]).size().unstack(fill_value=0)
+            bucket_period_count = bucket_period_count.reindex(columns=BUCKET_ORDER, fill_value=0).reindex(period_order)
+            mom_change = bucket_period_count.pct_change().mul(100).round(1)
+            if len(mom_change.dropna()) > 0:
+                fig = go.Figure()
+                for i, bucket in enumerate(BUCKET_ORDER[:6]):  # Skip "Unknown"
+                    if bucket in mom_change.columns:
+                        fig.add_trace(go.Scatter(
+                            x=mom_change.index, y=mom_change[bucket],
+                            name=bucket, mode="lines+markers",
+                            line=dict(color=COLORS[i % len(COLORS)], width=1.5),
+                        ))
+                fig = chart_layout(fig, "MoM % Change in Break Count by Bucket", "Period", "MoM Change %")
+                fig.add_hline(y=0, line_dash="dash", line_color=MUTED, line_width=1)
+                st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Period column not available for trend analysis.")
 
     # Download
     if len(disc_df) > 0:
@@ -1142,11 +1272,12 @@ def main():
             if expected != actual:
                 st.caption(f"{expected} → {actual}")
 
-    # Clean data
-    df, type_violations_df = clean_dataframe(df, col_map)
+    # Clean data (cached — col_map passed as tuple for hashability)
+    col_map_tuple = tuple(sorted(col_map.items()))
+    df, type_violations_df, filter_options = clean_dataframe(df, col_map_tuple)
 
-    # Apply global filters (for tabs 3, 4, 5)
-    filtered_df = apply_global_filters(df, col_map)
+    # Apply global filters (for tabs 3, 4, 5) using pre-computed options
+    filtered_df = apply_global_filters(df, col_map, filter_options)
 
     # Header
     st.markdown(f"""
