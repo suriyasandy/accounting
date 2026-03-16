@@ -102,6 +102,22 @@ def format_number(n, prefix="", decimal=0):
     return f"{prefix}{int(n):,}"
 
 
+def format_short(n, prefix="£"):
+    """Format number in human-readable short form: £1.2M, £45.3K, etc."""
+    if pd.isna(n):
+        return "N/A"
+    v = float(n)
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1_000_000_000:
+        return f"{sign}{prefix}{v / 1_000_000_000:.1f}B"
+    if v >= 1_000_000:
+        return f"{sign}{prefix}{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{sign}{prefix}{v / 1_000:.1f}K"
+    return f"{sign}{prefix}{v:,.0f}"
+
+
 # ───── VECTORISED: period_to_datetime ─────
 def period_to_datetime_scalar(period_val):
     """Convert int period like 202501 to datetime (last day of month). Scalar version for fallback."""
@@ -988,14 +1004,14 @@ def tab_break_amounts(df, col_map):
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        kpi_card("Total Break Amount GBP", format_number(total_amount, "£", 0))
+        kpi_card("Total Break Amount GBP", format_short(total_amount))
     with c2:
         delta_str = f"{'+'if mom_pct and mom_pct > 0 else ''}{mom_pct}% MoM" if mom_pct is not None else "N/A"
-        kpi_card("MoM Change", format_number(latest_amt, "£", 0), delta_str, invert=True)
+        kpi_card("MoM Change", format_short(latest_amt), delta_str, invert=True)
     with c3:
-        kpi_card("Avg Amount/Period", format_number(avg_per_period, "£", 0))
+        kpi_card("Avg Amount/Period", format_short(avg_per_period))
     with c4:
-        kpi_card("Max Single Break", format_number(max_single, "£", 0))
+        kpi_card("Max Single Break", format_short(max_single))
 
     st.markdown("---")
 
@@ -1234,7 +1250,7 @@ def tab_drill_down(df, col_map):
 # ─────────────────────────── Tab 6: Threshold Alerts ───────────────────────────
 
 def tab_threshold_alerts(df, col_map):
-    """Render Threshold Alerts tab with Median + MAD based alerting."""
+    """Render Threshold Alerts tab with Median + MAD based alerting on count, amount, or both."""
     st.markdown("## Threshold Alerts")
 
     period_col = col_map.get("Period")
@@ -1246,6 +1262,7 @@ def tab_threshold_alerts(df, col_map):
     abs_col = col_map.get("ABS GBP")
 
     amt_col = abs_col if (abs_col and abs_col in df.columns) else gbp_col
+    has_amounts = amt_col and amt_col in df.columns
     if not period_col or period_col not in df.columns:
         st.warning("Period column not found.")
         return
@@ -1264,11 +1281,16 @@ def tab_threshold_alerts(df, col_map):
         st.warning("No dimension columns available for segmentation.")
         return
 
-    seg_choice = st.selectbox(
-        "Primary segment dimension",
-        list(available_segments.keys()),
-        key="thresh_seg",
-    )
+    col_s1, col_s2 = st.columns([1, 1])
+    with col_s1:
+        seg_choice = st.selectbox(
+            "Primary segment dimension",
+            list(available_segments.keys()),
+            key="thresh_seg",
+        )
+    with col_s2:
+        metric_options = ["Break Count", "Break Amount", "Both"] if has_amounts else ["Break Count"]
+        threshold_metric = st.radio("Threshold metric", metric_options, horizontal=True, key="thresh_metric")
     seg_col = available_segments[seg_choice]
 
     # MAD multiplier
@@ -1284,7 +1306,7 @@ def tab_threshold_alerts(df, col_map):
     # Break count per segment per period
     seg_period_count = df.groupby([seg_col, period_col]).size().reset_index(name="Break Count")
     # Break amount per segment per period
-    if amt_col and amt_col in df.columns:
+    if has_amounts:
         seg_period_amt = df.groupby([seg_col, period_col])[amt_col].sum().abs().reset_index(name="Break Amount")
         seg_period = seg_period_count.merge(seg_period_amt, on=[seg_col, period_col], how="left")
     else:
@@ -1299,17 +1321,16 @@ def tab_threshold_alerts(df, col_map):
         n_periods = len(seg_data)
 
         if n_periods < 2:
-            # Insufficient data
             latest = seg_data.iloc[-1] if n_periods == 1 else None
             alert_rows.append({
                 "Segment": seg_val,
                 "Latest Count": int(latest["Break Count"]) if latest is not None else 0,
-                "Median Count": np.nan,
-                "MAD Count": np.nan,
-                "Upper Threshold": np.nan,
+                "Median Count": np.nan, "MAD Count": np.nan, "Upper Count Threshold": np.nan,
+                "Count Classification": "Insufficient Data", "Count Deviation %": np.nan,
                 "Latest Amount": float(latest["Break Amount"]) if latest is not None else 0,
-                "Classification": "Insufficient Data",
-                "Deviation %": np.nan,
+                "Median Amount": np.nan, "MAD Amount": np.nan, "Upper Amount Threshold": np.nan,
+                "Amount Classification": "Insufficient Data", "Amount Deviation %": np.nan,
+                "Classification": "Insufficient Data", "Deviation %": np.nan,
                 "Periods": n_periods,
             })
             continue
@@ -1317,38 +1338,61 @@ def tab_threshold_alerts(df, col_map):
         counts = seg_data["Break Count"].values
         amounts = seg_data["Break Amount"].values
 
+        # --- Count thresholds ---
         median_c = float(np.median(counts))
         mad_c = float(np.median(np.abs(counts - median_c)))
-
-        # MAD=0 fallback: use 10% of median
         if mad_c == 0:
             mad_c = max(median_c * 0.1, 1.0)
-
-        upper_material = median_c + mad_k * mad_c
-        upper_watchlist = median_c + watchlist_k * mad_c
-
+        upper_mat_c = median_c + mad_k * mad_c
+        upper_watch_c = median_c + watchlist_k * mad_c
         latest_count = int(counts[-1])
-        latest_amount = float(amounts[-1])
-
-        # Classification
-        if latest_count > upper_material:
-            classification = "Material"
-        elif latest_count > upper_watchlist:
-            classification = "Watchlist"
+        if latest_count > upper_mat_c:
+            count_cls = "Material"
+        elif latest_count > upper_watch_c:
+            count_cls = "Watchlist"
         else:
-            classification = "Normal"
+            count_cls = "Normal"
+        count_dev = round((latest_count - median_c) / mad_c * 100, 1) if mad_c > 0 else 0.0
 
-        deviation_pct = round((latest_count - median_c) / mad_c * 100, 1) if mad_c > 0 else 0.0
+        # --- Amount thresholds ---
+        median_a = float(np.median(amounts))
+        mad_a = float(np.median(np.abs(amounts - median_a)))
+        if mad_a == 0:
+            mad_a = max(median_a * 0.1, 1.0)
+        upper_mat_a = median_a + mad_k * mad_a
+        upper_watch_a = median_a + watchlist_k * mad_a
+        latest_amount = float(amounts[-1])
+        if latest_amount > upper_mat_a:
+            amt_cls = "Material"
+        elif latest_amount > upper_watch_a:
+            amt_cls = "Watchlist"
+        else:
+            amt_cls = "Normal"
+        amt_dev = round((latest_amount - median_a) / mad_a * 100, 1) if mad_a > 0 else 0.0
+
+        # --- Combined classification (worst of count vs amount) ---
+        cls_rank = {"Material": 2, "Watchlist": 1, "Normal": 0}
+        if threshold_metric == "Break Count":
+            classification = count_cls
+            deviation = count_dev
+        elif threshold_metric == "Break Amount":
+            classification = amt_cls
+            deviation = amt_dev
+        else:  # Both
+            classification = count_cls if cls_rank.get(count_cls, 0) >= cls_rank.get(amt_cls, 0) else amt_cls
+            deviation = max(count_dev, amt_dev)
 
         alert_rows.append({
             "Segment": seg_val,
             "Latest Count": latest_count,
-            "Median Count": round(median_c, 1),
-            "MAD Count": round(mad_c, 2),
-            "Upper Threshold": round(upper_material, 1),
+            "Median Count": round(median_c, 1), "MAD Count": round(mad_c, 2),
+            "Upper Count Threshold": round(upper_mat_c, 1),
+            "Count Classification": count_cls, "Count Deviation %": count_dev,
             "Latest Amount": round(latest_amount, 2),
-            "Classification": classification,
-            "Deviation %": deviation_pct,
+            "Median Amount": round(median_a, 1), "MAD Amount": round(mad_a, 2),
+            "Upper Amount Threshold": round(upper_mat_a, 1),
+            "Amount Classification": amt_cls, "Amount Deviation %": amt_dev,
+            "Classification": classification, "Deviation %": deviation,
             "Periods": n_periods,
         })
 
@@ -1374,7 +1418,34 @@ def tab_threshold_alerts(df, col_map):
 
     # ── Alert Table with color-coded classification ──
     st.markdown("### Alert Summary Table")
-    display_alert = alert_df.sort_values("Deviation %", ascending=False, na_position="last").reset_index(drop=True)
+    # Select columns for display based on metric
+    if threshold_metric == "Break Count":
+        display_cols = ["Segment", "Latest Count", "Median Count", "MAD Count",
+                        "Upper Count Threshold", "Latest Amount", "Classification",
+                        "Count Deviation %", "Periods"]
+    elif threshold_metric == "Break Amount":
+        display_cols = ["Segment", "Latest Count", "Latest Amount", "Median Amount",
+                        "MAD Amount", "Upper Amount Threshold", "Classification",
+                        "Amount Deviation %", "Periods"]
+    else:
+        display_cols = ["Segment", "Latest Count", "Median Count", "Upper Count Threshold",
+                        "Count Classification", "Latest Amount", "Median Amount",
+                        "Upper Amount Threshold", "Amount Classification",
+                        "Classification", "Deviation %", "Periods"]
+    display_alert = alert_df[[c for c in display_cols if c in alert_df.columns]].copy()
+    display_alert = display_alert.sort_values("Deviation %" if "Deviation %" in display_alert.columns else display_cols[-2],
+                                              ascending=False, na_position="last").reset_index(drop=True)
+
+    amt_js_formatter = JsCode("""
+    function(params) {
+        var v = Math.abs(params.value);
+        var sign = params.value < 0 ? '-' : '';
+        if (v >= 1e9) return sign + '\\u00a3' + (v/1e9).toFixed(1) + 'B';
+        if (v >= 1e6) return sign + '\\u00a3' + (v/1e6).toFixed(1) + 'M';
+        if (v >= 1e3) return sign + '\\u00a3' + (v/1e3).toFixed(1) + 'K';
+        return sign + '\\u00a3' + Math.round(v).toLocaleString();
+    }
+    """)
 
     if HAS_AGGRID and len(display_alert) > 0:
         gb = GridOptionsBuilder.from_dataframe(display_alert)
@@ -1395,7 +1466,13 @@ def tab_threshold_alerts(df, col_map):
         }
         """)
         gb.configure_column("Classification", cellStyle=cls_style)
-        gb.configure_column("Latest Amount", type=["numericColumn"], valueFormatter="'£' + Math.round(x).toLocaleString()")
+        if "Count Classification" in display_alert.columns:
+            gb.configure_column("Count Classification", cellStyle=cls_style)
+        if "Amount Classification" in display_alert.columns:
+            gb.configure_column("Amount Classification", cellStyle=cls_style)
+        for ac in ["Latest Amount", "Median Amount", "MAD Amount", "Upper Amount Threshold"]:
+            if ac in display_alert.columns:
+                gb.configure_column(ac, type=["numericColumn"], valueFormatter=amt_js_formatter)
         AgGrid(display_alert, gridOptions=gb.build(), height=400, theme="streamlit",
                allow_unsafe_jscode=True, key="alert_grid")
     else:
@@ -1422,25 +1499,34 @@ def tab_threshold_alerts(df, col_map):
         fig = chart_layout(fig, "Segments by Classification", "Classification", "Count")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Chart 2: Scatter — Latest Count vs Median with threshold bands
+    # Chart 2: Scatter — Latest value vs Median
     with col_b:
         scatter_df = alert_df[alert_df["Classification"] != "Insufficient Data"].copy()
         if len(scatter_df) > 0:
+            if threshold_metric == "Break Amount":
+                sx, sy, slbl = "Median Amount", "Latest Amount", "amount"
+                scatter_df["Bubble Size"] = scatter_df["Latest Count"].clip(lower=1)
+                scatter_df["Hover Amount"] = scatter_df["Latest Amount"].apply(format_short)
+            else:
+                sx, sy, slbl = "Median Count", "Latest Count", "count"
+                scatter_df["Bubble Size"] = scatter_df["Latest Amount"].clip(lower=1)
+                scatter_df["Hover Amount"] = scatter_df["Latest Amount"].apply(format_short)
             fig = px.scatter(
-                scatter_df, x="Median Count", y="Latest Count",
+                scatter_df, x=sx, y=sy,
                 color="Classification",
                 color_discrete_map={"Material": "#A84B2F", "Watchlist": "#FFC553", "Normal": "#01696F"},
-                hover_name="Segment", size="Latest Amount",
+                hover_name="Segment", size="Bubble Size",
                 size_max=30,
+                hover_data={"Hover Amount": True, "Bubble Size": False},
             )
-            # Add 1:1 reference line
-            max_val = max(scatter_df["Median Count"].max(), scatter_df["Latest Count"].max()) * 1.1
+            max_val = max(scatter_df[sx].max(), scatter_df[sy].max()) * 1.1
             fig.add_trace(go.Scatter(
                 x=[0, max_val], y=[0, max_val],
                 mode="lines", line=dict(dash="dash", color=MUTED, width=1),
                 showlegend=False, name="1:1 line",
             ))
-            fig = chart_layout(fig, "Latest Count vs Median (bubble = amount)", "Median Count", "Latest Count")
+            fig = chart_layout(fig, f"Latest {slbl.title()} vs Median (bubble = {'count' if slbl == 'amount' else 'amount'})",
+                               sx, sy)
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No segments with sufficient data for scatter chart.")
@@ -1481,44 +1567,110 @@ def tab_threshold_alerts(df, col_map):
             sel_seg = st.selectbox("Select segment", selectable_segs, index=default_idx, key="thresh_ts_seg")
             seg_ts = seg_period[seg_period[seg_col] == sel_seg].sort_values(period_col)
             seg_row = alert_df[alert_df["Segment"] == sel_seg].iloc[0]
-            median_val = seg_row["Median Count"]
-            mad_val = seg_row["MAD Count"]
 
-            if pd.notna(median_val):
+            # Choose metric for time series
+            if threshold_metric == "Break Amount":
+                ts_y, ts_med, ts_mad = "Break Amount", seg_row["Median Amount"], seg_row["MAD Amount"]
+                ts_label = "Break Amount"
+            else:
+                ts_y, ts_med, ts_mad = "Break Count", seg_row["Median Count"], seg_row["MAD Count"]
+                ts_label = "Break Count"
+
+            if pd.notna(ts_med):
                 period_labels = seg_ts[period_col].apply(
                     lambda x: period_to_datetime_scalar(x).strftime("%Y-%m") if pd.notna(period_to_datetime_scalar(x)) else str(x))
 
                 fig = go.Figure()
-                # Threshold bands
-                upper_mat = median_val + mad_k * mad_val
-                upper_watch = median_val + watchlist_k * mad_val
+                upper_mat = ts_med + mad_k * ts_mad
+                upper_watch = ts_med + watchlist_k * ts_mad
 
-                fig.add_hrect(y0=upper_mat, y1=max(seg_ts["Break Count"].max() * 1.2, upper_mat * 1.3),
+                fig.add_hrect(y0=upper_mat, y1=max(seg_ts[ts_y].max() * 1.2, upper_mat * 1.3),
                               fillcolor="rgba(168, 75, 47, 0.1)", line_width=0, annotation_text="Material",
                               annotation_position="top left")
                 fig.add_hrect(y0=upper_watch, y1=upper_mat,
                               fillcolor="rgba(255, 197, 83, 0.15)", line_width=0, annotation_text="Watchlist",
                               annotation_position="top left")
-                fig.add_hline(y=median_val, line_dash="dash", line_color=MUTED, line_width=1,
+                fig.add_hline(y=ts_med, line_dash="dash", line_color=MUTED, line_width=1,
                               annotation_text="Median")
                 fig.add_hline(y=upper_mat, line_dash="dot", line_color="#A84B2F", line_width=1)
                 fig.add_hline(y=upper_watch, line_dash="dot", line_color="#FFC553", line_width=1)
 
                 fig.add_trace(go.Scatter(
-                    x=period_labels, y=seg_ts["Break Count"],
-                    mode="lines+markers", name="Break Count",
+                    x=period_labels, y=seg_ts[ts_y],
+                    mode="lines+markers", name=ts_label,
                     line=dict(color=COLORS[0], width=2.5),
                     marker=dict(size=8),
                 ))
-                fig = chart_layout(fig, f"Time Series: {sel_seg}", "Period", "Break Count")
+                fig = chart_layout(fig, f"Time Series: {sel_seg}", "Period", ts_label)
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No segments with sufficient data for time series.")
 
+    # ── False Positive Identification (IMPROVEMENT 3) ──
+    st.markdown("---")
+    normal_df = alert_df[alert_df["Classification"] == "Normal"].copy()
+    total_normal_breaks = 0
+    total_all_breaks = 0
+    if len(alert_df) > 0:
+        total_all_breaks = int(alert_df["Latest Count"].sum())
+        total_normal_breaks = int(normal_df["Latest Count"].sum())
+
+    # FP Confidence: how close is the segment to the watchlist threshold
+    if len(normal_df) > 0:
+        if threshold_metric == "Break Amount":
+            fp_latest_col, fp_watch_col = "Latest Amount", "Upper Amount Threshold"
+        else:
+            fp_latest_col, fp_watch_col = "Latest Count", "Upper Count Threshold"
+        watch_thresholds = []
+        for _, row in normal_df.iterrows():
+            if threshold_metric == "Break Count":
+                wt = row["Median Count"] + watchlist_k * row["MAD Count"] if pd.notna(row["Median Count"]) else np.nan
+            elif threshold_metric == "Break Amount":
+                wt = row["Median Amount"] + watchlist_k * row["MAD Amount"] if pd.notna(row["Median Amount"]) else np.nan
+            else:
+                wt_c = row["Median Count"] + watchlist_k * row["MAD Count"] if pd.notna(row["Median Count"]) else np.nan
+                wt_a = row["Median Amount"] + watchlist_k * row["MAD Amount"] if pd.notna(row["Median Amount"]) else np.nan
+                wt = min(wt_c, wt_a) if pd.notna(wt_c) and pd.notna(wt_a) else (wt_c if pd.notna(wt_c) else wt_a)
+            watch_thresholds.append(wt)
+        normal_df["Watchlist Threshold"] = watch_thresholds
+        if threshold_metric == "Break Amount":
+            latest_vals = normal_df["Latest Amount"]
+        elif threshold_metric == "Break Count":
+            latest_vals = normal_df["Latest Count"]
+        else:
+            latest_vals = normal_df[["Latest Count", "Latest Amount"]].max(axis=1)
+        normal_df["FP Confidence %"] = np.where(
+            normal_df["Watchlist Threshold"] > 0,
+            ((normal_df["Watchlist Threshold"] - latest_vals) / normal_df["Watchlist Threshold"] * 100).clip(upper=100).round(1),
+            np.nan,
+        )
+
+    fp_count = len(normal_df)
+    fp_pct = round(total_normal_breaks / total_all_breaks * 100, 1) if total_all_breaks > 0 else 0
+
+    c1, c2 = st.columns(2)
+    with c1:
+        kpi_card("Potential False Positives",
+                 f"{fp_count} segments ({fp_pct}% of total breaks)")
+    with c2:
+        avg_fp_conf = normal_df["FP Confidence %"].mean() if len(normal_df) > 0 and "FP Confidence %" in normal_df.columns else 0
+        kpi_card("Avg FP Confidence", f"{avg_fp_conf:.1f}%")
+
+    with st.expander("View False Positive Candidates (Normal Segments)", expanded=False):
+        if len(normal_df) > 0:
+            fp_display_cols = ["Segment", "Latest Count", "Latest Amount", "FP Confidence %", "Periods"]
+            fp_display = normal_df[[c for c in fp_display_cols if c in normal_df.columns]].copy()
+            fp_display = fp_display.sort_values("FP Confidence %", ascending=True, na_position="last").reset_index(drop=True)
+            if "Latest Amount" in fp_display.columns:
+                fp_display["Latest Amount"] = fp_display["Latest Amount"].apply(format_short)
+            render_aggrid(fp_display, height=350, key="fp_grid")
+        else:
+            st.info("No Normal segments found — all segments are flagged as Material or Watchlist.")
+
     # Download
     st.markdown("---")
     st.download_button(
-        "📥 Download Alert Report (CSV)",
+        "Download Alert Report (CSV)",
         alert_df.to_csv(index=False).encode("utf-8"),
         file_name="threshold_alerts.csv",
         mime="text/csv",
@@ -1577,22 +1729,8 @@ def tab_factor_analysis(df, col_map):
     amt_change = total_curr_amt - total_prev_amt
     amt_pct = round(amt_change / abs(total_prev_amt) * 100, 1) if total_prev_amt != 0 else 0
 
-    # KPIs
-    c1, c2, c3, c4 = st.columns(4)
     prev_label = period_to_datetime_scalar(prev_period).strftime("%Y-%m") if pd.notna(period_to_datetime_scalar(prev_period)) else str(prev_period)
     curr_label = period_to_datetime_scalar(curr_period).strftime("%Y-%m") if pd.notna(period_to_datetime_scalar(curr_period)) else str(curr_period)
-    with c1:
-        kpi_card(f"Count ({prev_label})", format_number(total_prev_count))
-    with c2:
-        kpi_card(f"Count ({curr_label})", format_number(total_curr_count),
-                 f"{'+' if count_change >= 0 else ''}{count_change:,} ({count_pct:+.1f}%)", invert=True)
-    with c3:
-        kpi_card(f"Amount ({prev_label})", format_number(total_prev_amt, "£", 0))
-    with c4:
-        kpi_card(f"Amount ({curr_label})", format_number(total_curr_amt, "£", 0),
-                 f"{'+' if amt_change >= 0 else ''}{format_number(amt_change, '£', 0)} ({amt_pct:+.1f}%)", invert=True)
-
-    st.markdown("---")
 
     # Dimension selector
     dimensions_map = {
@@ -1644,10 +1782,69 @@ def tab_factor_analysis(df, col_map):
     )
     factor_df = factor_df.sort_values("Count Change", ascending=False)
 
+    # ── Plain-English Summary (teal info box at top) ──
+    summary_parts = []
+    direction = "increased" if count_change >= 0 else "decreased"
+    summary_parts.append(
+        f"Break count **{direction} by {abs(count_change):,}** ({count_pct:+.1f}%) "
+        f"from **{prev_label}** to **{curr_label}**."
+    )
+    if len(factor_df) > 0:
+        top_inc = factor_df.loc[factor_df["Count Change"].idxmax()]
+        top_dec = factor_df.loc[factor_df["Count Change"].idxmin()]
+        if top_inc["Count Change"] > 0:
+            summary_parts.append(
+                f"Largest increase: **{top_inc[dim_col]}** (+{int(top_inc['Count Change']):,} breaks)."
+            )
+        if top_dec["Count Change"] < 0:
+            summary_parts.append(
+                f"Largest decrease: **{top_dec[dim_col]}** ({int(top_dec['Count Change']):,} breaks)."
+            )
+        if amt_col and amt_col in df.columns:
+            amt_dir = "increased" if amt_change >= 0 else "decreased"
+            summary_parts.append(
+                f"Total amount **{amt_dir} by {format_short(abs(amt_change))}** ({amt_pct:+.1f}%)."
+            )
+        # Concentration check
+        top3 = factor_df.nlargest(3, "Count Change")
+        top3_total = top3["Count Change"].sum()
+        if count_change != 0:
+            conc = round(top3_total / count_change * 100, 1)
+            if abs(conc) > 50:
+                top3_names = ", ".join(top3[dim_col].tolist())
+                summary_parts.append(
+                    f"Top 3 segments ({top3_names}) account for **{abs(conc):.0f}%** of the net change."
+                )
+
+    summary_text = " ".join(summary_parts)
+    # Convert markdown bold to HTML bold for HTML rendering
+    summary_html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', summary_text)
+    st.markdown(
+        f'<div style="background-color:#E6F4F1; border-left:4px solid {PRIMARY}; padding:12px 16px; '
+        f'border-radius:4px; margin-bottom:16px; color:#1B474D; font-size:0.95rem;">'
+        f'{summary_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card(f"Count ({prev_label})", format_number(total_prev_count))
+    with c2:
+        kpi_card(f"Count ({curr_label})", format_number(total_curr_count),
+                 f"{'+' if count_change >= 0 else ''}{count_change:,} ({count_pct:+.1f}%)", invert=True)
+    with c3:
+        kpi_card(f"Amount ({prev_label})", format_short(total_prev_amt))
+    with c4:
+        kpi_card(f"Amount ({curr_label})", format_short(total_curr_amt),
+                 f"{'+' if amt_change >= 0 else ''}{format_short(amt_change)} ({amt_pct:+.1f}%)", invert=True)
+
+    st.markdown("---")
+
     # ── Charts ──
     col_a, col_b = st.columns(2)
 
-    # Chart 1: Waterfall — Count change by dimension
+    # Chart 1: Waterfall — Count change by dimension (simplified hover)
     with col_a:
         wf = factor_df.sort_values("Count Change", ascending=False)
         measures = ["relative"] * len(wf) + ["total"]
@@ -1662,8 +1859,9 @@ def tab_factor_analysis(df, col_map):
             connector=dict(line=dict(color=MUTED, width=1)),
             text=[f"{v:+,.0f}" for v in wf["Count Change"]] + [f"{count_change:+,.0f}"],
             textposition="outside",
+            hovertemplate="%{x}<br>Change: %{y:+,.0f}<extra></extra>",
         ))
-        fig = chart_layout(fig, f"Break Count Change by {sel_dim} (Waterfall)", sel_dim, "Count Change",
+        fig = chart_layout(fig, f"Break Count Change by {sel_dim}", sel_dim, "Count Change",
                            height=450)
         fig.update_xaxes(tickangle=45)
         st.plotly_chart(fig, use_container_width=True)
@@ -1681,47 +1879,44 @@ def tab_factor_analysis(df, col_map):
             orientation="h", marker_color=COLORS[4], opacity=0.7,
         ))
         fig.update_layout(barmode="group")
-        fig = chart_layout(fig, f"{prev_label} vs {curr_label} Break Count by {sel_dim}", "Count", "",
+        fig = chart_layout(fig, f"{prev_label} vs {curr_label} by {sel_dim}", "Count", "",
                            height=max(350, len(bar_df) * 30))
         st.plotly_chart(fig, use_container_width=True)
 
     col_c, col_d = st.columns(2)
 
-    # Chart 3: Heatmap — all dimensions combined
+    # Chart 3: Top Movers (replaces heatmap) — top 5 increases and decreases
     with col_c:
-        st.markdown("### Multi-Dimension Heatmap")
-        heat_rows = []
-        for dim_name, dim_c in available_dims.items():
-            prev_g = df_prev.groupby(dim_c).size()
-            curr_g = df_curr.groupby(dim_c).size()
-            combined = pd.DataFrame({"prev": prev_g, "curr": curr_g}).fillna(0)
-            combined["change_pct"] = np.where(
-                combined["prev"] > 0,
-                ((combined["curr"] - combined["prev"]) / combined["prev"] * 100).round(1),
-                np.where(combined["curr"] > 0, 100.0, 0.0),
-            )
-            for val, row in combined.iterrows():
-                heat_rows.append({
-                    "Dimension": dim_name,
-                    "Value": str(val),
-                    "Change %": row["change_pct"],
-                })
-        if heat_rows:
-            heat_df = pd.DataFrame(heat_rows)
-            heat_pivot = heat_df.pivot_table(index="Value", columns="Dimension", values="Change %", fill_value=0)
-            # Limit to top 20 values by absolute change
-            row_importance = heat_pivot.abs().sum(axis=1)
-            heat_pivot = heat_pivot.loc[row_importance.nlargest(20).index]
-            fig = px.imshow(
-                heat_pivot, color_continuous_scale=["#01696F", "#FFFFFF", "#A84B2F"],
-                color_continuous_midpoint=0, aspect="auto", text_auto=".1f",
-            )
-            fig = chart_layout(fig, f"Change % Heatmap ({prev_label} → {curr_label})", "", "",
-                               height=max(350, len(heat_pivot) * 25))
-            fig.update_layout(coloraxis_colorbar_title="Change %")
-            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("### Top Movers")
+        top_inc = factor_df[factor_df["Count Change"] > 0].nlargest(5, "Count Change")
+        top_dec = factor_df[factor_df["Count Change"] < 0].nsmallest(5, "Count Change")
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            st.markdown(f'<p style="color:#A84B2F; font-weight:bold; margin-bottom:4px;">Top Increases</p>',
+                        unsafe_allow_html=True)
+            if len(top_inc) > 0:
+                for _, r in top_inc.iterrows():
+                    st.markdown(
+                        f'<div style="padding:4px 8px; margin:2px 0; background:#FDECEA; border-radius:4px;">'
+                        f'<b>{r[dim_col]}</b>: +{int(r["Count Change"]):,} ({r["Count Change %"]:+.1f}%)</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("No increases")
+        with mc2:
+            st.markdown(f'<p style="color:#01696F; font-weight:bold; margin-bottom:4px;">Top Decreases</p>',
+                        unsafe_allow_html=True)
+            if len(top_dec) > 0:
+                for _, r in top_dec.iterrows():
+                    st.markdown(
+                        f'<div style="padding:4px 8px; margin:2px 0; background:#E6F4F1; border-radius:4px;">'
+                        f'<b>{r[dim_col]}</b>: {int(r["Count Change"]):,} ({r["Count Change %"]:+.1f}%)</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("No decreases")
 
-    # Chart 4: Pareto — cumulative contribution to count change
+    # Chart 4: Pareto — cumulative contribution to count change (cleaner)
     with col_d:
         pareto_df = factor_df[[dim_col, "Count Change"]].copy()
         pareto_df["Abs Change"] = pareto_df["Count Change"].abs()
@@ -1732,89 +1927,43 @@ def tab_factor_analysis(df, col_map):
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=pareto_df[dim_col], y=pareto_df["Abs Change"],
-            name="Abs Count Change", marker_color=COLORS[0], opacity=0.8,
+            name="Abs Change", marker_color=COLORS[0], opacity=0.8,
+            hovertemplate="%{x}<br>Abs Change: %{y:,.0f}<extra></extra>",
         ))
         fig.add_trace(go.Scatter(
             x=pareto_df[dim_col], y=pareto_df["Cumulative %"],
             name="Cumulative %", yaxis="y2",
             line=dict(color=COLORS[4], width=2.5), mode="lines+markers",
+            hovertemplate="%{x}<br>Cumulative: %{y:.1f}%<extra></extra>",
         ))
         fig.update_layout(
             yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 110]),
+            showlegend=False,
         )
-        fig = chart_layout(fig, f"Pareto: Contribution to Count Change by {sel_dim}",
+        fig = chart_layout(fig, f"Pareto: Contribution by {sel_dim}",
                            sel_dim, "Abs Count Change", height=420)
         fig.update_xaxes(tickangle=45)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── Summary table ──
-    st.markdown("### Dimension Breakdown Summary")
-    summary_df = factor_df.rename(columns={
-        dim_col: sel_dim,
-        "Prev_Count": f"Count ({prev_label})",
-        "Curr_Count": f"Count ({curr_label})",
-        "Count Change": "Count Δ",
-        "Count Change %": "Count Δ %",
-        "Prev_Amount": f"Amount ({prev_label})",
-        "Curr_Amount": f"Amount ({curr_label})",
-        "Amount Change": "Amount Δ",
-        "Amount Change %": "Amount Δ %",
-    })
-    render_aggrid(summary_df.reset_index(drop=True), height=400, key="factor_grid")
-
-    # ── Auto-generated insight text ──
-    st.markdown("### Key Insights")
-    if len(factor_df) > 0:
-        # Largest increase
-        max_increase_row = factor_df.loc[factor_df["Count Change"].idxmax()]
-        # Largest decrease
-        min_decrease_row = factor_df.loc[factor_df["Count Change"].idxmin()]
-
-        insights = []
-        if max_increase_row["Count Change"] > 0:
-            insights.append(
-                f"The largest **increase** in breaks came from **{sel_dim}: {max_increase_row[dim_col]}** "
-                f"which added **{int(max_increase_row['Count Change']):,}** breaks "
-                f"(**{max_increase_row['Count Change %']:+.1f}%**)."
-            )
-        if min_decrease_row["Count Change"] < 0:
-            insights.append(
-                f"The largest **decrease** came from **{sel_dim}: {min_decrease_row[dim_col]}** "
-                f"which reduced by **{int(abs(min_decrease_row['Count Change'])):,}** breaks "
-                f"(**{min_decrease_row['Count Change %']:+.1f}%**)."
-            )
-
-        # Amount insights
-        if amt_col and amt_col in df.columns:
-            max_amt_row = factor_df.loc[factor_df["Amount Change"].idxmax()]
-            if max_amt_row["Amount Change"] > 0:
-                insights.append(
-                    f"By amount, **{sel_dim}: {max_amt_row[dim_col]}** had the largest increase of "
-                    f"**£{int(max_amt_row['Amount Change']):,}** (**{max_amt_row['Amount Change %']:+.1f}%**)."
-                )
-
-        # Concentration
-        top3 = factor_df.nlargest(3, "Count Change")
-        top3_total = top3["Count Change"].sum()
-        if count_change != 0:
-            concentration = round(top3_total / count_change * 100, 1)
-            if abs(concentration) > 50:
-                top3_names = ", ".join(top3[dim_col].tolist())
-                insights.append(
-                    f"**{abs(concentration):.0f}%** of the net count change is concentrated in the top 3 segments: "
-                    f"**{top3_names}**."
-                )
-
-        if insights:
-            for insight in insights:
-                st.markdown(f"- {insight}")
-        else:
-            st.info("No significant changes detected between the selected periods.")
+    # ── Summary table in expander ──
+    with st.expander("Dimension Breakdown Summary", expanded=False):
+        summary_df = factor_df.rename(columns={
+            dim_col: sel_dim,
+            "Prev_Count": f"Count ({prev_label})",
+            "Curr_Count": f"Count ({curr_label})",
+            "Count Change": "Count Change",
+            "Count Change %": "Count Change %",
+            "Prev_Amount": f"Amount ({prev_label})",
+            "Curr_Amount": f"Amount ({curr_label})",
+            "Amount Change": "Amount Change",
+            "Amount Change %": "Amount Change %",
+        })
+        render_aggrid(summary_df.reset_index(drop=True), height=400, key="factor_grid")
 
     # Download
     st.markdown("---")
     st.download_button(
-        "📥 Download Factor Analysis (CSV)",
+        "Download Factor Analysis (CSV)",
         factor_df.to_csv(index=False).encode("utf-8"),
         file_name="factor_analysis.csv",
         mime="text/csv",
