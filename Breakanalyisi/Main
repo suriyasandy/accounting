@@ -1,0 +1,172 @@
+def main():
+    # ── Page header ──
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;justify-content:space-between;
+                    padding:10px 0 4px 0;border-bottom:2px solid {PRIMARY};
+                    margin-bottom:12px;">
+            <div>
+                <span style="font-size:1.5rem;font-weight:800;color:{DARK};">
+                    📊 Accounting Control AI Platform
+                </span>
+                <span style="font-size:0.82rem;color:{MUTED};margin-left:12px;">
+                    Phase 1 — DuckDB · Vectorised · Jira Factor Analysis
+                </span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Minimal sidebar — file upload only ──
+    with st.sidebar:
+        st.markdown(
+            f"""
+            <div style="text-align:center;padding:8px 0 4px 0;">
+                <span style="font-size:1.1rem;font-weight:700;color:{DARK};">
+                    📂 Data Upload
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("---")
+        uploaded = st.file_uploader(
+            "Upload MI Report",
+            type=["csv", "xlsx", "xls", "parquet"],
+            key="uploader",
+            help="Supported: CSV, Excel (.xlsx/.xls), Parquet. "
+                 "Upload a Parquet for ~0.2s load on reruns.",
+        )
+        st.markdown("---")
+        st.markdown(
+            """
+            <div style="font-size:0.78rem;color:#7A7974;line-height:1.6;">
+            <b>Load Times</b><br>
+            ⚡ <code>.parquet</code> ~0.2s<br>
+            🟢 <code>.csv</code>     ~1–2s<br>
+            🟡 <code>.xlsx</code>    ~4–6s<br>
+            <br>
+            <i>After first load every rerun is instant — cached in session.</i><br>
+            <br>
+            Download <b>Cleaned Parquet</b> from the Data Quality tab for fast future uploads.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── No file uploaded — landing page ──
+    if uploaded is None:
+        st.markdown("## 👋 Welcome")
+        lc, rc = st.columns([3, 2])
+        with lc:
+            st.info(
+                "Upload your **MI Report** using the sidebar to begin analysis.\n\n"
+                "Supported formats: **CSV**, **Excel (.xlsx/.xls)**, **Parquet**."
+            )
+            st.markdown("""
+            ### What this platform does
+            - 🧹 **Data Quality** — completeness scoring, type violations, outlier detection
+            - 📅 **Ageing Validation** — computed age days vs pre-populated, bucket discrepancy
+            - 📈 **Break Count Trends** — period-over-period break volumes by team, rec, bucket
+            - 💷 **Amount Analysis** — ABS GBP trends, top rec names by exposure
+            - 🔍 **Jira Factor Analysis** — Jira Reference × System to be Fixed driver analysis,
+              MoM change, heatmap, >90 day risk breakdown
+            """)
+        with rc:
+            st.markdown("""
+            ### Tips for best performance
+            | Format | First Load | Reruns |
+            |---|---|---|
+            | `.parquet` | ⚡ ~0.2s | ⚡ Instant |
+            | `.csv`     | 🟢 ~1–2s  | ⚡ Instant |
+            | `.xlsx`    | 🟡 ~4–6s  | ⚡ Instant |
+
+            > After first upload, **every filter change and tab switch is instant**
+            > — `@st.cache_data` holds the DataFrame in memory for the session.
+            >
+            > 💡 Download **Cleaned Parquet** from the Data Quality tab and
+            > upload it next time for near-instant loads.
+            """)
+        return
+
+    # ── Load and clean ──
+    file_bytes = uploaded.read()
+    fname      = uploaded.name
+
+    df, col_map, filter_options, violations_df, dropped_cols = clean_dataframe(
+        file_bytes, fname
+    )
+
+    vcount = int(violations_df["Violation Count"].sum()) if len(violations_df) else 0
+
+    # ── Sidebar file metadata (below upload) ──
+    with st.sidebar:
+        st.markdown(
+            f"""
+            <div style="background:#F7F7F5;border-radius:6px;padding:10px 12px;
+                        font-size:0.82rem;line-height:1.8;color:{DARK};">
+                <b>File:</b> <code>{fname}</code><br>
+                <b>Rows:</b> {len(df):,}<br>
+                <b>Cols:</b> {len(df.columns)}<br>
+                {"<span style='color:#A84B2F;font-weight:600'>⚠️ " +
+                 str(vcount) + " type violation(s)</span><br>"
+                 if vcount > 0 else
+                 "<span style='color:#01696F'>✅ No type violations</span><br>"}
+                {"<span style='color:#7A7974;font-size:0.76rem'>🗑️ " +
+                 str(len(dropped_cols)) + " blank col(s) removed</span>"
+                 if dropped_cols else ""}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── Top filter bar — renders above tabs, returns filtered df ──
+    df_filtered = render_top_filter_bar(df, col_map, filter_options)
+
+    # ── Row count indicator below filter bar ──
+    filter_active = bool(st.session_state.get("applied_filters", {}))
+    row_delta     = len(df) - len(df_filtered)
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;gap:16px;
+                    padding:4px 2px 8px 2px;font-size:0.82rem;color:{MUTED};">
+            <span>
+                <b style="color:{DARK};">{len(df_filtered):,}</b> rows displayed
+                {"out of <b style='color:" + DARK + ";'>" +
+                 f"{len(df):,}</b> total" if filter_active else ""}
+            </span>
+            {("<span style='color:" + WARN + ";font-weight:600;'>"
+              + f"🔽 {row_delta:,} rows filtered out</span>")
+             if filter_active and row_delta > 0 else ""}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Tabs ──
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🧹 Data Quality",
+        "📅 Ageing Validation",
+        "📈 Break Counts",
+        "💷 Amount Analysis",
+        "🔍 Jira Factor Analysis",
+    ])
+
+    with tab1:
+        tab_data_quality(
+            df_filtered, col_map, violations_df,
+            file_bytes, fname, dropped_cols,
+        )
+    with tab2:
+        tab_ageing_validation(df_filtered, col_map)
+    with tab3:
+        tab_break_counts(df_filtered, col_map)
+    with tab4:
+        tab_amount_analysis(df_filtered, col_map)
+    with tab5:
+        tab_jira_factor_analysis(df_filtered, col_map)
+
+
+if __name__ == "__main__":
+    main()
