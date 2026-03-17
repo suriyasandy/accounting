@@ -1,0 +1,25 @@
+As an OPS Control Analyst,
+I want to upload my MI Report (CSV/Excel/Parquet) and instantly see a data quality scorecard,
+So that I can identify completeness gaps and type violations before performing any analysis.
+I want to validate pre-populated Age Days and Bucket values against system-computed values,
+So that I can identify and report discrepancies in the MI Report before submission.
+I want to see break counts trending over periods broken down by Team, Rec Name, Asset Class, and Bucket,
+So that I can identify which areas are improving or deteriorating month-over-month.
+I want to see total ABS GBP exposure trending over periods by Team, Rec Name, and True/Systemic classification,
+So that I can prioritise resolution of highest-value outstanding breaks.
+I want to analyse break volumes and ageing against Jira Reference and System to be Fixed,
+So that I can identify which open Jira tickets and systems are responsible for the most breaks and drive resolution prioritisation.
+
+Acceptance Criteria
+•	Jira Reference and System to be Fixed are the only GROUP BY dimensions in the selector — Jira Description is excluded as it is 1:1 with Jira Reference
+•	Factor Summary Table shows: Jira Reference | Jira Description | System to be Fixed | Break Count | Latest Period | Prev Period | MoM Δ | MoM Δ % | Avg Age Days | Max Age Days | >90 Day Breaks | >90 Day % | >180 Day Breaks | >365 Day Breaks | Total ABS GBP | Avg GBP / Break
+•	Jira Description column appears immediately after Jira Reference in the table
+•	AgGrid conditional formatting: MoM Δ red for increase / green for decrease; >90 Day % amber ≥25%, red ≥50%
+•	All bar charts show Jira Description as hover tooltip when Jira Reference is selected
+•	Trend chart legend annotates as `JIRA-123: Short description…` (truncated to 40 chars)
+•	MoM Change chart Y-axis shows `JIRA-123: desc` with hover showing prev/latest counts
+•	Jira Reference × System to be Fixed heatmap with top 20 Jiras, row labels include description
+•	Coverage KPIs show % populated for Jira Reference, Jira Description, System to be Fixed
+•	When Rec Name is selected: Account Group and Products Reconciled shown as lookup attributes (1:1)
+•	When System to be Fixed is selected: Unique Jira Refs count shown as lookup attribute
+•	Factor summary CSV downloadable per selected dimension
