@@ -5,6 +5,10 @@ Optimised for 600K+ records:
   - DuckDB for all post-filter aggregations (SQL on Pandas, zero-copy)
   - Vectorised Pandas for cleaning/parsing
   - @st.cache_data for heavy computations
+  - False Positive flagging per discrepancy record
+  - ABS GBP threshold slider (DuckDB filtered)
+  - Rolling average trend lines for underlying trend visibility
+  - Root cause / driver analysis panel
 """
 
 import streamlit as st
@@ -13,11 +17,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
-from datetime import datetime
-import hashlib
 import duckdb
-import tempfile
-import os
+import hashlib
 
 try:
     from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
@@ -33,11 +34,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-COLORS = ["#01696F","#0C4E54","#20808D","#4F98A3","#A84B2F","#1B474D","#BCE2E7","#944454","#FFC553"]
-PRIMARY = "#01696F"
-DARK    = "#28251D"
-MUTED   = "#7A7974"
-BG_LIGHT= "#F7F7F5"
+COLORS       = ["#01696F","#0C4E54","#20808D","#4F98A3","#A84B2F","#1B474D","#BCE2E7","#944454","#FFC553"]
+PRIMARY      = "#01696F"
+DARK         = "#28251D"
+MUTED        = "#7A7974"
+BG_LIGHT     = "#F7F7F5"
+WARN         = "#A84B2F"
 BUCKET_ORDER = ["0-15","16-30","31-60","61-90","91-180","181-365","365+","Unknown"]
 
 st.markdown(f"""
@@ -56,27 +58,34 @@ st.markdown(f"""
     }}
     .kpi-card {{background:white;border-left:4px solid {PRIMARY};
         padding:12px 16px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}}
+    .kpi-card-warn {{background:white;border-left:4px solid {WARN};
+        padding:12px 16px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}}
     .kpi-label {{color:{MUTED};font-size:0.75rem;text-transform:uppercase;
         letter-spacing:0.5px;margin-bottom:2px;}}
     .kpi-value {{color:{DARK};font-size:1.4rem;font-weight:700;margin:0;}}
     .kpi-delta-pos {{color:#A84B2F;font-size:0.8rem;}}
     .kpi-delta-neg {{color:#01696F;font-size:0.8rem;}}
-    .convert-banner {{background:#E8F5E9;border-left:4px solid #01696F;
-        padding:10px 16px;border-radius:4px;margin-bottom:1rem;font-size:0.9rem;color:#28251D;}}
+    .fp-banner {{background:#FFF8E1;border-left:4px solid #FFC553;
+        padding:10px 16px;border-radius:4px;margin-bottom:0.5rem;
+        font-size:0.88rem;color:{DARK};}}
+    .violation-banner {{background:#FDECEA;border-left:4px solid {WARN};
+        padding:10px 16px;border-radius:4px;margin-bottom:0.5rem;
+        font-size:0.88rem;color:{DARK};font-weight:600;}}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────── Utilities ───────────────────────────
 
-def kpi_card(label, value, delta=None, invert=False):
+def kpi_card(label, value, delta=None, invert=False, warn=False):
     delta_html = ""
     if delta:
         css = ("kpi-delta-pos" if str(delta).startswith("-") else "kpi-delta-neg") if invert \
               else ("kpi-delta-neg" if str(delta).startswith("-") else "kpi-delta-pos")
         delta_html = f'<p class="{css}">{delta}</p>'
+    card_class = "kpi-card-warn" if warn else "kpi-card"
     st.markdown(f"""
-    <div class="kpi-card">
+    <div class="{card_class}">
         <p class="kpi-label">{label}</p>
         <p class="kpi-value">{value}</p>
         {delta_html}
@@ -88,9 +97,9 @@ def safe_mom_pct(current, previous):
     return round(((current - previous) / abs(previous)) * 100, 1)
 
 
-def format_number(n, prefix="", decimal=0):
+def format_number(n, decimal=0):
     if pd.isna(n): return "N/A"
-    return f"{prefix}{int(n):,}" if decimal == 0 else f"{prefix}{n:,.{decimal}f}"
+    return f"{int(n):,}" if decimal == 0 else f"{n:,.{decimal}f}"
 
 
 def format_short(n, prefix="£"):
@@ -116,127 +125,61 @@ def chart_layout(fig, title="", xaxis_title="", yaxis_title="", height=400):
     return fig
 
 
-def render_aggrid(df, height=400, key=None):
+def render_aggrid(df, height=400, key=None, match_cols=None):
+    """Render AgGrid with optional red/green cell styling for Match columns."""
     if HAS_AGGRID and len(df) > 0:
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
         gb.configure_default_column(filterable=True, sortable=True, resizable=True)
+        if match_cols:
+            cs = JsCode("""function(p){
+                if(p.value===false||p.value==='False'||p.value===0)
+                    return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                if(p.value===true||p.value==='True'||p.value===1)
+                    return {'backgroundColor':'#E8F5E9','color':'#01696F'};
+                return {};}""")
+            for c in match_cols:
+                if c in df.columns:
+                    gb.configure_column(c, cellStyle=cs)
         AgGrid(df, gridOptions=gb.build(), height=height,
                theme="streamlit", key=key, allow_unsafe_jscode=True)
     else:
         st.dataframe(df, height=height, use_container_width=True)
 
 
-def file_hash(b: bytes) -> str:
-    return hashlib.md5(b).hexdigest()
-
-
-# ─────────────────────────── DuckDB Connection ───────────────────────────
+# ─────────────────────────── DuckDB ───────────────────────────
 
 @st.cache_resource
 def get_duck() -> duckdb.DuckDBPyConnection:
-    """Single persistent in-memory DuckDB connection."""
     return duckdb.connect()
 
 
 def dq(sql: str, df: pd.DataFrame = None) -> pd.DataFrame:
-    """
-    Execute SQL via DuckDB on a Pandas DataFrame.
-    DuckDB accesses the local variable 'df' directly via replacement scan —
-    zero-copy, no registration needed.
-    """
+    """Execute SQL on a Pandas DataFrame via DuckDB — zero-copy replacement scan."""
     con = get_duck()
     if df is not None:
         con.register("tbl", df)
     return con.execute(sql).df()
 
 
-# ─────────────────────────── Parquet Conversion ───────────────────────────
-
-def _csv_to_parquet_duckdb(file_bytes: bytes) -> bytes:
-    con = duckdb.connect()
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as fi:
-        fi.write(file_bytes); csv_path = fi.name
-    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as fo:
-        pq_path = fo.name
-    try:
-        con.execute(f"""
-            COPY (SELECT * FROM read_csv_auto('{csv_path}', ignore_errors=true, all_varchar=true))
-            TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
-        return open(pq_path, "rb").read()
-    finally:
-        os.unlink(csv_path)
-        if os.path.exists(pq_path): os.unlink(pq_path)
-        con.close()
-
-
-def _xlsx_to_parquet(file_bytes: bytes) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as fi:
-        fi.write(file_bytes); xlsx_path = fi.name
-    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as fo:
-        pq_path = fo.name
-    try:
-        # Primary: DuckDB spatial
-        con = duckdb.connect()
-        con.execute("INSTALL spatial; LOAD spatial;")
-        con.execute(f"COPY (SELECT * FROM st_read('{xlsx_path}')) TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-        return open(pq_path, "rb").read()
-    except Exception:
-        try:
-            import polars as pl
-            df = pl.read_excel(BytesIO(file_bytes), engine="calamine")
-            buf = BytesIO(); df.write_parquet(buf, compression="zstd"); return buf.getvalue()
-        except Exception:
-            import polars as pl
-            df = pl.read_excel(BytesIO(file_bytes), engine="openpyxl")
-            buf = BytesIO(); df.write_parquet(buf, compression="zstd"); return buf.getvalue()
-    finally:
-        os.unlink(xlsx_path)
-        if os.path.exists(pq_path): os.unlink(pq_path)
-        try: con.close()
-        except: pass
-
-
-def get_parquet_bytes(file_bytes: bytes, filename: str) -> tuple[bytes, bool]:
-    fhash = file_hash(file_bytes)
-    key   = f"parquet_{fhash}"
-    if key in st.session_state:
-        return st.session_state[key], False
-    name_lower = filename.lower()
-    if name_lower.endswith(".parquet"):
-        pq = file_bytes
-    elif name_lower.endswith(".csv"):
-        with st.spinner("⚡ Converting CSV → Parquet via DuckDB..."):
-            pq = _csv_to_parquet_duckdb(file_bytes)
-    else:
-        with st.spinner("⚡ Converting Excel → Parquet..."):
-            pq = _xlsx_to_parquet(file_bytes)
-    st.session_state[key] = pq
-    for k in list(st.session_state.keys()):
-        if k.startswith("parquet_") and k != key:
-            del st.session_state[k]
-    return pq, not name_lower.endswith(".parquet")
-
-
 # ─────────────────────────── Vectorised Helpers ───────────────────────────
 
-def period_to_datetime_vec(series):
+def period_to_datetime_vec(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
     year = (s // 100).astype("Int64"); month = (s % 100).astype("Int64")
     valid = month.between(1, 12) & year.notna()
-    next_month = (month + 1).where(valid); next_year = year.where(valid)
+    nm = (month + 1).where(valid); ny = year.where(valid)
     dec = month == 12
-    next_month = next_month.where(~dec, 1); next_year = next_year.where(~dec, year + 1)
+    nm = nm.where(~dec, 1); ny = ny.where(~dec, year + 1)
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
     vi = valid[valid].index
-    if len(vi) > 0:
-        ds = next_year.loc[vi].astype(str) + "-" + next_month.loc[vi].astype(str).str.zfill(2) + "-01"
+    if len(vi):
+        ds = ny.loc[vi].astype(str) + "-" + nm.loc[vi].astype(str).str.zfill(2) + "-01"
         result.loc[vi] = pd.to_datetime(ds, errors="coerce") - pd.Timedelta(days=1)
     return result
 
 
-def parse_amount_vec(series):
+def parse_amount_vec(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
     s = s.str.replace(r'[£$€¥,]', '', regex=True)
     s = s.str.replace(r'^(GBP|USD|EUR|JPY|CHF|AUD|CAD)\s*', '', regex=True, case=False).str.strip()
@@ -244,19 +187,32 @@ def parse_amount_vec(series):
     return r
 
 
-def parse_age_days_vec(series):
+def parse_age_days_vec(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
     r = pd.to_numeric(s.str.extract(r'^[~]?(-?\d+)', expand=False), errors="coerce")
     r[series.isna() | s.isin(['','N/A','n/a','-','nan','None'])] = np.nan
     return r
 
 
-def age_to_bucket_vec(age_series):
+def age_to_bucket_vec(age_series: pd.Series) -> pd.Categorical:
     a = age_series.values
     cond = [pd.isna(age_series), a<=15, a<=30, a<=60, a<=90, a<=180, a<=365]
-    choices = ["Unknown","0-15","16-30","31-60","61-90","91-180","181-365"]
-    return pd.Categorical(np.select(cond, choices, default="365+"),
+    ch = ["Unknown","0-15","16-30","31-60","61-90","91-180","181-365"]
+    return pd.Categorical(np.select(cond, ch, default="365+"),
                           categories=BUCKET_ORDER, ordered=True)
+
+
+def detect_outliers_iqr(series: pd.Series, name: str) -> pd.DataFrame:
+    clean = series.dropna()
+    if len(clean) < 10: return pd.DataFrame()
+    q1, q3 = clean.quantile(0.25), clean.quantile(0.75)
+    iqr = q3 - q1; lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
+    out = clean[(clean < lo) | (clean > hi)]
+    if len(out) == 0: return pd.DataFrame()
+    return pd.DataFrame({"Column":[name],"Outlier Count":[len(out)],
+        "Outlier %":[round(len(out)/len(clean)*100,2)],
+        "IQR Lower":[round(lo,2)],"IQR Upper":[round(hi,2)],
+        "Min Outlier":[round(out.min(),2)],"Max Outlier":[round(out.max(),2)]})
 
 
 # ─────────────────────────── Column Mapping ───────────────────────────
@@ -282,22 +238,42 @@ def build_col_map(cols):
     return {e: m for e in EXPECTED_COLUMNS if (m := fuzzy_col_match(cols, e))}
 
 
-# ─────────────────────────── Load Parquet ───────────────────────────
+# ─────────────────────────── File Loading ───────────────────────────
 
-@st.cache_data(show_spinner="Loading file...")
-def load_parquet(parquet_bytes: bytes) -> pd.DataFrame:
-    return pd.read_parquet(BytesIO(parquet_bytes))
+@st.cache_data(show_spinner="Reading file... (cached after first load — instant on reruns)")
+def load_raw_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Load CSV / Excel / Parquet into Pandas.
+    Cached by file_bytes content — instant on every rerun after first load.
+    xlsx ~4-6s first time (calamine), then instant.
+    """
+    buf  = BytesIO(file_bytes)
+    name = filename.lower()
+    if name.endswith(".parquet"):
+        return pd.read_parquet(buf)
+    if name.endswith(".csv"):
+        return pd.read_csv(buf, low_memory=False)
+    # Excel — calamine (Rust, faster) with openpyxl fallback
+    try:
+        import polars as pl
+        return pl.read_excel(buf, engine="calamine").to_pandas()
+    except Exception:
+        buf.seek(0)
+        return pd.read_excel(buf, engine="openpyxl")
 
 
 # ─────────────────────────── Clean & Process ───────────────────────────
 
 @st.cache_data(show_spinner="Cleaning & processing data...")
-def clean_dataframe(parquet_bytes: bytes):
-    df      = load_parquet(parquet_bytes)
+def clean_dataframe(file_bytes: bytes, filename: str):
+    """
+    Full vectorised cleaning pipeline. Cached by (file_bytes, filename).
+    Returns: df, col_map, filter_options, violations_df
+    """
+    df      = load_raw_file(file_bytes, filename)
     col_map = build_col_map(df.columns.tolist())
     violations = []
 
-    # ── Amount columns ──
     for key in ["BREAK AMOUNT CCY","BREAK AMOUNT GBP","ABS GBP"]:
         if key in col_map and col_map[key] in df.columns:
             col = col_map[key]; orig = df[col].copy()
@@ -308,7 +284,6 @@ def clean_dataframe(parquet_bytes: bytes):
                     "Violation Count":int(bad.sum()),
                     "Sample Values":", ".join(orig[bad].head(3).astype(str))})
 
-    # ── Age Days ──
     if "Age Days" in col_map and col_map["Age Days"] in df.columns:
         col = col_map["Age Days"]; orig = df[col].copy()
         df[col] = parse_age_days_vec(df[col])
@@ -318,17 +293,14 @@ def clean_dataframe(parquet_bytes: bytes):
                 "Violation Count":int(bad.sum()),
                 "Sample Values":", ".join(orig[bad].head(3).astype(str))})
 
-    # ── Date ──
     if "Date" in col_map and col_map["Date"] in df.columns:
         df[col_map["Date"]] = pd.to_datetime(df[col_map["Date"]], errors="coerce")
 
-    # ── Period ──
     if "Period" in col_map and col_map["Period"] in df.columns:
         col = col_map["Period"]
         df["_Period_date"]  = period_to_datetime_vec(df[col])
         df["_Period_label"] = df["_Period_date"].dt.strftime("%Y-%m").fillna(df[col].astype(str))
 
-    # ── Ageing computed columns ──
     if "Date" in col_map and "_Period_date" in df.columns:
         date_col = col_map["Date"]
         df["_Computed_Age_Days"] = (df["_Period_date"] - df[date_col]).dt.days
@@ -338,10 +310,13 @@ def clean_dataframe(parquet_bytes: bytes):
                 df[col_map["Age Days"]].fillna(-999),
                 df["_Computed_Age_Days"].fillna(-998), atol=1)
         if "Bucket" in col_map:
-            df["_Bucket_Match"] = (df[col_map["Bucket"]].astype(str).str.strip() ==
-                                   df["_Computed_Bucket"].astype(str).str.strip())
+            df["_Bucket_Match"] = (
+                df[col_map["Bucket"]].astype(str).str.strip() ==
+                df["_Computed_Bucket"].astype(str).str.strip())
 
-    # ── Filter options ──
+    # False Positive column — initialised as False, user can toggle in UI
+    df["_False_Positive"] = False
+
     filter_options = {}
     for key in ["Period","Team","Rec Name (as per Rec Cube)","Entity",
                 "Asset Class","Type of break","True/Systemic Breaks"]:
@@ -356,87 +331,118 @@ def clean_dataframe(parquet_bytes: bytes):
 
 # ─────────────────────────── Global Filters via DuckDB ───────────────────────────
 
-def apply_global_filters(df: pd.DataFrame, col_map: dict, filter_options: dict) -> pd.DataFrame:
+def apply_global_filters(df: pd.DataFrame, col_map: dict,
+                         filter_options: dict) -> pd.DataFrame:
     """
-    Sidebar filter UI → build a single DuckDB WHERE clause → execute once.
-    DuckDB C++ filter evaluation is 5-10x faster than pandas boolean mask
-    on 600K rows when multiple filter columns are active simultaneously.
+    Single DuckDB WHERE clause from all sidebar filter selections.
+    5-10x faster than chained Pandas boolean masks on 600K rows.
     """
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🔍 Global Filters")
 
     selections = {}
     for key, label, wkey in [
-        ("Period",                      "Period",        "f_period"),
-        ("Team",                        "Team",          "f_team"),
-        ("Rec Name (as per Rec Cube)",  "Rec Name",      "f_rec"),
-        ("Entity",                      "Entity",        "f_entity"),
-        ("Asset Class",                 "Asset Class",   "f_ac"),
-        ("Type of break",               "Type of Break", "f_tob"),
-        ("True/Systemic Breaks",        "True/Systemic", "f_ts"),
+        ("Period",                     "Period",        "f_period"),
+        ("Team",                       "Team",          "f_team"),
+        ("Rec Name (as per Rec Cube)", "Rec Name",      "f_rec"),
+        ("Entity",                     "Entity",        "f_entity"),
+        ("Asset Class",                "Asset Class",   "f_ac"),
+        ("Type of break",              "Type of Break", "f_tob"),
+        ("True/Systemic Breaks",       "True/Systemic", "f_ts"),
     ]:
         if key not in filter_options: continue
         opts = filter_options[key]
         sel  = st.sidebar.multiselect(label, opts, default=opts, key=wkey)
-        if sel and len(sel) < len(opts):   # only add if not "all selected"
+        if sel and len(sel) < len(opts):
             selections[key] = sel
 
-    if not selections:
-        return df   # nothing filtered — return full df instantly
+    # ABS GBP threshold — applied globally across all tabs
+    abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    abs_threshold = 0.0
+    if abs_col and abs_col in df.columns:
+        max_val = float(df[abs_col].abs().max() or 1_000_000)
+        abs_threshold = st.sidebar.number_input(
+            "Min ABS GBP Threshold (£)",
+            min_value=0.0, max_value=float(min(max_val, 100_000_000)),
+            value=0.0, step=1000.0, format="%.0f", key="f_abs_threshold",
+        )
+        if abs_threshold > 0:
+            selections["_ABS_THRESHOLD"] = (abs_col, abs_threshold)
 
-    # ── Build WHERE clause — DuckDB handles all filter logic in C++ ──
+    # Exclude False Positives toggle
+    exclude_fp = st.sidebar.checkbox(
+        "Exclude False Positives", value=False, key="f_excl_fp",
+        help="Exclude records flagged as False Positive from all views"
+    )
+
+    if not selections and not exclude_fp:
+        return df
+
     where_parts = []
     for key, vals in selections.items():
-        col = col_map[key]
-        # Escape single quotes in values
-        escaped = [str(v).replace("'", "''") for v in vals]
-        in_list = ", ".join(f"'{v}'" for v in escaped)
-        where_parts.append(f'"{col}" IN ({in_list})')
+        if key == "_ABS_THRESHOLD":
+            col_name, thresh = vals
+            where_parts.append(f'ABS("{col_name}") >= {thresh}')
+        else:
+            col = col_map[key]
+            escaped = [str(v).replace("'", "''") for v in vals]
+            in_list = ", ".join(f"'{v}'" for v in escaped)
+            where_parts.append(f'"{col}" IN ({in_list})')
 
-    where_sql = " AND ".join(where_parts)
-    sql = f"SELECT * FROM tbl WHERE {where_sql}"
+    if exclude_fp:
+        where_parts.append('_False_Positive = false')
 
+    sql = f"SELECT * FROM tbl WHERE {' AND '.join(where_parts)}"
     return dq(sql, df)
 
 
-# ─────────────────────────── Outlier Detection ───────────────────────────
+# ─────────────────────────── Rolling Average Helper ───────────────────────────
 
-def detect_outliers_iqr(series, name="Column"):
-    clean = series.dropna()
-    if len(clean) < 10: return pd.DataFrame()
-    q1, q3 = clean.quantile(0.25), clean.quantile(0.75)
-    iqr = q3 - q1; lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
-    out = clean[(clean < lo) | (clean > hi)]
-    if len(out) == 0: return pd.DataFrame()
-    return pd.DataFrame({"Column":[name],"Outlier Count":[len(out)],
-        "Outlier %":[round(len(out)/len(clean)*100,2)],
-        "IQR Lower":[round(lo,2)],"IQR Upper":[round(hi,2)],
-        "Min Outlier":[round(out.min(),2)],"Max Outlier":[round(out.max(),2)]})
+def add_rolling_avg(fig, x, y, window=3, name="Rolling Avg", color=None):
+    """Add a rolling average line to expose the underlying trend."""
+    if len(x) < window:
+        return fig
+    s = pd.Series(y.values if hasattr(y, 'values') else y)
+    rolled = s.rolling(window, min_periods=1).mean().round(1)
+    fig.add_trace(go.Scatter(
+        x=x, y=rolled, name=f"{name} ({window}p)",
+        mode="lines",
+        line=dict(color=color or COLORS[7], width=2.5, dash="dot"),
+    ))
+    return fig
 
 
 # ─────────────────────────── Tab 1: Data Quality ───────────────────────────
 
 def tab_data_quality(df: pd.DataFrame, col_map: dict, violations_df: pd.DataFrame,
-                     parquet_bytes: bytes):
+                     file_bytes: bytes, filename: str):
     st.markdown("## Data Quality & Ingestion Scorecard")
 
-    n_rows = len(df); n_cols = len(df.columns)
-    total_cells = n_rows * n_cols
-    completeness = round(df.notna().sum().sum() / total_cells * 100, 1) if total_cells else 0
+    # ── Violations banner — prominent ──
     vcount = int(violations_df["Violation Count"].sum()) if len(violations_df) else 0
+    if vcount > 0:
+        st.markdown(
+            f'<div class="violation-banner">⚠️ {format_number(vcount)} type violations detected '
+            f'across {len(violations_df)} column(s). Review below.</div>',
+            unsafe_allow_html=True,
+        )
+
+    n_rows = len(df); n_cols = len(df.columns)
+    cells  = n_rows * n_cols
+    completeness = round(df.notna().sum().sum() / cells * 100, 1) if cells else 0
 
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi_card("Total Records",   format_number(n_rows))
     with c2: kpi_card("Columns",         str(n_cols))
     with c3: kpi_card("Completeness",    f"{completeness}%")
-    with c4: kpi_card("Type Violations", format_number(vcount), invert=True)
+    with c4: kpi_card("Type Violations", format_number(vcount),
+                      warn=(vcount > 0), invert=True)
 
     st.markdown("---")
     cl, cr = st.columns(2)
 
     with cl:
         st.markdown("### Column Completeness")
-        # DuckDB computes per-column completeness in one SQL pass — faster than pandas loop
         exprs = ", ".join(
             f'ROUND(100.0 * COUNT("{c}") / COUNT(*), 1) AS "{c}"'
             for c in df.columns
@@ -452,11 +458,11 @@ def tab_data_quality(df: pd.DataFrame, col_map: dict, violations_df: pd.DataFram
         st.plotly_chart(fig, use_container_width=True)
 
     with cr:
-        st.markdown("### Type Violation Details")
+        st.markdown("### ⚠️ Type Violation Details")
         if len(violations_df):
-            render_aggrid(violations_df, height=200, key="tv_grid")
+            render_aggrid(violations_df, height=220, key="tv_grid")
         else:
-            st.success("No type violations detected.")
+            st.success("✅ No type violations detected.")
 
         st.markdown("### Outlier Detection (IQR)")
         out_frames = []
@@ -474,27 +480,24 @@ def tab_data_quality(df: pd.DataFrame, col_map: dict, violations_df: pd.DataFram
     st.markdown("### Numeric Summary Statistics")
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if num_cols:
-        render_aggrid(df[num_cols].describe().T.round(2).reset_index(), height=300, key="sum_grid")
+        render_aggrid(
+            df[num_cols].describe().T.round(2).reset_index().rename(columns={"index":"Column"}),
+            height=300, key="sum_grid")
     else:
         st.info("No numeric columns found.")
 
     st.markdown("---")
-    dl1, dl2, dl3 = st.columns(3)
+    buf = BytesIO(); df.to_parquet(buf, index=False, compression="zstd")
+    dl1, dl2 = st.columns(2)
     with dl1:
         st.download_button("📥 Download Cleaned CSV",
             df.to_csv(index=False).encode("utf-8"),
             file_name="cleaned_data.csv", mime="text/csv")
     with dl2:
-        st.download_button("⚡ Download Raw Parquet",
-            parquet_bytes, file_name="data.parquet",
-            mime="application/octet-stream",
-            help="Upload this next time for ~0.2s load")
-    with dl3:
-        buf = BytesIO(); df.to_parquet(buf, index=False, compression="zstd")
-        st.download_button("⚡ Download Cleaned Parquet",
+        st.download_button("⚡ Download Cleaned Parquet (fast future uploads)",
             buf.getvalue(), file_name="cleaned_data.parquet",
             mime="application/octet-stream",
-            help="Cleaned version with all computed columns")
+            help="Upload this .parquet next time — loads in ~0.2s")
 
 
 # ─────────────────────────── Tab 2: Ageing Validation ───────────────────────────
@@ -507,45 +510,60 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
     team_col   = col_map.get("Team")
     rec_col    = col_map.get("Rec Name (as per Rec Cube)")
 
-    if not all(c in df.columns for c in ["_Computed_Age_Days","_Computed_Bucket",
-                                          "_Age_Match","_Bucket_Match"]):
+    if not all(c in df.columns for c in
+               ["_Computed_Age_Days","_Computed_Bucket","_Age_Match","_Bucket_Match"]):
         st.warning("Period and Date columns required for ageing validation.")
         return
 
-    # ── KPIs via DuckDB (single SQL pass) ──
     kpi = dq(f"""
         SELECT
             COUNT(*) FILTER (WHERE _Computed_Age_Days IS NOT NULL
-                             AND "{age_col}" IS NOT NULL)          AS total_valid,
+                             AND "{age_col}" IS NOT NULL)        AS total_valid,
             COUNT(*) FILTER (WHERE _Age_Match=false
-                             AND _Computed_Age_Days IS NOT NULL)   AS age_mis,
+                             AND _Computed_Age_Days IS NOT NULL) AS age_mis,
             COUNT(*) FILTER (WHERE _Bucket_Match=false
-                             AND _Computed_Age_Days IS NOT NULL)   AS bucket_mis
+                             AND _Computed_Age_Days IS NOT NULL) AS bucket_mis
         FROM tbl
     """, df).iloc[0]
 
-    total_valid     = int(kpi["total_valid"])
-    age_mis         = int(kpi["age_mis"])
-    bucket_mis      = int(kpi["bucket_mis"])
-    age_pct         = round(age_mis    / total_valid * 100, 1) if total_valid else 0
-    bucket_pct      = round(bucket_mis / total_valid * 100, 1) if total_valid else 0
+    total_valid = int(kpi["total_valid"])
+    age_mis     = int(kpi["age_mis"])
+    bucket_mis  = int(kpi["bucket_mis"])
+    age_pct     = round(age_mis    / total_valid * 100, 1) if total_valid else 0
+    bucket_pct  = round(bucket_mis / total_valid * 100, 1) if total_valid else 0
 
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi_card("Records Validated",    format_number(total_valid))
-    with c2: kpi_card("Age Discrepancies",    f"{format_number(age_mis)} ({age_pct}%)",    invert=True)
-    with c3: kpi_card("Bucket Discrepancies", f"{format_number(bucket_mis)} ({bucket_pct}%)", invert=True)
+    with c2: kpi_card("Age Discrepancies",    f"{format_number(age_mis)} ({age_pct}%)",
+                      warn=(age_pct > 5), invert=True)
+    with c3: kpi_card("Bucket Discrepancies", f"{format_number(bucket_mis)} ({bucket_pct}%)",
+                      warn=(bucket_pct > 5), invert=True)
     with c4: kpi_card("Accuracy Rate",        f"{round(100-max(age_pct,bucket_pct),1)}%")
 
+    # ── False Positive Flagging ──
     st.markdown("---")
-    st.markdown("### Discrepancy Records (max 500)")
-
-    sel_cols = ", ".join(
-        f'"{col_map[k]}"' for k in ["Period","Team","Rec Name (as per Rec Cube)","Entity","Date"]
-        if k in col_map and col_map[k] in df.columns
+    st.markdown("### Discrepancy Records — Flag False Positives")
+    st.markdown(
+        '<div class="fp-banner">💡 <b>False Positive Flagging:</b> Mark records below as '
+        'false positives to exclude them from the outstanding break count. '
+        'Use the <i>Exclude False Positives</i> toggle in the sidebar to apply globally.</div>',
+        unsafe_allow_html=True,
     )
+
+    sel_cols_list = [col_map[k] for k in
+        ["Period","Team","Rec Name (as per Rec Cube)","Entity","Date"]
+        if k in col_map and col_map[k] in df.columns]
+    sel_cols_sql = ", ".join(f'"{c}"' for c in sel_cols_list)
+
     disc_df = dq(f"""
-        SELECT {sel_cols}, "{age_col}", _Computed_Age_Days,
-               "{bucket_col}", _Computed_Bucket, _Age_Match, _Bucket_Match
+        SELECT {sel_cols_sql},
+               "{age_col}"        AS "Age Days (Source)",
+               _Computed_Age_Days AS "Age Days (Computed)",
+               "{bucket_col}"     AS "Bucket (Source)",
+               _Computed_Bucket   AS "Bucket (Computed)",
+               _Age_Match         AS "Age Match",
+               _Bucket_Match      AS "Bucket Match",
+               _False_Positive    AS "False Positive"
         FROM tbl
         WHERE (_Age_Match=false OR _Bucket_Match=false)
           AND _Computed_Age_Days IS NOT NULL
@@ -554,30 +572,42 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
     """, df)
 
     if len(disc_df) > 0:
-        if HAS_AGGRID:
-            gb = GridOptionsBuilder.from_dataframe(disc_df)
-            gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-            gb.configure_default_column(filterable=True, sortable=True, resizable=True)
-            cs = JsCode("""function(p){
-                if(p.value===false||p.value==='False')
-                    return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
-                if(p.value===true||p.value==='True')
-                    return {'backgroundColor':'#E8F5E9','color':'#01696F'};
-                return {};}""")
-            for c in disc_df.columns:
-                if "Match" in c: gb.configure_column(c, cellStyle=cs)
-            AgGrid(disc_df, gridOptions=gb.build(), height=400,
-                   theme="streamlit", allow_unsafe_jscode=True, key="disc_grid")
-        else:
-            st.dataframe(disc_df, height=400, use_container_width=True)
+        # Allow user to mark False Positives via editable checkbox column
+        fp_edited = st.data_editor(
+            disc_df,
+            column_config={
+                "False Positive": st.column_config.CheckboxColumn(
+                    "False Positive?",
+                    help="Check to mark as false positive — excluded from outstanding count",
+                    default=False,
+                ),
+                "Age Match":    st.column_config.CheckboxColumn("Age Match"),
+                "Bucket Match": st.column_config.CheckboxColumn("Bucket Match"),
+            },
+            use_container_width=True,
+            height=420,
+            num_rows="fixed",
+            key="fp_editor",
+        )
+
+        fp_count = int(fp_edited["False Positive"].sum())
+        net_outstanding = len(disc_df) - fp_count
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1: kpi_card("Total Discrepancies",  format_number(len(disc_df)))
+        with fc2: kpi_card("Flagged False Positive", format_number(fp_count))
+        with fc3: kpi_card("Net Outstanding",       format_number(net_outstanding),
+                           warn=(net_outstanding > 0))
+
+        if fp_count > 0:
+            st.info(f"ℹ️ {fp_count} record(s) flagged as False Positive. "
+                    "Enable 'Exclude False Positives' in sidebar to remove them from all views.")
     else:
-        st.success("No discrepancies found!")
+        st.success("✅ No discrepancies found!")
 
     st.markdown("---")
     cl, cr = st.columns(2)
 
     with cl:
-        # Age Days distribution — DuckDB bins for histogram data
         hist = dq(f"""
             SELECT "{age_col}" AS prepop, _Computed_Age_Days AS computed
             FROM tbl WHERE _Computed_Age_Days IS NOT NULL AND "{age_col}" IS NOT NULL
@@ -592,8 +622,7 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
         st.plotly_chart(fig, use_container_width=True)
 
     with cr:
-        # Bucket comparison — DuckDB GROUP BY
-        bkt = dq(f"""
+        bkt = dq("""
             SELECT _Computed_Bucket AS bucket, COUNT(*) AS computed FROM tbl
             WHERE _Computed_Age_Days IS NOT NULL GROUP BY _Computed_Bucket
         """, df)
@@ -602,7 +631,8 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
             GROUP BY "{bucket_col}"
         """, df)
         merged = bkt.merge(pre, on="bucket", how="outer").fillna(0)
-        merged["bucket"] = pd.Categorical(merged["bucket"], categories=BUCKET_ORDER, ordered=True)
+        merged["bucket"] = pd.Categorical(merged["bucket"],
+                           categories=BUCKET_ORDER, ordered=True)
         merged = merged.sort_values("bucket")
         fig = go.Figure()
         fig.add_trace(go.Bar(x=merged["bucket"], y=merged["prepop"],
@@ -613,7 +643,6 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
         fig = chart_layout(fig,"Bucket Distribution: Computed vs Pre-populated","Bucket","Count")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Discrepancy rate by Team — DuckDB aggregation
     if team_col and team_col in df.columns:
         st.markdown("### Discrepancy Rate by Team")
         td = dq(f"""
@@ -621,6 +650,7 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
                    COUNT(*) FILTER (WHERE _Age_Match=false)    AS age_mis,
                    COUNT(*) FILTER (WHERE _Bucket_Match=false) AS bkt_mis
             FROM tbl WHERE _Computed_Age_Days IS NOT NULL GROUP BY "{team_col}"
+            ORDER BY total DESC
         """, df)
         td["Age Disc %"]    = (td["age_mis"] / td["total"] * 100).round(1)
         td["Bucket Disc %"] = (td["bkt_mis"] / td["total"] * 100).round(1)
@@ -633,7 +663,6 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
         fig = chart_layout(fig,"Discrepancy Rate by Team (%)","Team","Discrepancy %")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Discrepancy rate by Rec Name — DuckDB aggregation
     if rec_col and rec_col in df.columns:
         st.markdown("### Discrepancy Rate by Rec Name")
         rd = dq(f"""
@@ -654,8 +683,7 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
     st.markdown("## Trend Analysis: Break Ageing")
 
     if "_Period_label" not in df.columns:
-        st.info("Period column not available.")
-        return
+        st.info("Period column not available."); return
 
     period_order = sorted(df["_Period_label"].dropna().unique().tolist())
 
@@ -669,12 +697,13 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
             GROUP BY _Period_label ORDER BY _Period_label
         """, df)
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=tr["period"],y=tr["mean_age"],
-                             name="Mean",marker_color=COLORS[0],opacity=0.8))
-        fig.add_trace(go.Scatter(x=tr["period"],y=tr["median_age"],
-                                 name="Median",line=dict(color=COLORS[4],width=2.5),
-                                 mode="lines+markers"))
-        fig = chart_layout(fig,"Average Age Days Trend by Period","Period","Days")
+        fig.add_trace(go.Bar(x=tr["period"], y=tr["mean_age"],
+                             name="Mean Age Days", marker_color=COLORS[0], opacity=0.7))
+        fig.add_trace(go.Scatter(x=tr["period"], y=tr["median_age"], name="Median",
+                                 line=dict(color=COLORS[4], width=2), mode="lines+markers"))
+        fig = add_rolling_avg(fig, tr["period"], tr["mean_age"],
+                              name="Mean Rolling Avg", color=COLORS[7])
+        fig = chart_layout(fig,"Average Age Days Trend by Period (with Rolling Avg)","Period","Days")
         st.plotly_chart(fig, use_container_width=True)
 
     with ct2:
@@ -704,9 +733,11 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
             mode="lines+markers+text",
             text=p90["p90"].round(0).astype(int).astype(str),
             textposition="top center",
-            line=dict(color=COLORS[4],width=2.5),
-            marker=dict(size=8,color=COLORS[4]), name="P90",
+            line=dict(color=COLORS[4], width=2.5),
+            marker=dict(size=8, color=COLORS[4]), name="P90",
         ))
+        fig = add_rolling_avg(fig, p90["period"], p90["p90"],
+                              name="P90 Rolling Avg", color=COLORS[7])
         fig = chart_layout(fig,"90th Percentile Age Days Trend","Period","Days")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -718,12 +749,12 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
                 FROM tbl WHERE _Computed_Age_Days IS NOT NULL
                 GROUP BY "{team_col}", _Period_label
             """, df)
-            pivot = heat.pivot_table(index="team",columns="period",
-                                     values="avg_age",fill_value=0)
+            pivot = heat.pivot_table(index="team", columns="period",
+                                     values="avg_age", fill_value=0)
             pivot = pivot.reindex(columns=sorted(pivot.columns))
             fig = px.imshow(pivot.round(0),
                             color_continuous_scale=["#E8F5E9","#FFC553","#A84B2F"],
-                            aspect="auto",text_auto=".0f")
+                            aspect="auto", text_auto=".0f")
             fig = chart_layout(fig,"Heatmap: Avg Age Days by Team × Period","","",height=350)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -739,12 +770,12 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
         risk[">90 %"]  = (risk["over90"]  / risk["total"] * 100).round(1)
         risk[">365 %"] = (risk["over365"] / risk["total"] * 100).round(1)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=risk["period"],y=risk[">90 %"],name="> 90 Days",
-                                 mode="lines+markers",line=dict(color=COLORS[4],width=2),
-                                 fill="tozeroy",fillcolor="rgba(168,75,47,0.15)"))
-        fig.add_trace(go.Scatter(x=risk["period"],y=risk[">365 %"],name="> 365 Days",
-                                 mode="lines+markers",line=dict(color=COLORS[7],width=2),
-                                 fill="tozeroy",fillcolor="rgba(148,68,84,0.15)"))
+        fig.add_trace(go.Scatter(x=risk["period"], y=risk[">90 %"], name="> 90 Days",
+                                 mode="lines+markers", line=dict(color=COLORS[4], width=2),
+                                 fill="tozeroy", fillcolor="rgba(168,75,47,0.15)"))
+        fig.add_trace(go.Scatter(x=risk["period"], y=risk[">365 %"], name="> 365 Days",
+                                 mode="lines+markers", line=dict(color=COLORS[7], width=2),
+                                 fill="tozeroy", fillcolor="rgba(148,68,84,0.15)"))
         fig = chart_layout(fig,"High-Risk Ageing Proportion Over Time","Period","% of Breaks")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -754,9 +785,9 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
             FROM tbl WHERE _Computed_Age_Days IS NOT NULL
             GROUP BY _Period_label, _Computed_Bucket ORDER BY _Period_label
         """, df)
-        mom_pivot  = mom_raw.pivot_table(index="period",columns="bucket",
-                                          values="cnt",fill_value=0)
-        mom_pivot  = mom_pivot.reindex(columns=BUCKET_ORDER,fill_value=0).reindex(period_order)
+        mom_pivot  = mom_raw.pivot_table(index="period", columns="bucket",
+                                          values="cnt", fill_value=0)
+        mom_pivot  = mom_pivot.reindex(columns=BUCKET_ORDER, fill_value=0).reindex(period_order)
         mom_change = mom_pivot.pct_change().mul(100).round(1)
         if len(mom_change.dropna()) > 0:
             fig = go.Figure()
@@ -765,9 +796,9 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
                     fig.add_trace(go.Scatter(
                         x=mom_change.index, y=mom_change[b], name=b,
                         mode="lines+markers",
-                        line=dict(color=COLORS[i%len(COLORS)], width=1.5)
+                        line=dict(color=COLORS[i % len(COLORS)], width=1.5)
                     ))
-            fig.add_hline(y=0,line_dash="dash",line_color=MUTED,line_width=1)
+            fig.add_hline(y=0, line_dash="dash", line_color=MUTED, line_width=1)
             fig = chart_layout(fig,"MoM % Change in Break Count by Bucket","Period","MoM %")
             st.plotly_chart(fig, use_container_width=True)
 
@@ -790,33 +821,26 @@ def tab_break_counts(df: pd.DataFrame, col_map: dict):
     bucket_col = col_map.get("Bucket")
 
     if not period_col or period_col not in df.columns:
-        st.warning("Period column not found.")
-        return
+        st.warning("Period column not found."); return
 
     period_order = sorted(df["_Period_label"].dropna().unique().tolist())
     latest = period_order[-1] if period_order else "0"
     prev   = period_order[-2] if len(period_order) >= 2 else "0"
 
-    # ── KPIs — one DuckDB pass ──
-    kpi_sql = f"""
+    kpi = dq(f"""
         SELECT COUNT(*) AS total,
                COUNT(*) FILTER (WHERE _Period_label='{latest}') AS lat,
                COUNT(*) FILTER (WHERE _Period_label='{prev}')   AS prv,
-               COUNT(DISTINCT "{rec_col}") AS u_recs
+               {f'COUNT(DISTINCT "{rec_col}")' if rec_col else '0'} AS u_recs
         FROM tbl
-    """ if rec_col else f"""
-        SELECT COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE _Period_label='{latest}') AS lat,
-               COUNT(*) FILTER (WHERE _Period_label='{prev}')   AS prv,
-               0 AS u_recs FROM tbl
-    """
-    kpi = dq(kpi_sql, df).iloc[0]
-    mom = safe_mom_pct(int(kpi["lat"]), int(kpi["prv"]))
+    """, df).iloc[0]
 
+    mom = safe_mom_pct(int(kpi["lat"]), int(kpi["prv"]))
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi_card("Total Breaks",        format_number(kpi["total"]))
     with c2: kpi_card("Latest Period Count", format_number(kpi["lat"]),
-                      f"{'+'if mom and mom>0 else ''}{mom}% MoM" if mom else "N/A", invert=True)
+                      f"{'+'if mom and mom>0 else ''}{mom}% MoM" if mom else "N/A",
+                      invert=True, warn=(mom is not None and mom > 10))
     with c3: kpi_card("Avg Breaks/Period",   format_number(round(kpi["total"]/max(len(period_order),1),0)))
     with c4: kpi_card("Unique Recs",         format_number(kpi["u_recs"]))
 
@@ -824,58 +848,82 @@ def tab_break_counts(df: pd.DataFrame, col_map: dict):
     ca, cb = st.columns(2)
 
     with ca:
-        # Break count trend — DuckDB GROUP BY
-        p_df = dq("SELECT _Period_label AS period, COUNT(*) AS cnt FROM tbl GROUP BY _Period_label ORDER BY _Period_label", df)
-        fig  = go.Figure()
-        fig.add_trace(go.Bar(x=p_df["period"],y=p_df["cnt"],name="Count",
-                             marker_color=COLORS[0],opacity=0.8))
-        fig.add_trace(go.Scatter(x=p_df["period"],y=p_df["cnt"],name="Trend",
-                                 line=dict(color=COLORS[4],width=2),mode="lines+markers"))
-        fig = chart_layout(fig,"Break Count Trend by Period","Period","Count")
+        p_df = dq("""
+            SELECT _Period_label AS period, COUNT(*) AS cnt
+            FROM tbl GROUP BY _Period_label ORDER BY _Period_label
+        """, df)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=p_df["period"], y=p_df["cnt"], name="Count",
+                             marker_color=COLORS[0], opacity=0.7))
+        fig.add_trace(go.Scatter(x=p_df["period"], y=p_df["cnt"], name="Actual",
+                                 line=dict(color=COLORS[4], width=2), mode="lines+markers"))
+        fig = add_rolling_avg(fig, p_df["period"], p_df["cnt"],
+                              name="Trend (Rolling Avg)", color=COLORS[7])
+        fig = chart_layout(fig,"Break Count Trend by Period (with Rolling Avg)","Period","Count")
         st.plotly_chart(fig, use_container_width=True)
 
     with cb:
         if team_col and team_col in df.columns:
-            t_df = dq(f'SELECT "{team_col}" AS team, _Period_label AS period, COUNT(*) AS cnt FROM tbl GROUP BY "{team_col}", _Period_label ORDER BY _Period_label', df)
-            fig  = px.bar(t_df,x="period",y="cnt",color="team",
-                          color_discrete_sequence=COLORS,barmode="group")
-            fig  = chart_layout(fig,"Break Count by Team Over Periods","Period","Count")
+            t_df = dq(f"""
+                SELECT "{team_col}" AS team, _Period_label AS period, COUNT(*) AS cnt
+                FROM tbl GROUP BY "{team_col}", _Period_label ORDER BY _Period_label
+            """, df)
+            fig = px.bar(t_df, x="period", y="cnt", color="team",
+                         color_discrete_sequence=COLORS, barmode="group")
+            fig = chart_layout(fig,"Break Count by Team Over Periods","Period","Count")
             st.plotly_chart(fig, use_container_width=True)
 
     cc, cd = st.columns(2)
     with cc:
         if rec_col and rec_col in df.columns:
-            top10 = dq(f'SELECT "{rec_col}" AS rec FROM tbl GROUP BY "{rec_col}" ORDER BY COUNT(*) DESC LIMIT 10', df)["rec"].tolist()
-            top10_str = ",".join(f"'{str(r).replace(chr(39), chr(39)*2)}'" for r in top10)
-            r_df = dq(f'SELECT "{rec_col}" AS rec, _Period_label AS period, COUNT(*) AS cnt FROM tbl WHERE "{rec_col}" IN ({top10_str}) GROUP BY "{rec_col}", _Period_label ORDER BY _Period_label', df)
-            fig  = px.line(r_df,x="period",y="cnt",color="rec",
-                           color_discrete_sequence=COLORS,markers=True)
-            fig  = chart_layout(fig,"Top 10 Rec Names — Break Count","Period","Count")
+            top10 = dq(f"""
+                SELECT "{rec_col}" AS rec FROM tbl
+                GROUP BY "{rec_col}" ORDER BY COUNT(*) DESC LIMIT 10
+            """, df)["rec"].tolist()
+            t_str = ", ".join(f"'{str(r).replace(chr(39), chr(39)*2)}'" for r in top10)
+            r_df = dq(f"""
+                SELECT "{rec_col}" AS rec, _Period_label AS period, COUNT(*) AS cnt
+                FROM tbl WHERE "{rec_col}" IN ({t_str})
+                GROUP BY "{rec_col}", _Period_label ORDER BY _Period_label
+            """, df)
+            fig = px.line(r_df, x="period", y="cnt", color="rec",
+                          color_discrete_sequence=COLORS, markers=True)
+            fig = chart_layout(fig,"Top 10 Rec Names — Break Count Over Periods","Period","Count")
             st.plotly_chart(fig, use_container_width=True)
 
     with cd:
         if ts_col and ts_col in df.columns:
-            ts_df = dq(f'SELECT "{ts_col}" AS ts, _Period_label AS period, COUNT(*) AS cnt FROM tbl GROUP BY "{ts_col}", _Period_label ORDER BY _Period_label', df)
-            fig   = px.bar(ts_df,x="period",y="cnt",color="ts",
-                           color_discrete_sequence=COLORS,barmode="stack")
-            fig   = chart_layout(fig,"True vs Systemic Breaks Over Periods","Period","Count")
+            ts_df = dq(f"""
+                SELECT "{ts_col}" AS ts, _Period_label AS period, COUNT(*) AS cnt
+                FROM tbl GROUP BY "{ts_col}", _Period_label ORDER BY _Period_label
+            """, df)
+            fig = px.bar(ts_df, x="period", y="cnt", color="ts",
+                         color_discrete_sequence=COLORS, barmode="stack")
+            fig = chart_layout(fig,"True vs Systemic Breaks Over Periods","Period","Count")
             st.plotly_chart(fig, use_container_width=True)
 
     ce, cf = st.columns(2)
     with ce:
         if ac_col and ac_col in df.columns:
-            ac_df = dq(f'SELECT "{ac_col}" AS ac, _Period_label AS period, COUNT(*) AS cnt FROM tbl GROUP BY "{ac_col}", _Period_label ORDER BY _Period_label', df)
-            fig   = px.bar(ac_df,x="period",y="cnt",color="ac",
-                           color_discrete_sequence=COLORS,barmode="stack")
-            fig   = chart_layout(fig,"Break Count by Asset Class","Period","Count")
+            ac_df = dq(f"""
+                SELECT "{ac_col}" AS ac, _Period_label AS period, COUNT(*) AS cnt
+                FROM tbl GROUP BY "{ac_col}", _Period_label ORDER BY _Period_label
+            """, df)
+            fig = px.bar(ac_df, x="period", y="cnt", color="ac",
+                         color_discrete_sequence=COLORS, barmode="stack")
+            fig = chart_layout(fig,"Break Count by Asset Class","Period","Count")
             st.plotly_chart(fig, use_container_width=True)
 
     with cf:
         if bucket_col and bucket_col in df.columns:
-            bk_df = dq(f'SELECT "{bucket_col}" AS bucket, _Period_label AS period, COUNT(*) AS cnt FROM tbl GROUP BY "{bucket_col}", _Period_label ORDER BY _Period_label', df)
-            bk_df["bucket"] = pd.Categorical(bk_df["bucket"],categories=BUCKET_ORDER,ordered=True)
-            fig = px.bar(bk_df,x="period",y="cnt",color="bucket",
-                         color_discrete_sequence=COLORS,barmode="stack",
+            bk_df = dq(f"""
+                SELECT "{bucket_col}" AS bucket, _Period_label AS period, COUNT(*) AS cnt
+                FROM tbl GROUP BY "{bucket_col}", _Period_label ORDER BY _Period_label
+            """, df)
+            bk_df["bucket"] = pd.Categorical(bk_df["bucket"],
+                               categories=BUCKET_ORDER, ordered=True)
+            fig = px.bar(bk_df, x="period", y="cnt", color="bucket",
+                         color_discrete_sequence=COLORS, barmode="stack",
                          category_orders={"bucket":BUCKET_ORDER})
             fig = chart_layout(fig,"Break Bucket Distribution Over Periods","Period","Count")
             st.plotly_chart(fig, use_container_width=True)
@@ -900,36 +948,25 @@ def tab_amount_analysis(df: pd.DataFrame, col_map: dict):
     if not amount_col or amount_col not in df.columns:
         st.warning("No ABS GBP or BREAK AMOUNT GBP column found."); return
 
-    st.sidebar.markdown("---")
-    max_abs   = float(df[amount_col].abs().max() or 1_000_000)
-    threshold = st.sidebar.slider(
-        "Min ABS GBP Threshold", min_value=0.0,
-        max_value=float(min(max_abs,50_000_000)),
-        value=0.0, step=10_000.0, format="£%,.0f", key="abs_threshold",
-    )
-
-    # Apply threshold via DuckDB
-    amt_df = dq(f'SELECT * FROM tbl WHERE ABS("{amount_col}") >= {threshold}', df) \
-             if threshold > 0 else df
-
-    period_order = sorted(amt_df["_Period_label"].dropna().unique().tolist())
+    period_order = sorted(df["_Period_label"].dropna().unique().tolist())
     latest = period_order[-1] if period_order else "0"
     prev   = period_order[-2] if len(period_order) >= 2 else "0"
 
     kpi = dq(f"""
-        SELECT SUM(ABS("{amount_col}")) AS total_abs,
-               AVG(ABS("{amount_col}")) AS avg_abs,
-               MAX(ABS("{amount_col}")) AS max_abs,
-               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{latest}') AS lat_sum,
-               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{prev}')   AS prv_sum
+        SELECT SUM(ABS("{amount_col}"))                                            AS total_abs,
+               AVG(ABS("{amount_col}"))                                            AS avg_abs,
+               MAX(ABS("{amount_col}"))                                            AS max_abs,
+               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{latest}')   AS lat_sum,
+               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{prev}')     AS prv_sum
         FROM tbl
-    """, amt_df).iloc[0]
+    """, df).iloc[0]
 
     mom = safe_mom_pct(float(kpi["lat_sum"] or 0), float(kpi["prv_sum"] or 0))
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi_card("Total ABS GBP",    format_short(kpi["total_abs"]))
     with c2: kpi_card("Latest Period",     format_short(kpi["lat_sum"]),
-                      f"{'+'if mom and mom>0 else ''}{mom}% MoM" if mom else "N/A", invert=True)
+                      f"{'+'if mom and mom>0 else ''}{mom}% MoM" if mom else "N/A",
+                      invert=True, warn=(mom is not None and mom > 10))
     with c3: kpi_card("Avg Break Amount", format_short(kpi["avg_abs"]))
     with c4: kpi_card("Max Single Break", format_short(kpi["max_abs"]))
 
@@ -937,116 +974,305 @@ def tab_amount_analysis(df: pd.DataFrame, col_map: dict):
     ca, cb = st.columns(2)
 
     with ca:
-        p_df = dq(f'SELECT _Period_label AS period, SUM(ABS("{amount_col}")) AS total FROM tbl GROUP BY _Period_label ORDER BY _Period_label', amt_df)
+        p_df = dq(f"""
+            SELECT _Period_label AS period, SUM(ABS("{amount_col}")) AS total
+            FROM tbl GROUP BY _Period_label ORDER BY _Period_label
+        """, df)
         p_df["label"] = p_df["total"].apply(format_short)
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=p_df["period"],y=p_df["total"],name="Total ABS GBP",
-                             marker_color=COLORS[0],text=p_df["label"],textposition="outside"))
-        fig = chart_layout(fig,"Total ABS GBP by Period","Period","GBP (£)")
+        fig.add_trace(go.Bar(x=p_df["period"], y=p_df["total"], name="Total ABS GBP",
+                             marker_color=COLORS[0], opacity=0.7,
+                             text=p_df["label"], textposition="outside"))
+        fig.add_trace(go.Scatter(x=p_df["period"], y=p_df["total"], name="Actual",
+                                 mode="lines+markers", line=dict(color=COLORS[4], width=2)))
+        fig = add_rolling_avg(fig, p_df["period"], p_df["total"],
+                              name="Trend (Rolling Avg)", color=COLORS[7])
+        fig = chart_layout(fig,"Total ABS GBP by Period (with Rolling Avg)","Period","GBP (£)")
         st.plotly_chart(fig, use_container_width=True)
 
     with cb:
-        if team_col and team_col in amt_df.columns:
-            t_df = dq(f'SELECT "{team_col}" AS team, _Period_label AS period, SUM(ABS("{amount_col}")) AS total FROM tbl GROUP BY "{team_col}", _Period_label ORDER BY _Period_label', amt_df)
-            fig  = px.bar(t_df,x="period",y="total",color="team",
-                          color_discrete_sequence=COLORS,barmode="group")
-            fig  = chart_layout(fig,"ABS GBP by Team","Period","GBP (£)")
+        if team_col and team_col in df.columns:
+            t_df = dq(f"""
+                SELECT "{team_col}" AS team, _Period_label AS period,
+                       SUM(ABS("{amount_col}")) AS total
+                FROM tbl GROUP BY "{team_col}", _Period_label ORDER BY _Period_label
+            """, df)
+            fig = px.bar(t_df, x="period", y="total", color="team",
+                         color_discrete_sequence=COLORS, barmode="group")
+            fig = chart_layout(fig,"ABS GBP by Team Over Periods","Period","GBP (£)")
             st.plotly_chart(fig, use_container_width=True)
 
     cc, cd = st.columns(2)
     with cc:
-        if ts_col and ts_col in amt_df.columns:
-            ts_df = dq(f'SELECT "{ts_col}" AS ts, _Period_label AS period, SUM(ABS("{amount_col}")) AS total FROM tbl GROUP BY "{ts_col}", _Period_label ORDER BY _Period_label', amt_df)
-            fig   = px.bar(ts_df,x="period",y="total",color="ts",
-                           color_discrete_sequence=COLORS,barmode="stack")
-            fig   = chart_layout(fig,"ABS GBP: True vs Systemic","Period","GBP (£)")
+        if ts_col and ts_col in df.columns:
+            ts_df = dq(f"""
+                SELECT "{ts_col}" AS ts, _Period_label AS period,
+                       SUM(ABS("{amount_col}")) AS total
+                FROM tbl GROUP BY "{ts_col}", _Period_label ORDER BY _Period_label
+            """, df)
+            fig = px.bar(ts_df, x="period", y="total", color="ts",
+                         color_discrete_sequence=COLORS, barmode="stack")
+            fig = chart_layout(fig,"ABS GBP: True vs Systemic Over Periods","Period","GBP (£)")
             st.plotly_chart(fig, use_container_width=True)
 
     with cd:
-        if rec_col and rec_col in amt_df.columns:
-            r_df = dq(f'SELECT "{rec_col}" AS rec, SUM(ABS("{amount_col}")) AS total FROM tbl GROUP BY "{rec_col}" ORDER BY total DESC LIMIT 10', amt_df)
-            r_df = r_df.sort_values("total",ascending=True)
+        if rec_col and rec_col in df.columns:
+            r_df = dq(f"""
+                SELECT "{rec_col}" AS rec, SUM(ABS("{amount_col}")) AS total
+                FROM tbl GROUP BY "{rec_col}" ORDER BY total DESC LIMIT 10
+            """, df)
+            r_df = r_df.sort_values("total", ascending=True)
             r_df["label"] = r_df["total"].apply(format_short)
-            fig = px.bar(r_df,x="total",y="rec",orientation="h",
+            fig = px.bar(r_df, x="total", y="rec", orientation="h",
                          color_discrete_sequence=[COLORS[0]])
-            fig.update_traces(text=r_df["label"],textposition="outside")
+            fig.update_traces(text=r_df["label"], textposition="outside")
             fig = chart_layout(fig,"Top 10 Rec Names by ABS GBP","GBP (£)","",
-                               height=max(300,len(r_df)*30))
+                               height=max(300, len(r_df)*30))
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
-    dl_cols = [c for c in [period_col,team_col,rec_col,ts_col,amount_col]
-               if c and c in amt_df.columns]
+    dl_cols = [c for c in [period_col, team_col, rec_col, ts_col, amount_col]
+               if c and c in df.columns]
     st.download_button("📥 Download Amount Data (CSV)",
-        amt_df[dl_cols].to_csv(index=False).encode("utf-8"),
+        df[dl_cols].to_csv(index=False).encode("utf-8"),
         file_name="amount_analysis.csv", mime="text/csv")
+
+
+# ─────────────────────────── Tab 5: Root Cause / Driver Analysis ───────────────────────────
+
+def tab_root_cause(df: pd.DataFrame, col_map: dict):
+    """
+    Root Cause / Driver Analysis:
+    Which paths (dimensions) have most influenced break volumes or ageing?
+    Addresses notes requirement: 'Say which paths has influenced / decrease in break-it.'
+    """
+    st.markdown("## Root Cause & Driver Analysis")
+    st.markdown(
+        "Identify **which dimensions** (Team, Rec Name, Asset Class, Entity) "
+        "are driving the highest break volumes, worst ageing, and largest amounts."
+    )
+
+    period_col = col_map.get("Period")
+    team_col   = col_map.get("Team")
+    rec_col    = col_map.get("Rec Name (as per Rec Cube)")
+    ac_col     = col_map.get("Asset Class")
+    entity_col = col_map.get("Entity")
+    ts_col     = col_map.get("True/Systemic Breaks")
+    rc_col     = col_map.get("Root Cause identified")
+    abs_col    = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+
+    if not period_col or period_col not in df.columns:
+        st.warning("Period column not found."); return
+
+    period_order = sorted(df["_Period_label"].dropna().unique().tolist())
+
+    # ── Dimension selector ──
+    dim_options = {k: v for k, v in {
+        "Team": team_col, "Rec Name": rec_col,
+        "Asset Class": ac_col, "Entity": entity_col,
+        "True/Systemic": ts_col, "Root Cause": rc_col,
+    }.items() if v and v in df.columns}
+
+    if not dim_options:
+        st.info("No categorical dimension columns found for driver analysis."); return
+
+    selected_dim_label = st.selectbox("Select Dimension to Analyse", list(dim_options.keys()),
+                                       key="rc_dim")
+    dim_col = dim_options[selected_dim_label]
+
+    # ── Break Count Driver Table ──
+    st.markdown(f"### Break Count by {selected_dim_label}")
+
+    driver_sql = f"""
+        SELECT "{dim_col}" AS dimension,
+               COUNT(*) AS break_count,
+               {f'AVG(_Computed_Age_Days) AS avg_age_days,' if '_Computed_Age_Days' in df.columns else ''}
+               {f'MAX(_Computed_Age_Days) AS max_age_days,' if '_Computed_Age_Days' in df.columns else ''}
+               {f'SUM(ABS("{abs_col}")) AS total_abs_gbp,' if abs_col else ''}
+               COUNT(*) FILTER (WHERE _Computed_Age_Days > 90)  AS count_over_90d,
+               COUNT(*) FILTER (WHERE _Computed_Age_Days > 365) AS count_over_365d
+        FROM tbl
+        WHERE "{dim_col}" IS NOT NULL
+        GROUP BY "{dim_col}"
+        ORDER BY break_count DESC
+    """
+    driver_df = dq(driver_sql, df)
+
+    # Clean up column names
+    driver_df = driver_df.rename(columns={
+        "dimension": selected_dim_label,
+        "break_count": "Break Count",
+        "avg_age_days": "Avg Age Days",
+        "max_age_days": "Max Age Days",
+        "total_abs_gbp": "Total ABS GBP (£)",
+        "count_over_90d": "Count > 90 Days",
+        "count_over_365d": "Count > 365 Days",
+    })
+
+    if "Total ABS GBP (£)" in driver_df.columns:
+        driver_df["Total ABS GBP (£)"] = driver_df["Total ABS GBP (£)"].apply(format_short)
+    if "Avg Age Days" in driver_df.columns:
+        driver_df["Avg Age Days"] = driver_df["Avg Age Days"].round(1)
+
+    render_aggrid(driver_df, height=350, key="rc_driver_grid")
+
+    # ── Top 10 by Break Count ──
+    ra, rb = st.columns(2)
+    with ra:
+        top_df = dq(f"""
+            SELECT "{dim_col}" AS dim, COUNT(*) AS cnt
+            FROM tbl WHERE "{dim_col}" IS NOT NULL
+            GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 10
+        """, df).sort_values("cnt", ascending=True)
+        fig = px.bar(top_df, x="cnt", y="dim", orientation="h",
+                     color_discrete_sequence=[PRIMARY])
+        fig = chart_layout(fig,f"Top 10 {selected_dim_label} by Break Count","Count",
+                           height=max(300, len(top_df)*30))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with rb:
+        if "_Computed_Age_Days" in df.columns:
+            top_age = dq(f"""
+                SELECT "{dim_col}" AS dim, AVG(_Computed_Age_Days) AS avg_age
+                FROM tbl WHERE "{dim_col}" IS NOT NULL AND _Computed_Age_Days IS NOT NULL
+                GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 10
+            """, df).sort_values("avg_age", ascending=True)
+            fig = px.bar(top_age, x="avg_age", y="dim", orientation="h",
+                         color_discrete_sequence=[COLORS[4]])
+            fig = chart_layout(fig,f"Top 10 {selected_dim_label} by Avg Age Days","Avg Days",
+                               height=max(300, len(top_age)*30))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Period trend for selected dimension (top 5 values) ──
+    st.markdown(f"### {selected_dim_label} Break Count Trend Over Periods (Top 5)")
+    top5 = dq(f"""
+        SELECT "{dim_col}" AS dim FROM tbl
+        WHERE "{dim_col}" IS NOT NULL
+        GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
+    """, df)["dim"].tolist()
+    top5_str = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5)
+    trend_df = dq(f"""
+        SELECT "{dim_col}" AS dim, _Period_label AS period, COUNT(*) AS cnt
+        FROM tbl WHERE "{dim_col}" IN ({top5_str})
+        GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
+    """, df)
+    fig = px.line(trend_df, x="period", y="cnt", color="dim",
+                  color_discrete_sequence=COLORS, markers=True)
+    fig = chart_layout(fig, f"Top 5 {selected_dim_label} — Break Count Trend","Period","Count")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Root Cause breakdown (if column available) ──
+    if rc_col and rc_col in df.columns:
+        st.markdown("### Root Cause Distribution")
+        rc_data, rc_b = st.columns(2)
+        with rc_
+            rc_df = dq(f"""
+                SELECT "{rc_col}" AS root_cause, COUNT(*) AS cnt
+                FROM tbl WHERE "{rc_col}" IS NOT NULL
+                GROUP BY "{rc_col}" ORDER BY cnt DESC LIMIT 15
+            """, df)
+            fig = px.bar(rc_df.sort_values("cnt", ascending=True),
+                         x="cnt", y="root_cause", orientation="h",
+                         color_discrete_sequence=[COLORS[0]])
+            fig = chart_layout(fig,"Root Cause Identified — Break Count",
+                               "Count","",height=max(300, len(rc_df)*25))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with rc_b:
+            fig = px.pie(rc_df, values="cnt", names="root_cause",
+                         color_discrete_sequence=COLORS, hole=0.4)
+            fig = chart_layout(fig,"Root Cause Share","","",height=400)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── MoM Change by Dimension — which driver is declining/rising? ──
+    st.markdown(f"### MoM Change by {selected_dim_label} (Latest vs Previous Period)")
+    if len(period_order) >= 2:
+        mom_df = dq(f"""
+            SELECT "{dim_col}" AS dim,
+                   COUNT(*) FILTER (WHERE _Period_label='{latest if (latest:=period_order[-1]) else ""}')  AS lat,
+                   COUNT(*) FILTER (WHERE _Period_label='{prev if (prev:=period_order[-2]) else ""}')   AS prv
+            FROM tbl WHERE "{dim_col}" IS NOT NULL GROUP BY "{dim_col}"
+        """, df)
+        mom_df["MoM Δ"]   = mom_df["lat"] - mom_df["prv"]
+        mom_df["MoM Δ %"] = ((mom_df["lat"] - mom_df["prv"]) /
+                              mom_df["prv"].replace(0, np.nan) * 100).round(1)
+        mom_df = mom_df.sort_values("MoM Δ")
+
+        colors_mom = [COLORS[0] if v >= 0 else COLORS[4] for v in mom_df["MoM Δ"]]
+        fig = go.Figure(go.Bar(
+            x=mom_df["MoM Δ"], y=mom_df["dim"],
+            orientation="h", marker_color=colors_mom,
+            text=mom_df["MoM Δ"].apply(lambda x: f"+{x}" if x >= 0 else str(x)),
+            textposition="outside",
+        ))
+        fig.add_vline(x=0, line_dash="dash", line_color=MUTED, line_width=1)
+        fig = chart_layout(fig,
+            f"MoM Break Count Change by {selected_dim_label} ({prev} → {latest})",
+            "Change in Break Count","",
+            height=max(350, len(mom_df)*28))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("🟢 Teal = Increase (more breaks)  🔴 Red = Decrease (fewer breaks — improvement)")
 
 
 # ─────────────────────────── Main ───────────────────────────
 
 def main():
     st.sidebar.title("📊 Accounting Control AI")
-    st.sidebar.markdown("*Phase 1 — DuckDB Edition*")
+    st.sidebar.markdown("*Phase 1 — DuckDB + Vectorised*")
     st.sidebar.markdown("---")
 
     uploaded = st.sidebar.file_uploader(
         "Upload Data (CSV / Excel / Parquet)",
-        type=["csv","xlsx","xls","parquet"], key="uploader",
+        type=["csv","xlsx","xls","parquet"],
+        key="uploader",
     )
 
     if uploaded is None:
         st.markdown("## 👋 Welcome to Accounting Control AI Platform")
         st.info("Upload a **CSV**, **Excel**, or **Parquet** file to begin.")
         st.markdown("""
-        | Format | Load Speed (600K rows) |
-        |---|---|
-        | `.parquet` | ⚡ ~0.2s |
-        | `.csv`     | 🟢 ~1s   |
-        | `.xlsx` (calamine) | 🟡 ~4s |
-        | `.xlsx` (openpyxl) | 🔴 ~60s |
+        | Format | First Load | Reruns |
+        |---|---|---|
+        | `.parquet` | ⚡ ~0.2s | ⚡ Instant (cached) |
+        | `.csv`     | 🟢 ~1–2s  | ⚡ Instant (cached) |
+        | `.xlsx`    | 🟡 ~4–6s  | ⚡ Instant (cached) |
 
-        > Upload CSV/Excel once → app auto-converts to Parquet internally.
-        > Download `.parquet` from the **Data Quality** tab for instant future loads.
+        > After first load, **every rerun is instant** — `@st.cache_data` holds the DataFrame
+        > in memory for the session. Download the **Parquet** from the Data Quality tab
+        > for ~0.2s loads in future sessions.
         """)
         return
 
     file_bytes = uploaded.read()
     fname      = uploaded.name
 
-    # ── Auto-convert to Parquet ──
-    parquet_bytes, was_converted = get_parquet_bytes(file_bytes, fname)
+    df, col_map, filter_options, violations_df = clean_dataframe(file_bytes, fname)
 
-    if was_converted:
-        st.markdown(f"""
-        <div class="convert-banner">
-            ⚡ <b>{fname}</b> was auto-converted to Parquet for fast processing.
-            Download the <b>.parquet</b> file from the Data Quality tab to skip conversion next time.
-        </div>""", unsafe_allow_html=True)
-
-    # ── Clean & process ──
-    df, col_map, filter_options, violations_df = clean_dataframe(parquet_bytes)
-
+    vcount = int(violations_df["Violation Count"].sum()) if len(violations_df) else 0
     st.sidebar.markdown(f"""
     **File:** `{fname}`
     **Rows:** {len(df):,} &nbsp;|&nbsp; **Cols:** {len(df.columns)}
-    **Format:** {'Parquet (native)' if fname.endswith('.parquet') else 'Parquet (auto-converted)'}
     """)
+    if vcount > 0:
+        st.sidebar.markdown(
+            f'<span style="color:#A84B2F;font-weight:600">⚠️ {vcount} type violations</span>',
+            unsafe_allow_html=True)
 
-    # ── Global filters via DuckDB ──
     df_filtered = apply_global_filters(df, col_map, filter_options)
-
     st.sidebar.markdown(f"**Filtered Rows:** {len(df_filtered):,}")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🧹 Data Quality",
         "📅 Ageing Validation",
         "📈 Break Counts",
         "💷 Amount Analysis",
+        "🔍 Root Cause",
     ])
-    with tab1: tab_data_quality(df_filtered, col_map, violations_df, parquet_bytes)
+    with tab1: tab_data_quality(df_filtered, col_map, violations_df, file_bytes, fname)
     with tab2: tab_ageing_validation(df_filtered, col_map)
     with tab3: tab_break_counts(df_filtered, col_map)
     with tab4: tab_amount_analysis(df_filtered, col_map)
+    with tab5: tab_root_cause(df_filtered, col_map)
 
 
 if __name__ == "__main__":
