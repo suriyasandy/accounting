@@ -1,0 +1,187 @@
+# ─────────────────────────── Top Filter Bar (replaces sidebar filters) ───────────────────────────
+
+def render_top_filter_bar(df: pd.DataFrame, col_map: dict,
+                          filter_options: dict) -> pd.DataFrame:
+    """
+    Renders a collapsible top filter bar with Apply Filters button.
+    Filters are only applied when the user clicks Apply — not on every widget change.
+    Uses st.session_state to hold pending selections separately from applied selections.
+    """
+
+    # ── Init session state ──
+    if "applied_filters" not in st.session_state:
+        st.session_state["applied_filters"] = {}
+    if "filter_bar_open" not in st.session_state:
+        st.session_state["filter_bar_open"] = False
+
+    # ── Toggle button for filter bar ──
+    col_toggle, col_active, col_spacer = st.columns([1, 3, 8])
+    with col_toggle:
+        if st.button(
+            "🔽 Filters" if not st.session_state["filter_bar_open"] else "🔼 Filters",
+            key="toggle_filter_bar",
+            use_container_width=True,
+        ):
+            st.session_state["filter_bar_open"] = not st.session_state["filter_bar_open"]
+
+    # Show active filter summary chips when bar is collapsed
+    with col_active:
+        applied = st.session_state["applied_filters"]
+        if applied:
+            chips = []
+            for key, val in applied.items():
+                if key == "_ABS_THRESHOLD":
+                    chips.append(f"ABS GBP ≥ £{int(val[1]):,}")
+                elif key == "_EXCL_FP" and val:
+                    chips.append("Excl. False Positives")
+                else:
+                    chips.append(f"{key}: {len(val)} selected")
+            st.markdown(
+                " &nbsp;|&nbsp; ".join(
+                    f'<span style="background:#E0F2F1;color:#01696F;'
+                    f'padding:2px 8px;border-radius:12px;font-size:0.78rem;'
+                    f'font-weight:600">{c}</span>'
+                    for c in chips
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<span style="color:#7A7974;font-size:0.82rem">No filters active — '
+                'showing all data</span>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Expandable filter panel ──
+    if st.session_state["filter_bar_open"]:
+        with st.container():
+            st.markdown(
+                f"""
+                <div style="background:#F7F7F5;border:1px solid #E0E0E0;
+                            border-radius:8px;padding:16px 20px 8px 20px;
+                            margin-bottom:12px;">
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # ── Row 1: Categorical filters (up to 4 per row) ──
+            filter_keys = [
+                ("Period",                     "Period"),
+                ("Team",                       "Team"),
+                ("Rec Name (as per Rec Cube)", "Rec Name"),
+                ("Entity",                     "Entity"),
+                ("Asset Class",                "Asset Class"),
+                ("Type of break",              "Type of Break"),
+                ("True/Systemic Breaks",       "True / Systemic"),
+            ]
+            available_filters = [(k, l) for k, l in filter_keys if k in filter_options]
+
+            # Render in rows of 4
+            for row_start in range(0, len(available_filters), 4):
+                row_keys = available_filters[row_start:row_start + 4]
+                cols = st.columns(len(row_keys))
+                for col_ui, (key, label) in zip(cols, row_keys):
+                    with col_ui:
+                        opts = filter_options[key]
+                        # Default to previously pending selection, else all
+                        prev_sel = st.session_state.get(f"pending_{key}", opts)
+                        st.multiselect(
+                            label, opts,
+                            default=prev_sel,
+                            key=f"pending_{key}",
+                            placeholder=f"All {label}s",
+                        )
+
+            # ── Row 2: Numeric + toggle filters ──
+            abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+            num_cols_ui = st.columns([2, 2, 2, 6])
+
+            with num_cols_ui[0]:
+                if abs_col and abs_col in df.columns:
+                    max_val = float(df[abs_col].abs().max() or 1_000_000)
+                    prev_abs = st.session_state.get("pending_abs_threshold", 0.0)
+                    st.number_input(
+                        "Min ABS GBP (£)",
+                        min_value=0.0,
+                        max_value=float(min(max_val, 100_000_000)),
+                        value=prev_abs,
+                        step=1000.0,
+                        format="%.0f",
+                        key="pending_abs_threshold",
+                    )
+
+            with num_cols_ui[1]:
+                prev_fp = st.session_state.get("pending_excl_fp", False)
+                st.checkbox(
+                    "Exclude False Positives",
+                    value=prev_fp,
+                    key="pending_excl_fp",
+                )
+
+            # ── Action buttons ──
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            btn_cols = st.columns([1, 1, 10])
+            with btn_cols[0]:
+                apply_clicked = st.button(
+                    "✅ Apply Filters",
+                    key="apply_filters_btn",
+                    type="primary",
+                    use_container_width=True,
+                )
+            with btn_cols[1]:
+                reset_clicked = st.button(
+                    "↺ Reset",
+                    key="reset_filters_btn",
+                    use_container_width=True,
+                )
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            if apply_clicked:
+                # ── Snapshot pending → applied ──
+                new_applied = {}
+                for key, label in available_filters:
+                    opts = filter_options[key]
+                    sel  = st.session_state.get(f"pending_{key}", opts)
+                    if sel and len(sel) < len(opts):
+                        new_applied[key] = sel
+                abs_thresh = st.session_state.get("pending_abs_threshold", 0.0)
+                if abs_thresh and abs_thresh > 0 and abs_col:
+                    new_applied["_ABS_THRESHOLD"] = (abs_col, abs_thresh)
+                excl_fp = st.session_state.get("pending_excl_fp", False)
+                if excl_fp:
+                    new_applied["_EXCL_FP"] = True
+                st.session_state["applied_filters"] = new_applied
+                st.session_state["filter_bar_open"] = False
+                st.rerun()
+
+            if reset_clicked:
+                # ── Clear all pending and applied ──
+                for key, _ in available_filters:
+                    if f"pending_{key}" in st.session_state:
+                        del st.session_state[f"pending_{key}"]
+                for k in ["pending_abs_threshold","pending_excl_fp","applied_filters"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.session_state["applied_filters"] = {}
+                st.rerun()
+
+    # ── Apply stored filters via DuckDB ──
+    applied = st.session_state.get("applied_filters", {})
+    if not applied:
+        return df
+
+    where_parts = []
+    for key, vals in applied.items():
+        if key == "_ABS_THRESHOLD":
+            col_name, thresh = vals
+            where_parts.append(f'ABS("{col_name}") >= {thresh}')
+        elif key == "_EXCL_FP":
+            where_parts.append('_False_Positive = false')
+        else:
+            col = col_map[key]
+            escaped  = [str(v).replace("'", "''") for v in vals]
+            in_list  = ", ".join(f"'{v}'" for v in escaped)
+            where_parts.append(f'"{col}" IN ({in_list})')
+
+    return dq(f"SELECT * FROM tbl WHERE {' AND '.join(where_parts)}", df)
