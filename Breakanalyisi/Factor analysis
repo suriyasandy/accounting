@@ -1,0 +1,552 @@
+# ─────────────────────────── Tab 5: Jira Factor Analysis ───────────────────────────
+
+def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict):
+    """
+    Factor Analysis using Jira Reference (Jira Desc as lookup attribute — not a dimension)
+    and System to be Fixed.
+
+    Attribute roles:
+      Jira Reference      → GROUP BY dimension (primary key)
+      Jira Desc           → Lookup attribute shown as column alongside Jira Reference
+      System to be Fixed  → GROUP BY dimension (separate factor)
+      Rec Name            → GROUP BY dimension; Account Group / Products as lookup attrs
+      TRADE REF           → Row identifier — never grouped
+    """
+    st.markdown("## Jira Factor Analysis")
+    st.markdown(
+        '<div class="jira-banner">🔍 <b>Factor Analysis:</b> Jira Reference and System to be Fixed '
+        'are the primary break driver dimensions. Jira Description is shown as a reference '
+        'attribute alongside each ticket — not grouped separately as it is 1:1 with Jira Reference. '
+        'Similarly, Account Group and Products are shown as lookup attributes on Rec Name.</div>',
+        unsafe_allow_html=True)
+
+    # ── Resolve columns ──
+    jira_ref_col   = col_map.get("Jira Reference")
+    jira_desc_col  = col_map.get("Jira Desc")
+    system_col     = col_map.get("System to be Fixed")
+    abs_col        = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    team_col       = col_map.get("Team")
+    rec_col        = col_map.get("Rec Name (as per Rec Cube)")
+    ac_col         = col_map.get("Asset Class")
+    entity_col     = col_map.get("Entity")
+    ts_col         = col_map.get("True/Systemic Breaks")
+    acct_grp_col   = col_map.get("Account Group")
+    products_col   = col_map.get("Products Reconciled")
+
+    # ── Dimension selector — Jira Desc excluded (it is a lookup, not a dimension) ──
+    factor_options = {}
+    if jira_ref_col and jira_ref_col in df.columns:
+        factor_options["Jira Reference"]     = jira_ref_col
+    if system_col   and system_col   in df.columns:
+        factor_options["System to be Fixed"] = system_col
+
+    extra_dims = {k: v for k, v in {
+        "Team":          team_col,
+        "Rec Name":      rec_col,
+        "Asset Class":   ac_col,
+        "Entity":        entity_col,
+        "True/Systemic": ts_col,
+    }.items() if v and v in df.columns}
+
+    all_dims = {**factor_options, **extra_dims}
+
+    if not all_dims:
+        st.info("No Jira or dimension columns found. Check that the file contains "
+                "'Jira Reference', 'Jira Desc', 'System to be Fixed'.")
+        return
+
+    # ── Coverage KPIs for Jira columns ──
+    coverage_cols = {k: v for k, v in {
+        "Jira Reference":     jira_ref_col,
+        "Jira Description":   jira_desc_col,
+        "System to be Fixed": system_col,
+    }.items() if v and v in df.columns}
+
+    if coverage_cols:
+        st.markdown("### Jira Column Coverage")
+        cov_cols_ui = st.columns(len(coverage_cols))
+        for i, (label, col) in enumerate(coverage_cols.items()):
+            filled = dq(f"""
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (
+                           WHERE "{col}" IS NOT NULL
+                           AND TRIM(CAST("{col}" AS VARCHAR))
+                               NOT IN ('','nan','None','N/A','-')
+                       ) AS populated
+                FROM tbl
+            """, df).iloc[0]
+            pct = round(int(filled["populated"]) / max(int(filled["total"]), 1) * 100, 1)
+            with cov_cols_ui[i]:
+                kpi_card(f"{label} Coverage", f"{pct}%",
+                         f"{format_number(filled['populated'])} / {format_number(filled['total'])} rows",
+                         warn=(pct < 50))
+
+    st.markdown("---")
+
+    # ── Dimension selector ──
+    selected_label = st.selectbox(
+        "Select Factor Dimension",
+        list(all_dims.keys()),
+        key="jira_dim_sel",
+        help="Jira Description is not listed here — it appears as a lookup column "
+             "in the summary table when Jira Reference is selected.",
+    )
+    dim_col = all_dims[selected_label]
+
+    period_order = (sorted(df["_Period_label"].dropna().unique().tolist())
+                    if "_Period_label" in df.columns else [])
+    latest = period_order[-1] if period_order else "0"
+    prev   = period_order[-2] if len(period_order) >= 2 else "0"
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Helper: build a Jira Desc / System lookup dict for annotations
+    # ─────────────────────────────────────────────────────────────────────
+    def _desc_map() -> dict:
+        """Jira Reference → Jira Desc  (first non-null per ref)."""
+        if not (jira_desc_col and jira_desc_col in df.columns): return {}
+        return (dq(f"""
+            SELECT "{jira_ref_col}" AS ref,
+                   FIRST("{jira_desc_col}") AS d
+            FROM tbl
+            WHERE "{jira_ref_col}" IS NOT NULL
+            GROUP BY "{jira_ref_col}"
+        """, df).set_index("ref")["d"].to_dict())
+
+    def _short_label(ref: str, dmap: dict, max_chars: int = 38) -> str:
+        desc = str(dmap.get(ref, ""))
+        if not desc or desc in ("nan", "None", "N/A", "-"): return str(ref)
+        return f"{ref}: {desc[:max_chars]}{'…' if len(desc) > max_chars else ''}"
+
+    # ── Factor Summary Table ──
+    st.markdown(f"### {selected_label} — Factor Summary Table")
+
+    # Lookup attribute expressions per selected dimension
+    lookup_exprs = ""
+    if selected_label == "Jira Reference":
+        if jira_desc_col and jira_desc_col in df.columns:
+            lookup_exprs += f', FIRST("{jira_desc_col}") AS "Jira Description"'
+        if system_col and system_col in df.columns:
+            lookup_exprs += f', FIRST("{system_col}") AS "System to be Fixed"'
+    elif selected_label == "System to be Fixed":
+        if jira_ref_col and jira_ref_col in df.columns:
+            lookup_exprs += f', COUNT(DISTINCT "{jira_ref_col}") AS "Unique Jira Refs"'
+    elif selected_label == "Rec Name":
+        # Rec Name → Account Group and Products are 1:1 lookup attributes
+        if acct_grp_col and acct_grp_col in df.columns:
+            lookup_exprs += f', FIRST("{acct_grp_col}") AS "Account Group"'
+        if products_col and products_col in df.columns:
+            lookup_exprs += f', FIRST("{products_col}") AS "Products Reconciled"'
+
+    age_expr = (
+        'ROUND(AVG(_Computed_Age_Days), 1) AS "Avg Age Days",'
+        'MAX(_Computed_Age_Days)           AS "Max Age Days",'
+        if "_Computed_Age_Days" in df.columns else ""
+    )
+    amount_expr = (
+        f'ROUND(SUM(ABS("{abs_col}")), 0) AS "Total ABS GBP",'
+        if abs_col and abs_col in df.columns else ""
+    )
+    over_expr = (
+        'COUNT(*) FILTER (WHERE _Computed_Age_Days > 90)  AS ">90d",'
+        'COUNT(*) FILTER (WHERE _Computed_Age_Days > 180) AS ">180d",'
+        'COUNT(*) FILTER (WHERE _Computed_Age_Days > 365) AS ">365d",'
+        if "_Computed_Age_Days" in df.columns else ""
+    )
+    period_expr = (
+        f'COUNT(*) FILTER (WHERE _Period_label = \'{latest}\') AS "Latest Period",'
+        f'COUNT(*) FILTER (WHERE _Period_label = \'{prev}\')   AS "Prev Period"'
+        if period_order else
+        '0 AS "Latest Period", 0 AS "Prev Period"'
+    )
+
+    summary_df = dq(f"""
+        SELECT
+            "{dim_col}"  AS "{selected_label}",
+            COUNT(*)     AS "Break Count"
+            {lookup_exprs},
+            {age_expr}
+            {amount_expr}
+            {over_expr}
+            {period_expr}
+        FROM tbl
+        WHERE "{dim_col}" IS NOT NULL
+          AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+        GROUP BY "{dim_col}"
+        ORDER BY "Break Count" DESC
+    """, df)
+
+    # ── Derived / enriched columns ──
+    if "Total ABS GBP" in summary_df.columns:
+        summary_df["Avg GBP / Break"] = (
+            summary_df["Total ABS GBP"] /
+            summary_df["Break Count"].replace(0, np.nan)
+        ).round(0)
+        summary_df["Total ABS GBP"]   = summary_df["Total ABS GBP"].apply(format_short)
+        summary_df["Avg GBP / Break"] = summary_df["Avg GBP / Break"].apply(format_short)
+
+    if ">90d" in summary_df.columns:
+        summary_df[">90 Day %"] = (
+            summary_df[">90d"] /
+            summary_df["Break Count"].replace(0, np.nan) * 100
+        ).round(1)
+
+    if "Latest Period" in summary_df.columns and "Prev Period" in summary_df.columns:
+        summary_df["MoM Δ"]   = summary_df["Latest Period"] - summary_df["Prev Period"]
+        summary_df["MoM Δ %"] = (
+            (summary_df["MoM Δ"] /
+             summary_df["Prev Period"].replace(0, np.nan)) * 100
+        ).round(1)
+
+    # ── Column order — Jira Desc always immediately after Jira Reference ──
+    col_order = [selected_label]
+    for c in ["Jira Description", "System to be Fixed", "Account Group",
+              "Products Reconciled", "Unique Jira Refs"]:
+        if c in summary_df.columns: col_order.append(c)
+    for c in ["Break Count", "Latest Period", "Prev Period", "MoM Δ", "MoM Δ %",
+              "Avg Age Days", "Max Age Days",
+              ">90d", ">90 Day %", ">180d", ">365d",
+              "Total ABS GBP", "Avg GBP / Break"]:
+        if c in summary_df.columns: col_order.append(c)
+    summary_df = summary_df[[c for c in col_order if c in summary_df.columns]]
+
+    # ── Rename >90d etc. for display ──
+    summary_df = summary_df.rename(columns={
+        ">90d":  ">90 Day Breaks",
+        ">180d": ">180 Day Breaks",
+        ">365d": ">365 Day Breaks",
+    })
+
+    # ── AgGrid with rich conditional formatting ──
+    if HAS_AGGRID:
+        gb = GridOptionsBuilder.from_dataframe(summary_df)
+        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        gb.configure_default_column(filterable=True, sortable=True, resizable=True,
+                                    wrapText=True, autoHeight=True)
+        # Pin primary dimension; widen desc column
+        gb.configure_column(selected_label, pinned="left", width=160)
+        if "Jira Description" in summary_df.columns:
+            gb.configure_column("Jira Description", width=300,
+                                tooltipField="Jira Description")
+        if "System to be Fixed" in summary_df.columns:
+            gb.configure_column("System to be Fixed", width=200)
+        for c in ["Break Count", "Latest Period", "Prev Period"]:
+            if c in summary_df.columns:
+                gb.configure_column(c, width=120)
+        # MoM Δ colour
+        if "MoM Δ" in summary_df.columns:
+            mom_cs = JsCode("""function(p){
+                var v=p.value;
+                if(v > 0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                if(v < 0) return {'backgroundColor':'#E8F5E9','color':'#01696F','fontWeight':'bold'};
+                return {};}""")
+            gb.configure_column("MoM Δ",   cellStyle=mom_cs, width=90)
+            gb.configure_column("MoM Δ %", cellStyle=mom_cs, width=100)
+        # >90 Day % colour — red ≥50%, amber ≥25%
+        if ">90 Day %" in summary_df.columns:
+            risk_cs = JsCode("""function(p){
+                var v=parseFloat(p.value);
+                if(v>=50) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                if(v>=25) return {'backgroundColor':'#FFF8E1','color':'#7A4000'};
+                return {};}""")
+            gb.configure_column(">90 Day %", cellStyle=risk_cs, width=105)
+        AgGrid(summary_df, gridOptions=gb.build(), height=440,
+               theme="streamlit", allow_unsafe_jscode=True, key="jira_summary_grid")
+    else:
+        st.dataframe(summary_df, height=440, use_container_width=True)
+
+    # ── Download button right below the table ──
+    st.download_button(
+        f"📥 Download {selected_label} Factor Summary (CSV)",
+        summary_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"factor_{selected_label.replace(' ','_').lower()}.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Visual panels — 4 charts in 2×2 grid
+    # ─────────────────────────────────────────────────────────────────────
+    dmap = _desc_map() if selected_label == "Jira Reference" else {}
+
+    row1a, row1b = st.columns(2)
+
+    # ── Chart 1: Top 15 by Break Count ──
+    with row1a:
+        top_cnt = dq(f"""
+            SELECT "{dim_col}" AS factor, COUNT(*) AS cnt
+            FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 15
+        """, df).sort_values("cnt", ascending=True)
+
+        if dmap:
+            top_cnt["hover_desc"] = top_cnt["factor"].map(dmap).fillna("")
+            fig = go.Figure(go.Bar(
+                x=top_cnt["cnt"], y=top_cnt["factor"],
+                orientation="h", marker_color=PRIMARY,
+                text=top_cnt["cnt"], textposition="outside",
+                customdata=top_cnt["hover_desc"],
+                hovertemplate="<b>%{y}</b><br>%{customdata}<br>Breaks: %{x}<extra></extra>",
+            ))
+        else:
+            fig = px.bar(top_cnt, x="cnt", y="factor", orientation="h",
+                         color_discrete_sequence=[PRIMARY], text="cnt")
+            fig.update_traces(textposition="outside")
+        fig = chart_layout(fig, f"Top 15 {selected_label} by Break Count",
+                           "Break Count", "", height=max(360, len(top_cnt) * 32))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Chart 2: Top 15 by Avg Age Days (colour-coded by severity) ──
+    with row1b:
+        if "_Computed_Age_Days" in df.columns:
+            top_age = dq(f"""
+                SELECT "{dim_col}" AS factor,
+                       ROUND(AVG(_Computed_Age_Days), 1) AS avg_age
+                FROM tbl
+                WHERE "{dim_col}" IS NOT NULL
+                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+                  AND _Computed_Age_Days IS NOT NULL
+                GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 15
+            """, df).sort_values("avg_age", ascending=True)
+            bar_colors = [
+                WARN      if v > 180 else
+                COLORS[8] if v > 90  else
+                COLORS[0]
+                for v in top_age["avg_age"]
+            ]
+            if dmap:
+                top_age["hover_desc"] = top_age["factor"].map(dmap).fillna("")
+                htemplate = "<b>%{y}</b><br>%{customdata}<br>Avg Age: %{x}d<extra></extra>"
+                fig = go.Figure(go.Bar(
+                    x=top_age["avg_age"], y=top_age["factor"],
+                    orientation="h", marker_color=bar_colors,
+                    text=top_age["avg_age"].astype(str) + "d",
+                    textposition="outside",
+                    customdata=top_age["hover_desc"],
+                    hovertemplate=htemplate,
+                ))
+            else:
+                fig = go.Figure(go.Bar(
+                    x=top_age["avg_age"], y=top_age["factor"],
+                    orientation="h", marker_color=bar_colors,
+                    text=top_age["avg_age"].astype(str) + "d",
+                    textposition="outside",
+                ))
+            fig.add_vline(x=90,  line_dash="dash", line_color=COLORS[8], line_width=1.2,
+                          annotation_text="90d",  annotation_position="top right")
+            fig.add_vline(x=180, line_dash="dash", line_color=WARN,      line_width=1.2,
+                          annotation_text="180d", annotation_position="top right")
+            fig = chart_layout(fig, f"Top 15 {selected_label} by Avg Age Days",
+                               "Avg Age Days", "", height=max(360, len(top_age) * 32))
+            st.plotly_chart(fig, use_container_width=True)
+
+    if abs_col and abs_col in df.columns:
+        row2a, row2b = st.columns(2)
+
+        # ── Chart 3: Top 15 by ABS GBP ──
+        with row2a:
+            top_amt = dq(f"""
+                SELECT "{dim_col}" AS factor, SUM(ABS("{abs_col}")) AS total
+                FROM tbl
+                WHERE "{dim_col}" IS NOT NULL
+                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+                GROUP BY "{dim_col}" ORDER BY total DESC LIMIT 15
+            """, df).sort_values("total", ascending=True)
+            top_amt["label"] = top_amt["total"].apply(format_short)
+            if dmap:
+                top_amt["hover_desc"] = top_amt["factor"].map(dmap).fillna("")
+                fig = go.Figure(go.Bar(
+                    x=top_amt["total"], y=top_amt["factor"],
+                    orientation="h", marker_color=COLORS[2],
+                    text=top_amt["label"], textposition="outside",
+                    customdata=top_amt["hover_desc"],
+                    hovertemplate="<b>%{y}</b><br>%{customdata}<br>ABS GBP: %{text}<extra></extra>",
+                ))
+            else:
+                fig = px.bar(top_amt, x="total", y="factor", orientation="h",
+                             color_discrete_sequence=[COLORS[2]], text="label")
+                fig.update_traces(textposition="outside")
+            fig = chart_layout(fig, f"Top 15 {selected_label} by Total ABS GBP",
+                               "GBP (£)", "", height=max(360, len(top_amt) * 32))
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Chart 4: Top 15 by % Breaks > 90 Days ──
+        with row2b:
+            if "_Computed_Age_Days" in df.columns:
+                risk_df = dq(f"""
+                    SELECT "{dim_col}" AS factor,
+                           COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE _Computed_Age_Days > 90) AS over90
+                    FROM tbl
+                    WHERE "{dim_col}" IS NOT NULL
+                      AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+                      AND _Computed_Age_Days IS NOT NULL
+                    GROUP BY "{dim_col}" ORDER BY over90 DESC LIMIT 15
+                """, df)
+                risk_df[">90 Day %"] = (
+                    risk_df["over90"] / risk_df["total"].replace(0, np.nan) * 100
+                ).round(1)
+                risk_df = risk_df.sort_values(">90 Day %", ascending=True)
+                risk_colors = [
+                    WARN      if v >= 50 else
+                    COLORS[8] if v >= 25 else
+                    COLORS[0]
+                    for v in risk_df[">90 Day %"]
+                ]
+                if dmap:
+                    risk_df["hover_desc"] = risk_df["factor"].map(dmap).fillna("")
+                    fig = go.Figure(go.Bar(
+                        x=risk_df[">90 Day %"], y=risk_df["factor"],
+                        orientation="h", marker_color=risk_colors,
+                        text=risk_df[">90 Day %"].astype(str) + "%",
+                        textposition="outside",
+                        customdata=risk_df["hover_desc"],
+                        hovertemplate="<b>%{y}</b><br>%{customdata}<br>>90d: %{x}%<extra></extra>",
+                    ))
+                else:
+                    fig = go.Figure(go.Bar(
+                        x=risk_df[">90 Day %"], y=risk_df["factor"],
+                        orientation="h", marker_color=risk_colors,
+                        text=risk_df[">90 Day %"].astype(str) + "%",
+                        textposition="outside",
+                    ))
+                fig.add_vline(x=25, line_dash="dash", line_color=COLORS[8], line_width=1.2,
+                              annotation_text="25%", annotation_position="top right")
+                fig.add_vline(x=50, line_dash="dash", line_color=WARN,      line_width=1.2,
+                              annotation_text="50%", annotation_position="top right")
+                fig = chart_layout(fig, f"Top 15 {selected_label} — % Breaks > 90 Days",
+                                   "% Breaks > 90 Days", "",
+                                   height=max(360, len(risk_df) * 32))
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Trend over periods — Top 5, legend annotated with Jira Desc
+    # ─────────────────────────────────────────────────────────────────────
+    if "_Period_label" in df.columns and period_order:
+        st.markdown(f"### {selected_label} — Break Count Trend Over Periods (Top 5)")
+        top5 = dq(f"""
+            SELECT "{dim_col}" AS factor FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
+        """, df)["factor"].tolist()
+        top5_str = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5)
+        trend_df = dq(f"""
+            SELECT "{dim_col}" AS factor, _Period_label AS period, COUNT(*) AS cnt
+            FROM tbl WHERE "{dim_col}" IN ({top5_str})
+            GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
+        """, df)
+        # Annotate legend: "JIRA-123: Short desc here…" if Jira Reference
+        if dmap:
+            trend_df["factor_label"] = trend_df["factor"].apply(
+                lambda x: _short_label(x, dmap, max_chars=40))
+        else:
+            trend_df["factor_label"] = trend_df["factor"]
+        fig = px.line(trend_df, x="period", y="cnt", color="factor_label",
+                      color_discrete_sequence=COLORS, markers=True)
+        fig = chart_layout(fig,
+            f"Top 5 {selected_label} — Break Count Trend Over Periods",
+            "Period", "Break Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # MoM Change — bar chart with hover showing prev/latest counts
+    # ─────────────────────────────────────────────────────────────────────
+    if len(period_order) >= 2:
+        st.markdown(f"### MoM Change by {selected_label}  ({prev} → {latest})")
+        mom_df = dq(f"""
+            SELECT "{dim_col}" AS factor,
+                   COUNT(*) FILTER (WHERE _Period_label='{latest}') AS lat,
+                   COUNT(*) FILTER (WHERE _Period_label='{prev}')   AS prv
+            FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{dim_col}"
+            HAVING (lat > 0 OR prv > 0)
+        """, df)
+        mom_df["delta"] = mom_df["lat"] - mom_df["prv"]
+        mom_df = mom_df.sort_values("delta")
+        colors_mom = [COLORS[0] if v >= 0 else COLORS[4] for v in mom_df["delta"]]
+        # Bar labels — Jira ref annotated with short desc
+        if dmap:
+            mom_df["y_label"] = mom_df["factor"].apply(
+                lambda x: _short_label(x, dmap, max_chars=35))
+        else:
+            mom_df["y_label"] = mom_df["factor"]
+        fig = go.Figure(go.Bar(
+            x=mom_df["delta"],
+            y=mom_df["y_label"],
+            orientation="h",
+            marker_color=colors_mom,
+            text=mom_df["delta"].apply(lambda x: f"+{int(x)}" if x >= 0 else str(int(x))),
+            textposition="outside",
+            customdata=np.stack([mom_df["prv"], mom_df["lat"]], axis=-1),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Prev Period: %{customdata[0]}<br>"
+                "Latest Period: %{customdata[1]}<br>"
+                "Δ: %{x}<extra></extra>"
+            ),
+        ))
+        fig.add_vline(x=0, line_dash="dash", line_color=MUTED, line_width=1)
+        fig = chart_layout(fig,
+            f"MoM Break Count Change by {selected_label}  ({prev} → {latest})",
+            "Change in Break Count", "",
+            height=max(400, len(mom_df) * 28))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("🟩 Teal = More breaks this period (worse)   "
+                   "🟥 Red = Fewer breaks this period (improvement)")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Jira Reference × System to be Fixed heatmap
+    # Row labels = "JIRA-123: Short Desc" for readability
+    # ─────────────────────────────────────────────────────────────────────
+    if (jira_ref_col  and jira_ref_col  in df.columns and
+            system_col and system_col in df.columns):
+        st.markdown("### Jira Reference × System to be Fixed — Break Count Heatmap")
+        cross = dq(f"""
+            SELECT "{jira_ref_col}" AS jira_ref,
+                   "{system_col}"   AS system_fix,
+                   COUNT(*)         AS cnt
+            FROM tbl
+            WHERE "{jira_ref_col}" IS NOT NULL AND "{system_col}" IS NOT NULL
+              AND TRIM(CAST("{jira_ref_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+              AND TRIM(CAST("{system_col}"   AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+            GROUP BY "{jira_ref_col}", "{system_col}"
+        """, df)
+
+        if len(cross) > 0:
+            # Build row labels: "JIRA-123: Description text…"
+            if jira_desc_col and jira_desc_col in df.columns:
+                desc_map_h = dq(f"""
+                    SELECT "{jira_ref_col}" AS ref,
+                           FIRST("{jira_desc_col}") AS d
+                    FROM tbl WHERE "{jira_ref_col}" IS NOT NULL
+                    GROUP BY "{jira_ref_col}"
+                """, df).set_index("ref")["d"].to_dict()
+                cross["jira_label"] = cross["jira_ref"].apply(
+                    lambda x: _short_label(x, desc_map_h, max_chars=30))
+            else:
+                cross["jira_label"] = cross["jira_ref"]
+
+            pivot = cross.pivot_table(
+                index="jira_label", columns="system_fix",
+                values="cnt", fill_value=0)
+            # Limit to top 20 Jira refs by total breaks for readability
+            jira_totals = cross.groupby("jira_label")["cnt"].sum()
+            top20_labels = jira_totals.nlargest(20).index
+            pivot = pivot.loc[pivot.index.isin(top20_labels)]
+
+            fig = px.imshow(
+                pivot,
+                color_continuous_scale=["#E8F5E9","#FFC553","#A84B2F"],
+                aspect="auto", text_auto=".0f",
+            )
+            fig = chart_layout(fig,
+                "Jira Reference × System to be Fixed (Top 20 Jiras — Break Count)",
+                "", "", height=max(400, len(pivot) * 30))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No data found for Jira Reference × System to be Fixed cross-analysis.")
