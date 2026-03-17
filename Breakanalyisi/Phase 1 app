@@ -5,10 +5,8 @@ Optimised for 600K+ records:
   - DuckDB for all post-filter aggregations (SQL on Pandas, zero-copy)
   - Vectorised Pandas for cleaning/parsing
   - @st.cache_data for heavy computations
-  - False Positive flagging per discrepancy record
-  - ABS GBP threshold slider (DuckDB filtered)
-  - Rolling average trend lines for underlying trend visibility
-  - Root cause / driver analysis panel
+  - Jira Reference / Jira Desc / System to be Fixed for Factor Analysis
+  - Last 4 blank columns auto-dropped on load
 """
 
 import streamlit as st
@@ -71,6 +69,9 @@ st.markdown(f"""
     .violation-banner {{background:#FDECEA;border-left:4px solid {WARN};
         padding:10px 16px;border-radius:4px;margin-bottom:0.5rem;
         font-size:0.88rem;color:{DARK};font-weight:600;}}
+    .jira-banner {{background:#E8F4FD;border-left:4px solid #20808D;
+        padding:10px 16px;border-radius:4px;margin-bottom:0.5rem;
+        font-size:0.88rem;color:{DARK};}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -126,7 +127,6 @@ def chart_layout(fig, title="", xaxis_title="", yaxis_title="", height=400):
 
 
 def render_aggrid(df, height=400, key=None, match_cols=None):
-    """Render AgGrid with optional red/green cell styling for Match columns."""
     if HAS_AGGRID and len(df) > 0:
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
@@ -139,12 +139,22 @@ def render_aggrid(df, height=400, key=None, match_cols=None):
                     return {'backgroundColor':'#E8F5E9','color':'#01696F'};
                 return {};}""")
             for c in match_cols:
-                if c in df.columns:
-                    gb.configure_column(c, cellStyle=cs)
+                if c in df.columns: gb.configure_column(c, cellStyle=cs)
         AgGrid(df, gridOptions=gb.build(), height=height,
                theme="streamlit", key=key, allow_unsafe_jscode=True)
     else:
         st.dataframe(df, height=height, use_container_width=True)
+
+
+def add_rolling_avg(fig, x, y, window=3, name="Rolling Avg", color=None):
+    if len(x) < window: return fig
+    s = pd.Series(y.values if hasattr(y, 'values') else y)
+    rolled = s.rolling(window, min_periods=1).mean().round(1)
+    fig.add_trace(go.Scatter(
+        x=x, y=rolled, name=f"{name} ({window}p)",
+        mode="lines", line=dict(color=color or COLORS[7], width=2.5, dash="dot"),
+    ))
+    return fig
 
 
 # ─────────────────────────── DuckDB ───────────────────────────
@@ -155,7 +165,6 @@ def get_duck() -> duckdb.DuckDBPyConnection:
 
 
 def dq(sql: str, df: pd.DataFrame = None) -> pd.DataFrame:
-    """Execute SQL on a Pandas DataFrame via DuckDB — zero-copy replacement scan."""
     con = get_duck()
     if df is not None:
         con.register("tbl", df)
@@ -197,7 +206,7 @@ def parse_age_days_vec(series: pd.Series) -> pd.Series:
 def age_to_bucket_vec(age_series: pd.Series) -> pd.Categorical:
     a = age_series.values
     cond = [pd.isna(age_series), a<=15, a<=30, a<=60, a<=90, a<=180, a<=365]
-    ch = ["Unknown","0-15","16-30","31-60","61-90","91-180","181-365"]
+    ch   = ["Unknown","0-15","16-30","31-60","61-90","91-180","181-365"]
     return pd.Categorical(np.select(cond, ch, default="365+"),
                           categories=BUCKET_ORDER, ordered=True)
 
@@ -216,6 +225,8 @@ def detect_outliers_iqr(series: pd.Series, name: str) -> pd.DataFrame:
 
 
 # ─────────────────────────── Column Mapping ───────────────────────────
+# Last 4 columns (blank trailing cols) are intentionally excluded from EXPECTED_COLUMNS.
+# drop_blank_trailing_cols() handles this at load time.
 
 EXPECTED_COLUMNS = [
     "Period","Asset Class","Team","Rec Name (as per Rec Cube)","Entity",
@@ -224,7 +235,13 @@ EXPECTED_COLUMNS = [
     "BREAK AMOUNT CCY","BREAK AMOUNT GBP","Date","Age Days","Bucket",
     "True/Systemic Breaks","Journals Posted","Comments","ABS GBP",
     "Root Cause identified","B/S Cert",
+    # ── Jira / System Fix columns ──
+    "Jira Reference","Jira Desc","System to be Fixed",
 ]
+
+# These are the Jira-related factor columns for Tab 5
+JIRA_FACTOR_COLS = ["Jira Reference", "Jira Desc", "System to be Fixed"]
+
 
 def fuzzy_col_match(cols, target):
     tl = target.lower().strip()
@@ -234,26 +251,42 @@ def fuzzy_col_match(cols, target):
         if tl in c.lower() or c.lower() in tl: return c
     return None
 
+
 def build_col_map(cols):
     return {e: m for e in EXPECTED_COLUMNS if (m := fuzzy_col_match(cols, e))}
+
+
+def drop_blank_trailing_cols(df: pd.DataFrame, n: int = 4) -> pd.DataFrame:
+    """
+    Drop the last `n` columns if they are >95% empty (blank/NaN).
+    These are the trailing unnamed blank columns in the MI report.
+    """
+    cols_to_drop = []
+    for col in df.columns[-(n):]:
+        null_pct = df[col].isna().sum() / len(df) if len(df) > 0 else 1.0
+        str_blank = 0.0
+        try:
+            str_blank = (df[col].astype(str).str.strip().isin(['','nan','None','NaN'])
+                         .sum() / len(df))
+        except Exception:
+            pass
+        if max(null_pct, str_blank) >= 0.95:
+            cols_to_drop.append(col)
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+    return df, cols_to_drop
 
 
 # ─────────────────────────── File Loading ───────────────────────────
 
 @st.cache_data(show_spinner="Reading file... (cached after first load — instant on reruns)")
 def load_raw_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """
-    Load CSV / Excel / Parquet into Pandas.
-    Cached by file_bytes content — instant on every rerun after first load.
-    xlsx ~4-6s first time (calamine), then instant.
-    """
     buf  = BytesIO(file_bytes)
     name = filename.lower()
     if name.endswith(".parquet"):
         return pd.read_parquet(buf)
     if name.endswith(".csv"):
         return pd.read_csv(buf, low_memory=False)
-    # Excel — calamine (Rust, faster) with openpyxl fallback
     try:
         import polars as pl
         return pl.read_excel(buf, engine="calamine").to_pandas()
@@ -266,12 +299,12 @@ def load_raw_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Cleaning & processing data...")
 def clean_dataframe(file_bytes: bytes, filename: str):
-    """
-    Full vectorised cleaning pipeline. Cached by (file_bytes, filename).
-    Returns: df, col_map, filter_options, violations_df
-    """
-    df      = load_raw_file(file_bytes, filename)
-    col_map = build_col_map(df.columns.tolist())
+    df = load_raw_file(file_bytes, filename)
+
+    # ── Drop last 4 blank trailing columns ──
+    df, dropped_cols = drop_blank_trailing_cols(df, n=4)
+
+    col_map    = build_col_map(df.columns.tolist())
     violations = []
 
     for key in ["BREAK AMOUNT CCY","BREAK AMOUNT GBP","ABS GBP"]:
@@ -314,7 +347,6 @@ def clean_dataframe(file_bytes: bytes, filename: str):
                 df[col_map["Bucket"]].astype(str).str.strip() ==
                 df["_Computed_Bucket"].astype(str).str.strip())
 
-    # False Positive column — initialised as False, user can toggle in UI
     df["_False_Positive"] = False
 
     filter_options = {}
@@ -326,17 +358,13 @@ def clean_dataframe(file_bytes: bytes, filename: str):
     vdf = pd.DataFrame(violations) if violations else \
           pd.DataFrame(columns=["Column","Expected Type","Violation Count","Sample Values"])
 
-    return df, col_map, filter_options, vdf
+    return df, col_map, filter_options, vdf, dropped_cols
 
 
 # ─────────────────────────── Global Filters via DuckDB ───────────────────────────
 
 def apply_global_filters(df: pd.DataFrame, col_map: dict,
                          filter_options: dict) -> pd.DataFrame:
-    """
-    Single DuckDB WHERE clause from all sidebar filter selections.
-    5-10x faster than chained Pandas boolean masks on 600K rows.
-    """
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🔍 Global Filters")
 
@@ -356,9 +384,7 @@ def apply_global_filters(df: pd.DataFrame, col_map: dict,
         if sel and len(sel) < len(opts):
             selections[key] = sel
 
-    # ABS GBP threshold — applied globally across all tabs
     abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
-    abs_threshold = 0.0
     if abs_col and abs_col in df.columns:
         max_val = float(df[abs_col].abs().max() or 1_000_000)
         abs_threshold = st.sidebar.number_input(
@@ -369,11 +395,8 @@ def apply_global_filters(df: pd.DataFrame, col_map: dict,
         if abs_threshold > 0:
             selections["_ABS_THRESHOLD"] = (abs_col, abs_threshold)
 
-    # Exclude False Positives toggle
     exclude_fp = st.sidebar.checkbox(
-        "Exclude False Positives", value=False, key="f_excl_fp",
-        help="Exclude records flagged as False Positive from all views"
-    )
+        "Exclude False Positives", value=False, key="f_excl_fp")
 
     if not selections and not exclude_fp:
         return df
@@ -392,40 +415,27 @@ def apply_global_filters(df: pd.DataFrame, col_map: dict,
     if exclude_fp:
         where_parts.append('_False_Positive = false')
 
-    sql = f"SELECT * FROM tbl WHERE {' AND '.join(where_parts)}"
-    return dq(sql, df)
-
-
-# ─────────────────────────── Rolling Average Helper ───────────────────────────
-
-def add_rolling_avg(fig, x, y, window=3, name="Rolling Avg", color=None):
-    """Add a rolling average line to expose the underlying trend."""
-    if len(x) < window:
-        return fig
-    s = pd.Series(y.values if hasattr(y, 'values') else y)
-    rolled = s.rolling(window, min_periods=1).mean().round(1)
-    fig.add_trace(go.Scatter(
-        x=x, y=rolled, name=f"{name} ({window}p)",
-        mode="lines",
-        line=dict(color=color or COLORS[7], width=2.5, dash="dot"),
-    ))
-    return fig
+    return dq(f"SELECT * FROM tbl WHERE {' AND '.join(where_parts)}", df)
 
 
 # ─────────────────────────── Tab 1: Data Quality ───────────────────────────
 
 def tab_data_quality(df: pd.DataFrame, col_map: dict, violations_df: pd.DataFrame,
-                     file_bytes: bytes, filename: str):
+                     file_bytes: bytes, filename: str, dropped_cols: list):
     st.markdown("## Data Quality & Ingestion Scorecard")
 
-    # ── Violations banner — prominent ──
     vcount = int(violations_df["Violation Count"].sum()) if len(violations_df) else 0
     if vcount > 0:
         st.markdown(
-            f'<div class="violation-banner">⚠️ {format_number(vcount)} type violations detected '
+            f'<div class="violation-banner">⚠️ {format_number(vcount)} type violations '
             f'across {len(violations_df)} column(s). Review below.</div>',
-            unsafe_allow_html=True,
-        )
+            unsafe_allow_html=True)
+
+    if dropped_cols:
+        st.markdown(
+            f'<div class="fp-banner">🗑️ <b>Auto-removed {len(dropped_cols)} blank trailing '
+            f'column(s):</b> {", ".join(dropped_cols)}</div>',
+            unsafe_allow_html=True)
 
     n_rows = len(df); n_cols = len(df.columns)
     cells  = n_rows * n_cols
@@ -435,8 +445,7 @@ def tab_data_quality(df: pd.DataFrame, col_map: dict, violations_df: pd.DataFram
     with c1: kpi_card("Total Records",   format_number(n_rows))
     with c2: kpi_card("Columns",         str(n_cols))
     with c3: kpi_card("Completeness",    f"{completeness}%")
-    with c4: kpi_card("Type Violations", format_number(vcount),
-                      warn=(vcount > 0), invert=True)
+    with c4: kpi_card("Type Violations", format_number(vcount), warn=(vcount > 0), invert=True)
 
     st.markdown("---")
     cl, cr = st.columns(2)
@@ -496,8 +505,7 @@ def tab_data_quality(df: pd.DataFrame, col_map: dict, violations_df: pd.DataFram
     with dl2:
         st.download_button("⚡ Download Cleaned Parquet (fast future uploads)",
             buf.getvalue(), file_name="cleaned_data.parquet",
-            mime="application/octet-stream",
-            help="Upload this .parquet next time — loads in ~0.2s")
+            mime="application/octet-stream")
 
 
 # ─────────────────────────── Tab 2: Ageing Validation ───────────────────────────
@@ -540,21 +548,18 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
                       warn=(bucket_pct > 5), invert=True)
     with c4: kpi_card("Accuracy Rate",        f"{round(100-max(age_pct,bucket_pct),1)}%")
 
-    # ── False Positive Flagging ──
     st.markdown("---")
     st.markdown("### Discrepancy Records — Flag False Positives")
     st.markdown(
-        '<div class="fp-banner">💡 <b>False Positive Flagging:</b> Mark records below as '
-        'false positives to exclude them from the outstanding break count. '
-        'Use the <i>Exclude False Positives</i> toggle in the sidebar to apply globally.</div>',
-        unsafe_allow_html=True,
-    )
+        '<div class="fp-banner">💡 <b>False Positive Flagging:</b> Mark records as false '
+        'positives to exclude them from outstanding count. Use sidebar toggle to apply globally.</div>',
+        unsafe_allow_html=True)
 
-    sel_cols_list = [col_map[k] for k in
+    sel_cols_sql = ", ".join(
+        f'"{col_map[k]}"' for k in
         ["Period","Team","Rec Name (as per Rec Cube)","Entity","Date"]
-        if k in col_map and col_map[k] in df.columns]
-    sel_cols_sql = ", ".join(f'"{c}"' for c in sel_cols_list)
-
+        if k in col_map and col_map[k] in df.columns
+    )
     disc_df = dq(f"""
         SELECT {sel_cols_sql},
                "{age_col}"        AS "Age Days (Source)",
@@ -572,37 +577,27 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
     """, df)
 
     if len(disc_df) > 0:
-        # Allow user to mark False Positives via editable checkbox column
         fp_edited = st.data_editor(
             disc_df,
             column_config={
                 "False Positive": st.column_config.CheckboxColumn(
-                    "False Positive?",
-                    help="Check to mark as false positive — excluded from outstanding count",
-                    default=False,
-                ),
+                    "False Positive?", default=False),
                 "Age Match":    st.column_config.CheckboxColumn("Age Match"),
                 "Bucket Match": st.column_config.CheckboxColumn("Bucket Match"),
             },
-            use_container_width=True,
-            height=420,
-            num_rows="fixed",
-            key="fp_editor",
+            use_container_width=True, height=420,
+            num_rows="fixed", key="fp_editor",
         )
-
         fp_count = int(fp_edited["False Positive"].sum())
         net_outstanding = len(disc_df) - fp_count
         fc1, fc2, fc3 = st.columns(3)
-        with fc1: kpi_card("Total Discrepancies",  format_number(len(disc_df)))
+        with fc1: kpi_card("Total Discrepancies",   format_number(len(disc_df)))
         with fc2: kpi_card("Flagged False Positive", format_number(fp_count))
-        with fc3: kpi_card("Net Outstanding",       format_number(net_outstanding),
+        with fc3: kpi_card("Net Outstanding",        format_number(net_outstanding),
                            warn=(net_outstanding > 0))
-
-        if fp_count > 0:
-            st.info(f"ℹ️ {fp_count} record(s) flagged as False Positive. "
-                    "Enable 'Exclude False Positives' in sidebar to remove them from all views.")
     else:
         st.success("✅ No discrepancies found!")
+        disc_df = pd.DataFrame()
 
     st.markdown("---")
     cl, cr = st.columns(2)
@@ -649,8 +644,8 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
             SELECT "{team_col}" AS team, COUNT(*) AS total,
                    COUNT(*) FILTER (WHERE _Age_Match=false)    AS age_mis,
                    COUNT(*) FILTER (WHERE _Bucket_Match=false) AS bkt_mis
-            FROM tbl WHERE _Computed_Age_Days IS NOT NULL GROUP BY "{team_col}"
-            ORDER BY total DESC
+            FROM tbl WHERE _Computed_Age_Days IS NOT NULL
+            GROUP BY "{team_col}" ORDER BY total DESC
         """, df)
         td["Age Disc %"]    = (td["age_mis"] / td["total"] * 100).round(1)
         td["Bucket Disc %"] = (td["bkt_mis"] / td["total"] * 100).round(1)
@@ -660,7 +655,7 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
         fig.add_trace(go.Bar(x=td["team"], y=td["Bucket Disc %"],
                              name="Bucket Disc %", marker_color=COLORS[4]))
         fig.update_layout(barmode="group")
-        fig = chart_layout(fig,"Discrepancy Rate by Team (%)","Team","Discrepancy %")
+        fig = chart_layout(fig,"Discrepancy Rate by Team (%)","Team","Disc %")
         st.plotly_chart(fig, use_container_width=True)
 
     if rec_col and rec_col in df.columns:
@@ -674,7 +669,7 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
         rd = rd.sort_values("Disc %", ascending=True)
         fig = px.bar(rd, x="Disc %", y="rec", orientation="h",
                      color_discrete_sequence=[COLORS[0]])
-        fig = chart_layout(fig,"Bucket Discrepancy Rate by Rec Name (%)","Discrepancy %","",
+        fig = chart_layout(fig,"Bucket Discrepancy Rate by Rec Name (%)","Disc %","",
                            height=max(300, len(rd)*25))
         st.plotly_chart(fig, use_container_width=True)
 
@@ -697,13 +692,13 @@ def tab_ageing_validation(df: pd.DataFrame, col_map: dict):
             GROUP BY _Period_label ORDER BY _Period_label
         """, df)
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=tr["period"], y=tr["mean_age"],
-                             name="Mean Age Days", marker_color=COLORS[0], opacity=0.7))
+        fig.add_trace(go.Bar(x=tr["period"], y=tr["mean_age"], name="Mean Age Days",
+                             marker_color=COLORS[0], opacity=0.7))
         fig.add_trace(go.Scatter(x=tr["period"], y=tr["median_age"], name="Median",
                                  line=dict(color=COLORS[4], width=2), mode="lines+markers"))
         fig = add_rolling_avg(fig, tr["period"], tr["mean_age"],
                               name="Mean Rolling Avg", color=COLORS[7])
-        fig = chart_layout(fig,"Average Age Days Trend by Period (with Rolling Avg)","Period","Days")
+        fig = chart_layout(fig,"Average Age Days Trend by Period","Period","Days")
         st.plotly_chart(fig, use_container_width=True)
 
     with ct2:
@@ -859,7 +854,7 @@ def tab_break_counts(df: pd.DataFrame, col_map: dict):
                                  line=dict(color=COLORS[4], width=2), mode="lines+markers"))
         fig = add_rolling_avg(fig, p_df["period"], p_df["cnt"],
                               name="Trend (Rolling Avg)", color=COLORS[7])
-        fig = chart_layout(fig,"Break Count Trend by Period (with Rolling Avg)","Period","Count")
+        fig = chart_layout(fig,"Break Count Trend by Period","Period","Count")
         st.plotly_chart(fig, use_container_width=True)
 
     with cb:
@@ -881,7 +876,7 @@ def tab_break_counts(df: pd.DataFrame, col_map: dict):
                 GROUP BY "{rec_col}" ORDER BY COUNT(*) DESC LIMIT 10
             """, df)["rec"].tolist()
             t_str = ", ".join(f"'{str(r).replace(chr(39), chr(39)*2)}'" for r in top10)
-            r_df = dq(f"""
+            r_df  = dq(f"""
                 SELECT "{rec_col}" AS rec, _Period_label AS period, COUNT(*) AS cnt
                 FROM tbl WHERE "{rec_col}" IN ({t_str})
                 GROUP BY "{rec_col}", _Period_label ORDER BY _Period_label
@@ -953,11 +948,11 @@ def tab_amount_analysis(df: pd.DataFrame, col_map: dict):
     prev   = period_order[-2] if len(period_order) >= 2 else "0"
 
     kpi = dq(f"""
-        SELECT SUM(ABS("{amount_col}"))                                            AS total_abs,
-               AVG(ABS("{amount_col}"))                                            AS avg_abs,
-               MAX(ABS("{amount_col}"))                                            AS max_abs,
-               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{latest}')   AS lat_sum,
-               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{prev}')     AS prv_sum
+        SELECT SUM(ABS("{amount_col}"))                                           AS total_abs,
+               AVG(ABS("{amount_col}"))                                           AS avg_abs,
+               MAX(ABS("{amount_col}"))                                           AS max_abs,
+               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{latest}')  AS lat_sum,
+               SUM(ABS("{amount_col}")) FILTER (WHERE _Period_label='{prev}')    AS prv_sum
         FROM tbl
     """, df).iloc[0]
 
@@ -987,7 +982,7 @@ def tab_amount_analysis(df: pd.DataFrame, col_map: dict):
                                  mode="lines+markers", line=dict(color=COLORS[4], width=2)))
         fig = add_rolling_avg(fig, p_df["period"], p_df["total"],
                               name="Trend (Rolling Avg)", color=COLORS[7])
-        fig = chart_layout(fig,"Total ABS GBP by Period (with Rolling Avg)","Period","GBP (£)")
+        fig = chart_layout(fig,"Total ABS GBP by Period","Period","GBP (£)")
         st.plotly_chart(fig, use_container_width=True)
 
     with cb:
@@ -1038,187 +1033,299 @@ def tab_amount_analysis(df: pd.DataFrame, col_map: dict):
         file_name="amount_analysis.csv", mime="text/csv")
 
 
-# ─────────────────────────── Tab 5: Root Cause / Driver Analysis ───────────────────────────
+# ─────────────────────────── Tab 5: Jira Factor Analysis ───────────────────────────
 
-def tab_root_cause(df: pd.DataFrame, col_map: dict):
+def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict):
     """
-    Root Cause / Driver Analysis:
-    Which paths (dimensions) have most influenced break volumes or ageing?
-    Addresses notes requirement: 'Say which paths has influenced / decrease in break-it.'
+    Factor Analysis using Jira Reference, Jira Desc, System to be Fixed.
+    Replaces Root Cause identified — these columns directly indicate which
+    system/Jira ticket is driving the breaks.
     """
-    st.markdown("## Root Cause & Driver Analysis")
+    st.markdown("## Jira Factor Analysis")
     st.markdown(
-        "Identify **which dimensions** (Team, Rec Name, Asset Class, Entity) "
-        "are driving the highest break volumes, worst ageing, and largest amounts."
-    )
+        '<div class="jira-banner">🔍 <b>Factor Analysis:</b> Identify which Jira tickets, '
+        'descriptions, and systems are driving the highest break volumes, worst ageing, '
+        'and largest amounts. Use the dimension selector below to switch between factors.</div>',
+        unsafe_allow_html=True)
 
-    period_col = col_map.get("Period")
-    team_col   = col_map.get("Team")
-    rec_col    = col_map.get("Rec Name (as per Rec Cube)")
-    ac_col     = col_map.get("Asset Class")
-    entity_col = col_map.get("Entity")
-    ts_col     = col_map.get("True/Systemic Breaks")
-    rc_col     = col_map.get("Root Cause identified")
-    abs_col    = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    # ── Resolve Jira columns via fuzzy col map ──
+    jira_ref_col = col_map.get("Jira Reference")
+    jira_desc_col = col_map.get("Jira Desc")
+    system_col   = col_map.get("System to be Fixed")
+    abs_col      = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    team_col     = col_map.get("Team")
+    rec_col      = col_map.get("Rec Name (as per Rec Cube)")
+    period_col   = col_map.get("Period")
 
-    if not period_col or period_col not in df.columns:
-        st.warning("Period column not found."); return
+    # Build available factor options — only show if column exists in df
+    factor_options = {}
+    if jira_ref_col  and jira_ref_col  in df.columns: factor_options["Jira Reference"]     = jira_ref_col
+    if jira_desc_col and jira_desc_col in df.columns: factor_options["Jira Description"]   = jira_desc_col
+    if system_col    and system_col    in df.columns: factor_options["System to be Fixed"] = system_col
 
-    period_order = sorted(df["_Period_label"].dropna().unique().tolist())
-
-    # ── Dimension selector ──
-    dim_options = {k: v for k, v in {
-        "Team": team_col, "Rec Name": rec_col,
-        "Asset Class": ac_col, "Entity": entity_col,
-        "True/Systemic": ts_col, "Root Cause": rc_col,
+    # Also expose the standard driver dimensions alongside Jira columns
+    extra_dims = {k: v for k, v in {
+        "Team":          team_col,
+        "Rec Name":      rec_col,
+        "Asset Class":   col_map.get("Asset Class"),
+        "Entity":        col_map.get("Entity"),
+        "True/Systemic": col_map.get("True/Systemic Breaks"),
     }.items() if v and v in df.columns}
 
-    if not dim_options:
-        st.info("No categorical dimension columns found for driver analysis."); return
+    all_dims = {**factor_options, **extra_dims}
 
-    selected_dim_label = st.selectbox("Select Dimension to Analyse", list(dim_options.keys()),
-                                       key="rc_dim")
-    dim_col = dim_options[selected_dim_label]
+    if not all_dims:
+        st.info("No Jira or dimension columns found. Check column names include "
+                "'Jira Reference', 'Jira Desc', 'System to be Fixed'.")
+        return
 
-    # ── Break Count Driver Table ──
-    st.markdown(f"### Break Count by {selected_dim_label}")
+    # ── Jira Coverage KPIs ──
+    jira_kpis = {}
+    for label, col in factor_options.items():
+        filled = dq(f"""
+            SELECT COUNT(*) AS filled, COUNT(*) FILTER (WHERE "{col}" IS NOT NULL
+              AND TRIM(CAST("{col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')) AS populated
+            FROM tbl
+        """, df).iloc[0]
+        jira_kpis[label] = {
+            "populated": int(filled["populated"]),
+            "total":     int(filled["filled"]),
+            "pct":       round(int(filled["populated"]) / max(int(filled["filled"]),1) * 100, 1),
+        }
 
-    driver_sql = f"""
-        SELECT "{dim_col}" AS dimension,
+    if jira_kpis:
+        st.markdown("### Jira Column Coverage")
+        cols = st.columns(len(jira_kpis))
+        for i, (label, kdata) in enumerate(jira_kpis.items()):
+            with cols[i]:
+                kpi_card(f"{label} Coverage",
+                         f"{kdata['pct']}%",
+                         f"{format_number(kdata['populated'])} / {format_number(kdata['total'])} rows",
+                         warn=(kdata["pct"] < 50))
+
+    st.markdown("---")
+    selected_label = st.selectbox(
+        "Select Factor Dimension",
+        list(all_dims.keys()), key="jira_dim_sel",
+    )
+    dim_col = all_dims[selected_label]
+
+    period_order = sorted(df["_Period_label"].dropna().unique().tolist()) \
+                   if "_Period_label" in df.columns else []
+    latest = period_order[-1] if period_order else "0"
+    prev   = period_order[-2] if len(period_order) >= 2 else "0"
+
+    # ── Driver Summary Table — DuckDB aggregation ──
+    st.markdown(f"### {selected_label} — Factor Summary Table")
+
+    age_clause    = 'AVG(_Computed_Age_Days) AS avg_age_days, MAX(_Computed_Age_Days) AS max_age_days,' \
+                    if "_Computed_Age_Days" in df.columns else ""
+    amount_clause = f'SUM(ABS("{abs_col}")) AS total_abs_gbp,' if abs_col and abs_col in df.columns else ""
+    over90_clause = 'COUNT(*) FILTER (WHERE _Computed_Age_Days > 90)  AS count_over_90d,' \
+                    if "_Computed_Age_Days" in df.columns else ""
+    over365_clause= 'COUNT(*) FILTER (WHERE _Computed_Age_Days > 365) AS count_over_365d' \
+                    if "_Computed_Age_Days" in df.columns else "0 AS count_over_365d"
+
+    summary_df = dq(f"""
+        SELECT "{dim_col}" AS factor,
                COUNT(*) AS break_count,
-               {f'AVG(_Computed_Age_Days) AS avg_age_days,' if '_Computed_Age_Days' in df.columns else ''}
-               {f'MAX(_Computed_Age_Days) AS max_age_days,' if '_Computed_Age_Days' in df.columns else ''}
-               {f'SUM(ABS("{abs_col}")) AS total_abs_gbp,' if abs_col else ''}
-               COUNT(*) FILTER (WHERE _Computed_Age_Days > 90)  AS count_over_90d,
-               COUNT(*) FILTER (WHERE _Computed_Age_Days > 365) AS count_over_365d
+               {age_clause}
+               {amount_clause}
+               {over90_clause}
+               {over365_clause}
         FROM tbl
         WHERE "{dim_col}" IS NOT NULL
+          AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
         GROUP BY "{dim_col}"
         ORDER BY break_count DESC
-    """
-    driver_df = dq(driver_sql, df)
+    """, df)
 
-    # Clean up column names
-    driver_df = driver_df.rename(columns={
-        "dimension": selected_dim_label,
-        "break_count": "Break Count",
-        "avg_age_days": "Avg Age Days",
-        "max_age_days": "Max Age Days",
-        "total_abs_gbp": "Total ABS GBP (£)",
+    summary_df = summary_df.rename(columns={
+        "factor":         selected_label,
+        "break_count":    "Break Count",
+        "avg_age_days":   "Avg Age Days",
+        "max_age_days":   "Max Age Days",
+        "total_abs_gbp":  "Total ABS GBP",
         "count_over_90d": "Count > 90 Days",
-        "count_over_365d": "Count > 365 Days",
+        "count_over_365d":"Count > 365 Days",
     })
+    if "Total ABS GBP" in summary_df.columns:
+        summary_df["Total ABS GBP"] = summary_df["Total ABS GBP"].apply(format_short)
+    if "Avg Age Days" in summary_df.columns:
+        summary_df["Avg Age Days"] = summary_df["Avg Age Days"].round(1)
 
-    if "Total ABS GBP (£)" in driver_df.columns:
-        driver_df["Total ABS GBP (£)"] = driver_df["Total ABS GBP (£)"].apply(format_short)
-    if "Avg Age Days" in driver_df.columns:
-        driver_df["Avg Age Days"] = driver_df["Avg Age Days"].round(1)
+    render_aggrid(summary_df, height=380, key="jira_summary_grid")
 
-    render_aggrid(driver_df, height=350, key="rc_driver_grid")
+    st.markdown("---")
+    row1a, row1b = st.columns(2)
 
     # ── Top 10 by Break Count ──
-    ra, rb = st.columns(2)
-    with ra:
-        top_df = dq(f"""
-            SELECT "{dim_col}" AS dim, COUNT(*) AS cnt
-            FROM tbl WHERE "{dim_col}" IS NOT NULL
+    with row1a:
+        top_cnt = dq(f"""
+            SELECT "{dim_col}" AS factor, COUNT(*) AS cnt
+            FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
             GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 10
         """, df).sort_values("cnt", ascending=True)
-        fig = px.bar(top_df, x="cnt", y="dim", orientation="h",
+        fig = px.bar(top_cnt, x="cnt", y="factor", orientation="h",
                      color_discrete_sequence=[PRIMARY])
-        fig = chart_layout(fig,f"Top 10 {selected_dim_label} by Break Count","Count",
-                           height=max(300, len(top_df)*30))
+        fig = chart_layout(fig, f"Top 10 {selected_label} by Break Count",
+                           "Break Count", "", height=max(320, len(top_cnt)*32))
         st.plotly_chart(fig, use_container_width=True)
 
-    with rb:
+    # ── Top 10 by Avg Age Days ──
+    with row1b:
         if "_Computed_Age_Days" in df.columns:
             top_age = dq(f"""
-                SELECT "{dim_col}" AS dim, AVG(_Computed_Age_Days) AS avg_age
-                FROM tbl WHERE "{dim_col}" IS NOT NULL AND _Computed_Age_Days IS NOT NULL
+                SELECT "{dim_col}" AS factor, AVG(_Computed_Age_Days) AS avg_age
+                FROM tbl
+                WHERE "{dim_col}" IS NOT NULL
+                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
+                  AND _Computed_Age_Days IS NOT NULL
                 GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 10
             """, df).sort_values("avg_age", ascending=True)
-            fig = px.bar(top_age, x="avg_age", y="dim", orientation="h",
+            fig = px.bar(top_age, x="avg_age", y="factor", orientation="h",
                          color_discrete_sequence=[COLORS[4]])
-            fig = chart_layout(fig,f"Top 10 {selected_dim_label} by Avg Age Days","Avg Days",
-                               height=max(300, len(top_age)*30))
+            fig = chart_layout(fig, f"Top 10 {selected_label} by Avg Age Days",
+                               "Avg Age Days", "", height=max(320, len(top_age)*32))
             st.plotly_chart(fig, use_container_width=True)
 
-    # ── Period trend for selected dimension (top 5 values) ──
-    st.markdown(f"### {selected_dim_label} Break Count Trend Over Periods (Top 5)")
-    top5 = dq(f"""
-        SELECT "{dim_col}" AS dim FROM tbl
-        WHERE "{dim_col}" IS NOT NULL
-        GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
-    """, df)["dim"].tolist()
-    top5_str = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5)
-    trend_df = dq(f"""
-        SELECT "{dim_col}" AS dim, _Period_label AS period, COUNT(*) AS cnt
-        FROM tbl WHERE "{dim_col}" IN ({top5_str})
-        GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
-    """, df)
-    fig = px.line(trend_df, x="period", y="cnt", color="dim",
-                  color_discrete_sequence=COLORS, markers=True)
-    fig = chart_layout(fig, f"Top 5 {selected_dim_label} — Break Count Trend","Period","Count")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── Root Cause breakdown (if column available) ──
-    if rc_col and rc_col in df.columns:
-        st.markdown("### Root Cause Distribution")
-        rc_data, rc_b = st.columns(2)
-        with rc_
-            rc_df = dq(f"""
-                SELECT "{rc_col}" AS root_cause, COUNT(*) AS cnt
-                FROM tbl WHERE "{rc_col}" IS NOT NULL
-                GROUP BY "{rc_col}" ORDER BY cnt DESC LIMIT 15
-            """, df)
-            fig = px.bar(rc_df.sort_values("cnt", ascending=True),
-                         x="cnt", y="root_cause", orientation="h",
-                         color_discrete_sequence=[COLORS[0]])
-            fig = chart_layout(fig,"Root Cause Identified — Break Count",
-                               "Count","",height=max(300, len(rc_df)*25))
+    # ── Top 10 by ABS GBP ──
+    if abs_col and abs_col in df.columns:
+        row2a, row2b = st.columns(2)
+        with row2a:
+            top_amt = dq(f"""
+                SELECT "{dim_col}" AS factor, SUM(ABS("{abs_col}")) AS total
+                FROM tbl
+                WHERE "{dim_col}" IS NOT NULL
+                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
+                GROUP BY "{dim_col}" ORDER BY total DESC LIMIT 10
+            """, df).sort_values("total", ascending=True)
+            top_amt["label"] = top_amt["total"].apply(format_short)
+            fig = px.bar(top_amt, x="total", y="factor", orientation="h",
+                         color_discrete_sequence=[COLORS[2]])
+            fig.update_traces(text=top_amt["label"], textposition="outside")
+            fig = chart_layout(fig, f"Top 10 {selected_label} by ABS GBP",
+                               "GBP (£)", "", height=max(320, len(top_amt)*32))
             st.plotly_chart(fig, use_container_width=True)
 
-        with rc_b:
-            fig = px.pie(rc_df, values="cnt", names="root_cause",
-                         color_discrete_sequence=COLORS, hole=0.4)
-            fig = chart_layout(fig,"Root Cause Share","","",height=400)
-            st.plotly_chart(fig, use_container_width=True)
+        # ── High-risk (>90 days) share by factor ──
+        with row2b:
+            if "_Computed_Age_Days" in df.columns:
+                risk_df = dq(f"""
+                    SELECT "{dim_col}" AS factor,
+                           COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE _Computed_Age_Days > 90) AS over90
+                    FROM tbl
+                    WHERE "{dim_col}" IS NOT NULL
+                      AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
+                      AND _Computed_Age_Days IS NOT NULL
+                    GROUP BY "{dim_col}" ORDER BY over90 DESC LIMIT 10
+                """, df)
+                risk_df[">90 Day %"] = (risk_df["over90"] / risk_df["total"] * 100).round(1)
+                risk_df = risk_df.sort_values(">90 Day %", ascending=True)
+                fig = px.bar(risk_df, x=">90 Day %", y="factor", orientation="h",
+                             color_discrete_sequence=[WARN])
+                fig = chart_layout(fig, f"Top 10 {selected_label} — % Breaks > 90 Days",
+                                   "% of Breaks > 90 Days", "",
+                                   height=max(320, len(risk_df)*32))
+                st.plotly_chart(fig, use_container_width=True)
 
-    # ── MoM Change by Dimension — which driver is declining/rising? ──
-    st.markdown(f"### MoM Change by {selected_dim_label} (Latest vs Previous Period)")
+    # ── Period Trend for Top 5 values of selected dimension ──
+    if "_Period_label" in df.columns and period_order:
+        st.markdown(f"### {selected_label} — Break Count Trend Over Periods (Top 5)")
+        top5 = dq(f"""
+            SELECT "{dim_col}" AS factor FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
+            GROUP BY "{dim_col}" ORDER BY COUNT(*) DESC LIMIT 5
+        """, df)["factor"].tolist()
+        top5_str = ", ".join(f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in top5)
+        trend_df = dq(f"""
+            SELECT "{dim_col}" AS factor, _Period_label AS period, COUNT(*) AS cnt
+            FROM tbl WHERE "{dim_col}" IN ({top5_str})
+            GROUP BY "{dim_col}", _Period_label ORDER BY _Period_label
+        """, df)
+        fig = px.line(trend_df, x="period", y="cnt", color="factor",
+                      color_discrete_sequence=COLORS, markers=True)
+        fig = chart_layout(fig, f"Top 5 {selected_label} — Break Count Trend","Period","Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── MoM Change by Factor — which is driving increase/decrease? ──
     if len(period_order) >= 2:
+        st.markdown(f"### MoM Change by {selected_label}  ({prev} → {latest})")
         mom_df = dq(f"""
-            SELECT "{dim_col}" AS dim,
-                   COUNT(*) FILTER (WHERE _Period_label='{latest if (latest:=period_order[-1]) else ""}')  AS lat,
-                   COUNT(*) FILTER (WHERE _Period_label='{prev if (prev:=period_order[-2]) else ""}')   AS prv
-            FROM tbl WHERE "{dim_col}" IS NOT NULL GROUP BY "{dim_col}"
+            SELECT "{dim_col}" AS factor,
+                   COUNT(*) FILTER (WHERE _Period_label='{latest}') AS lat,
+                   COUNT(*) FILTER (WHERE _Period_label='{prev}')   AS prv
+            FROM tbl
+            WHERE "{dim_col}" IS NOT NULL
+              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
+            GROUP BY "{dim_col}"
         """, df)
         mom_df["MoM Δ"]   = mom_df["lat"] - mom_df["prv"]
         mom_df["MoM Δ %"] = ((mom_df["lat"] - mom_df["prv"]) /
                               mom_df["prv"].replace(0, np.nan) * 100).round(1)
         mom_df = mom_df.sort_values("MoM Δ")
-
         colors_mom = [COLORS[0] if v >= 0 else COLORS[4] for v in mom_df["MoM Δ"]]
         fig = go.Figure(go.Bar(
-            x=mom_df["MoM Δ"], y=mom_df["dim"],
-            orientation="h", marker_color=colors_mom,
+            x=mom_df["MoM Δ"], y=mom_df["factor"], orientation="h",
+            marker_color=colors_mom,
             text=mom_df["MoM Δ"].apply(lambda x: f"+{x}" if x >= 0 else str(x)),
             textposition="outside",
         ))
         fig.add_vline(x=0, line_dash="dash", line_color=MUTED, line_width=1)
         fig = chart_layout(fig,
-            f"MoM Break Count Change by {selected_dim_label} ({prev} → {latest})",
+            f"MoM Break Count Change by {selected_label}",
             "Change in Break Count","",
-            height=max(350, len(mom_df)*28))
+            height=max(380, len(mom_df)*28))
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("🟢 Teal = Increase (more breaks)  🔴 Red = Decrease (fewer breaks — improvement)")
+        st.caption("🟩 Teal = Increase in breaks  🟥 Red = Decrease in breaks (improvement)")
+
+    # ── Cross-factor: Jira Reference × System to be Fixed heatmap ──
+    if (jira_ref_col and jira_ref_col in df.columns and
+            system_col  and system_col  in df.columns and
+            selected_label in ("Jira Reference","System to be Fixed")):
+        st.markdown("### Jira Reference × System to be Fixed — Break Count Heatmap")
+        cross = dq(f"""
+            SELECT "{jira_ref_col}" AS jira_ref,
+                   "{system_col}"   AS system_fix,
+                   COUNT(*) AS cnt
+            FROM tbl
+            WHERE "{jira_ref_col}" IS NOT NULL AND "{system_col}" IS NOT NULL
+              AND TRIM(CAST("{jira_ref_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A')
+              AND TRIM(CAST("{system_col}"   AS VARCHAR)) NOT IN ('','nan','None','N/A')
+            GROUP BY "{jira_ref_col}", "{system_col}"
+            ORDER BY cnt DESC
+            LIMIT 200
+        """, df)
+        if len(cross) > 0:
+            pivot = cross.pivot_table(index="jira_ref", columns="system_fix",
+                                      values="cnt", fill_value=0)
+            # Limit heatmap to top 20 jira refs for readability
+            top20 = cross.groupby("jira_ref")["cnt"].sum().nlargest(20).index
+            pivot = pivot.loc[pivot.index.isin(top20)]
+            fig = px.imshow(pivot, color_continuous_scale=["#E8F5E9","#FFC553","#A84B2F"],
+                            aspect="auto", text_auto=".0f")
+            fig = chart_layout(fig,"Jira Reference × System to be Fixed (Break Count)",
+                               "","", height=max(350, len(pivot)*28))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Download factor summary ──
+    st.download_button(
+        f"📥 Download {selected_label} Factor Summary (CSV)",
+        summary_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"factor_analysis_{selected_label.replace(' ','_').lower()}.csv",
+        mime="text/csv",
+    )
 
 
 # ─────────────────────────── Main ───────────────────────────
 
 def main():
     st.sidebar.title("📊 Accounting Control AI")
-    st.sidebar.markdown("*Phase 1 — DuckDB + Vectorised*")
+    st.sidebar.markdown("*Phase 1 — DuckDB + Jira Factor Analysis*")
     st.sidebar.markdown("---")
 
     uploaded = st.sidebar.file_uploader(
@@ -1229,7 +1336,7 @@ def main():
 
     if uploaded is None:
         st.markdown("## 👋 Welcome to Accounting Control AI Platform")
-        st.info("Upload a **CSV**, **Excel**, or **Parquet** file to begin.")
+        st.info("Upload your **MI Report** (CSV, Excel, or Parquet) to begin.")
         st.markdown("""
         | Format | First Load | Reruns |
         |---|---|---|
@@ -1237,25 +1344,32 @@ def main():
         | `.csv`     | 🟢 ~1–2s  | ⚡ Instant (cached) |
         | `.xlsx`    | 🟡 ~4–6s  | ⚡ Instant (cached) |
 
-        > After first load, **every rerun is instant** — `@st.cache_data` holds the DataFrame
-        > in memory for the session. Download the **Parquet** from the Data Quality tab
-        > for ~0.2s loads in future sessions.
+        **Tabs available:**
+        - 🧹 Data Quality — completeness, violations, outliers
+        - 📅 Ageing Validation — age days & bucket discrepancy check
+        - 📈 Break Counts — period trend analysis
+        - 💷 Amount Analysis — ABS GBP trend analysis
+        - 🔍 Jira Factor Analysis — Jira Ref / Jira Desc / System to be Fixed driver analysis
         """)
         return
 
     file_bytes = uploaded.read()
     fname      = uploaded.name
 
-    df, col_map, filter_options, violations_df = clean_dataframe(file_bytes, fname)
+    df, col_map, filter_options, violations_df, dropped_cols = clean_dataframe(file_bytes, fname)
 
     vcount = int(violations_df["Violation Count"].sum()) if len(violations_df) else 0
     st.sidebar.markdown(f"""
     **File:** `{fname}`
     **Rows:** {len(df):,} &nbsp;|&nbsp; **Cols:** {len(df.columns)}
     """)
+    if dropped_cols:
+        st.sidebar.markdown(
+            f'<span style="color:{MUTED};font-size:0.8rem">🗑️ {len(dropped_cols)} blank col(s) removed</span>',
+            unsafe_allow_html=True)
     if vcount > 0:
         st.sidebar.markdown(
-            f'<span style="color:#A84B2F;font-weight:600">⚠️ {vcount} type violations</span>',
+            f'<span style="color:{WARN};font-weight:600">⚠️ {vcount} type violations</span>',
             unsafe_allow_html=True)
 
     df_filtered = apply_global_filters(df, col_map, filter_options)
@@ -1266,13 +1380,13 @@ def main():
         "📅 Ageing Validation",
         "📈 Break Counts",
         "💷 Amount Analysis",
-        "🔍 Root Cause",
+        "🔍 Jira Factor Analysis",
     ])
-    with tab1: tab_data_quality(df_filtered, col_map, violations_df, file_bytes, fname)
+    with tab1: tab_data_quality(df_filtered, col_map, violations_df, file_bytes, fname, dropped_cols)
     with tab2: tab_ageing_validation(df_filtered, col_map)
     with tab3: tab_break_counts(df_filtered, col_map)
     with tab4: tab_amount_analysis(df_filtered, col_map)
-    with tab5: tab_root_cause(df_filtered, col_map)
+    with tab5: tab_jira_factor_analysis(df_filtered, col_map)
 
 
 if __name__ == "__main__":
