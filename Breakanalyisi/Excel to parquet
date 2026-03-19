@@ -1,0 +1,31 @@
+import os
+import pandas as pd
+
+excel_file = "file.xlsx"
+parquet_file = "file.parquet"
+
+if os.path.exists(parquet_file):
+    print("Loading from parquet (FAST)")
+    df = pd.read_parquet(parquet_file)
+else:
+    print("Reading Excel (FIRST TIME)")
+    df = pd.read_excel(excel_file, engine="calamine")
+    df.to_parquet(parquet_file, engine="pyarrow", compression="snappy")
+
+
+import pandas as pd
+
+df = pd.read_csv(r"C:\Users\45261673\Desktop\Document\Accounting Control Docs\Nov_Feb_AC_monthly.csv")
+
+# FIX problematic columns
+df["TRADE REF"] = df["TRADE REF"].astype(str)
+
+# Optional: handle NaN properly
+df["TRADE REF"] = df["TRADE REF"].fillna("")
+
+# Save parquet
+df.to_parquet(
+    r"C:\Users\45261673\Desktop\Document\Accounting Control Docs\Nov_Feb_AC_monthly.parquet",
+    engine="pyarrow",
+    compression="snappy"
+)
