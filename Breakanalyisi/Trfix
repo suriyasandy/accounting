@@ -1,0 +1,101 @@
+# ================================
+# STEP 1: Merge Period Breakdown
+# ================================
+_trade_stats = _trade_stats.merge(
+    _period_brkdown,
+    on=["RecName", "Trade ID"],
+    how="left"
+)
+
+# ================================
+# STEP 2: Classify Trade IDs (FIXED LOGIC)
+# ================================
+def _classify_trade(row):
+    # Priority order (prevents double counting)
+
+    if row.get("is_dup_stale", False):
+        return "Duplicate + Stale"
+
+    if row.get("max_in_period", 0) >= 2:
+        return "Duplicate"
+
+    if row.get("is_stale", False):
+        return "Recurring + Stale"
+
+    if row.get("distinct_periods", 0) >= 2:
+        return "Recurring"
+
+    return "New"
+
+
+_trade_stats["Type"] = _trade_stats.apply(_classify_trade, axis=1)
+
+# ================================
+# STEP 3: Aggregate (NO OVERLAP)
+# ================================
+_rec_summary = (
+    _trade_stats.groupby("RecName")
+    .agg(
+        unique_tradeid_count=("Trade ID", "nunique"),
+
+        new_count=("Type", lambda x: (x == "New").sum()),
+        recurring_count=("Type", lambda x: (x == "Recurring").sum()),
+        recurring_stale_count=("Type", lambda x: (x == "Recurring + Stale").sum()),
+        duplicate_count=("Type", lambda x: (x == "Duplicate").sum()),
+        dup_stale_count=("Type", lambda x: (x == "Duplicate + Stale").sum()),
+    )
+    .reset_index()
+)
+
+# ================================
+# STEP 4: Rename Columns (UI READY)
+# ================================
+_rec_summary.columns = [
+    "RecName",
+    "Unique Tradeid Count",
+    "No. of New Tradeids",
+    "No. of Recurring Tradeids",
+    "No. of Recurring + Stale Tradeids",
+    "No. of Duplicate Tradeids",
+    "No. of Dup+Stale Tradeids",
+]
+
+# ================================
+# STEP 5: Convert to Integer
+# ================================
+for col in [
+    "No. of New Tradeids",
+    "No. of Recurring Tradeids",
+    "No. of Recurring + Stale Tradeids",
+    "No. of Duplicate Tradeids",
+    "No. of Dup+Stale Tradeids",
+]:
+    _rec_summary[col] = _rec_summary[col].astype(int)
+
+# ================================
+# STEP 6: VALIDATION (IMPORTANT)
+# ================================
+_rec_summary["Check_Total"] = (
+    _rec_summary["No. of New Tradeids"]
+    + _rec_summary["No. of Recurring Tradeids"]
+    + _rec_summary["No. of Recurring + Stale Tradeids"]
+    + _rec_summary["No. of Duplicate Tradeids"]
+    + _rec_summary["No. of Dup+Stale Tradeids"]
+)
+
+# Debug check (should ALWAYS match)
+print(
+    _rec_summary[
+        ["RecName", "Unique Tradeid Count", "Check_Total"]
+    ]
+)
+
+# Optional: assert for safety
+assert all(
+    _rec_summary["Unique Tradeid Count"] == _rec_summary["Check_Total"]
+), "Mismatch detected in counts!"
+
+# ================================
+# FINAL OUTPUT
+# ================================
+# _rec_summary → use this in Streamlit AGGrid
