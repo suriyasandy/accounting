@@ -99,3 +99,59 @@ assert all(
 # FINAL OUTPUT
 # ================================
 # _rec_summary → use this in Streamlit AGGrid
+
+
+
+# ================================
+# STEP: % Recurring Breaks (FIXED)
+# ================================
+
+# Get recurring trade IDs (based on FINAL Type)
+_recur_ids = set(
+    _trade_stats.loc[
+        _trade_stats["Type"].isin(["Recurring", "Recurring + Stale"]),
+        "Trade ID"
+    ].astype(str)
+)
+
+# Get recurring rows from original dataset
+_recur_rows = (
+    _df[
+        _df[rec_col].notna() &
+        _df[trade_ref_col].astype(str).isin(_recur_ids)
+    ]
+    .groupby(rec_col)
+    .size()
+    .reset_index(name="_recur_rows")
+    .rename(columns={rec_col: "RecName"})
+)
+
+# Merge with summary
+_rec_summary = _rec_summary.merge(_total_rows, on="RecName", how="left")
+_rec_summary = _rec_summary.merge(_recur_rows, on="RecName", how="left")
+
+# Fill nulls
+_rec_summary["_recur_rows"] = _rec_summary["_recur_rows"].fillna(0).astype(int)
+
+# Calculate %
+_rec_summary["% Recurring Breaks"] = (
+    _rec_summary["_recur_rows"] /
+    _rec_summary["_total_rows"].replace(0, np.nan) * 100
+).round(1).fillna(0.0)
+
+# Drop helper columns
+_rec_summary = _rec_summary.drop(columns=["_total_rows", "_recur_rows"])
+
+# Sort
+_rec_summary = _rec_summary.sort_values(
+    "No. of Recurring Tradeids",
+    ascending=False
+).reset_index(drop=True)
+
+# Reset index for trade stats
+_trade_stats = _trade_stats.reset_index(drop=True)
+
+# ================================
+# FINAL RETURN
+# ================================
+return _trade_stats, _rec_summary
