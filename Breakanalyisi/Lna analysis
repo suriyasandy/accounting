@@ -1,0 +1,17 @@
+import zipfile
+import xml.etree.ElementTree as ET
+
+# 1. Open the .lna as a zip archive
+lna_path = 'your_workflow.lna'
+with zipfile.ZipFile(lna_path, 'r') as z:
+    # 2. Extract the main definition (usually 'dataflow.xml' or similar)
+    # The actual filename inside may vary by Data360 version
+    with z.open('dataflow.xml') as f:
+        tree = ET.parse(f)
+        root = tree.getroot()
+
+        # 3. List all nodes in the workflow
+        for node in root.findall('.//node'):
+            name = node.get('name')
+            node_type = node.get('type')
+            print(f"Node Name: {name} | Type: {node_type}")
