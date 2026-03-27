@@ -1,14 +1,14 @@
-import zipfile
-import os
+import xml.dom.minidom
 
-lna_file = "workflow.lna"
-extract_dir = "extracted_lna"
+xml_file = "extracted_lna/project.xml"
 
-# Create output directory
-os.makedirs(extract_dir, exist_ok=True)
+with open(xml_file, "r", encoding="utf-8") as f:
+    xml_content = f.read()
 
-# Extract contents
-with zipfile.ZipFile(lna_file, 'r') as zip_ref:
-    zip_ref.extractall(extract_dir)
+dom = xml.dom.minidom.parseString(xml_content)
+pretty_xml = dom.toprettyxml()
 
-print("Extraction completed!")
+with open("formatted.xml", "w", encoding="utf-8") as f:
+    f.write(pretty_xml)
+
+print("XML formatted and saved!")
