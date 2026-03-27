@@ -1,14 +1,27 @@
-import xml.dom.minidom
+def extract_strings(file_path, min_length=6):
+    with open(file_path, "rb") as f:
+        data = f.read()
 
-xml_file = "extracted_lna/project.xml"
+    strings = []
+    current = ""
 
-with open(xml_file, "r", encoding="utf-8") as f:
-    xml_content = f.read()
+    for byte in data:
+        if 32 <= byte <= 126:  # printable ASCII
+            current += chr(byte)
+        else:
+            if len(current) >= min_length:
+                strings.append(current)
+            current = ""
 
-dom = xml.dom.minidom.parseString(xml_content)
-pretty_xml = dom.toprettyxml()
+    return strings
 
-with open("formatted.xml", "w", encoding="utf-8") as f:
-    f.write(pretty_xml)
 
-print("XML formatted and saved!")
+lod_file = "extracted_lna/your_file.lod"
+strings = extract_strings(lod_file)
+
+# Save for inspection
+with open("lod_strings.txt", "w") as f:
+    for s in strings:
+        f.write(s + "\n")
+
+print("Extracted readable content!")
