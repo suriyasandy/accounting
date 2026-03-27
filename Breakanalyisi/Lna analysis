@@ -1,143 +1,159 @@
 import re
 import json
-from collections import defaultdict
 
-# -----------------------------
-# STEP 1: Load and clean file
-# -----------------------------
+
+# ==========================================
+# STEP 1: Load file
+# ==========================================
 def load_lod(file_path):
     with open(file_path, "rb") as f:
-        content = f.read().decode(errors="ignore")
-    return content
+        return f.read().decode(errors="ignore")
 
 
-# -----------------------------
-# STEP 2: Extract node blocks
-# -----------------------------
-def extract_node_blocks(content):
-    # Capture blocks that contain internalName (node type)
-    pattern = r'\{[^{}]*"internalName"\s*:\s*".*?"[^{}]*\}'
-    return re.findall(pattern, content, re.DOTALL)
+# ==========================================
+# STEP 2: Clean escaped code
+# ==========================================
+def clean_code(code):
+    if not code:
+        return code
+
+    code = code.replace("\\n", "\n")
+    code = code.replace('\\"', '"')
+    code = code.replace("\\t", "\t")
+    code = code.replace("\\r", "")
+    return code.strip()
 
 
-# -----------------------------
-# STEP 3: Parse each node
-# -----------------------------
-def parse_nodes(node_blocks):
+# ==========================================
+# STEP 3: Extract nodes + logic
+# ==========================================
+def extract_nodes(content):
     nodes = []
 
-    for block in node_blocks:
+    # Split based on internalName (node type)
+    chunks = re.split(r'"internalName"\s*:\s*"', content)
+
+    for chunk in chunks[1:]:
         node = {}
 
+        # -----------------------------
+        # Node Type
+        # -----------------------------
+        node_type = chunk.split('"')[0]
+        node["type"] = node_type
+
+        # -----------------------------
         # Node ID
-        id_match = re.search(r'"id"\s*:\s*"([^"]+)"', block)
-        node_id = id_match.group(1) if id_match else None
+        # -----------------------------
+        id_match = re.search(r'"id"\s*:\s*"([^"]+)"', chunk)
+        node["id"] = id_match.group(1) if id_match else None
 
-        # Node Type (VERY IMPORTANT)
-        type_match = re.search(r'"internalName"\s*:\s*"([^"]+)"', block)
-        node_type = type_match.group(1) if type_match else "Unknown"
-
+        # -----------------------------
         # Inputs / Outputs
-        inputs = re.findall(r'"id"\s*:\s*"(__in_[^"]+__)"', block)
-        outputs = re.findall(r'"id"\s*:\s*"(__out_[^"]+__)"', block)
+        # -----------------------------
+        inputs = re.findall(r'"id"\s*:\s*"(__in_[^"]+__)"', chunk)
+        outputs = re.findall(r'"id"\s*:\s*"(__out_[^"]+__)"', chunk)
 
-        # Parameters (basic key-value)
-        params = dict(re.findall(r'"(\w+)"\s*:\s*"([^"]+)"', block))
+        node["inputs"] = list(set(inputs))
+        node["outputs"] = list(set(outputs))
 
-        node = {
-            "id": node_id,
-            "type": node_type,
-            "inputs": inputs,
-            "outputs": outputs,
-            "parameters": params
-        }
+        # -----------------------------
+        # Extract Parameters (CORE)
+        # -----------------------------
+        param_blocks = re.findall(
+            r'"parameterName"\s*:\s*"([^"]+)".*?"value"\s*:\s*"(.*?)"',
+            chunk,
+            re.DOTALL
+        )
+
+        logic = {}
+        for name, value in param_blocks:
+            logic[name] = clean_code(value)
+
+        node["operations"] = logic
 
         nodes.append(node)
 
     return nodes
 
 
-# -----------------------------
-# STEP 4: Extract connections (edges)
-# -----------------------------
+# ==========================================
+# STEP 4: Extract edges (best effort)
+# ==========================================
 def extract_edges(content):
     edges = []
 
-    # Extract connectable IDs (best effort pairing)
-    matches = re.findall(
-        r'"connectableId"\s*:\s*"([^"]+)"',
-        content
-    )
+    connect_ids = re.findall(r'"connectableId"\s*:\s*"([^"]+)"', content)
 
-    # Pair sequentially (approximation)
-    for i in range(0, len(matches) - 1, 2):
+    # Pair sequentially
+    for i in range(0, len(connect_ids) - 1, 2):
         edges.append({
-            "source": matches[i],
-            "target": matches[i + 1]
+            "source": connect_ids[i],
+            "target": connect_ids[i + 1]
         })
 
     return edges
 
 
-# -----------------------------
-# STEP 5: Improve parameter extraction (nested)
-# -----------------------------
-def extract_advanced_parameters(content):
-    param_map = defaultdict(dict)
+# ==========================================
+# STEP 5: Build execution sequence
+# ==========================================
+def build_execution_sequence(nodes):
+    sequence = []
 
-    # Example: GroupBy, sortOrder etc.
-    param_blocks = re.findall(
-        r'"parameterGroups".*?\[(.*?)\]',
-        content,
-        re.DOTALL
-    )
+    for idx, node in enumerate(nodes):
+        step = {
+            "step": idx + 1,
+            "node_id": node["id"],
+            "type": node["type"],
+            "inputs": node["inputs"],
+            "outputs": node["outputs"],
+            "operations": node["operations"]
+        }
 
-    for block in param_blocks:
-        kv_pairs = re.findall(r'"(\w+)"\s*:\s*"([^"]+)"', block)
-        for k, v in kv_pairs:
-            param_map[k] = v
+        sequence.append(step)
 
-    return dict(param_map)
+    return sequence
 
 
-# -----------------------------
-# STEP 6: Build final structure
-# -----------------------------
-def build_workflow(file_path):
+# ==========================================
+# STEP 6: Main parser
+# ==========================================
+def parse_lod(file_path):
     content = load_lod(file_path)
 
-    node_blocks = extract_node_blocks(content)
-    nodes = parse_nodes(node_blocks)
+    nodes = extract_nodes(content)
     edges = extract_edges(content)
-    global_params = extract_advanced_parameters(content)
+    sequence = build_execution_sequence(nodes)
 
     workflow = {
         "nodes": nodes,
         "edges": edges,
-        "global_parameters": global_params
+        "execution_sequence": sequence
     }
 
     return workflow
 
 
-# -----------------------------
+# ==========================================
 # STEP 7: Save output
-# -----------------------------
-def save_workflow(workflow, output_file="workflow.json"):
+# ==========================================
+def save_output(workflow, output_file="parsed_workflow.json"):
     with open(output_file, "w") as f:
         json.dump(workflow, f, indent=4)
-    print(f"✅ Workflow saved to {output_file}")
+
+    print(f"\n✅ Output saved to {output_file}")
+    print(f"📊 Nodes: {len(workflow['nodes'])}")
+    print(f"🔗 Edges: {len(workflow['edges'])}")
+    print(f"⚙️ Steps: {len(workflow['execution_sequence'])}")
 
 
-# -----------------------------
+# ==========================================
 # MAIN
-# -----------------------------
+# ==========================================
 if __name__ == "__main__":
-    file_path = "your_file.lod"   # 👈 update path
+    file_path = "your_file.lod"   # 👈 UPDATE THIS
 
-    workflow = build_workflow(file_path)
+    workflow = parse_lod(file_path)
 
-    save_workflow(workflow)
-
-    print(f"Nodes parsed: {len(workflow['nodes'])}")
-    print(f"Edges parsed: {len(workflow['edges'])}")
+    save_output(workflow)
