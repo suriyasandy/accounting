@@ -1,27 +1,62 @@
-def extract_strings(file_path, min_length=6):
-    with open(file_path, "rb") as f:
-        data = f.read()
-
-    strings = []
-    current = ""
-
-    for byte in data:
-        if 32 <= byte <= 126:  # printable ASCII
-            current += chr(byte)
-        else:
-            if len(current) >= min_length:
-                strings.append(current)
-            current = ""
-
-    return strings
-
+import re
+import json
 
 lod_file = "extracted_lna/your_file.lod"
-strings = extract_strings(lod_file)
 
-# Save for inspection
-with open("lod_strings.txt", "w") as f:
-    for s in strings:
-        f.write(s + "\n")
+with open(lod_file, "rb") as f:
+    content = f.read().decode(errors="ignore")
 
-print("Extracted readable content!")
+
+# -------------------------
+# Extract Nodes
+# -------------------------
+node_pattern = re.findall(r'node.*?id\s*=\s*(\w+).*?type\s*=\s*(\w+)', content, re.DOTALL)
+
+nodes = []
+for n in node_pattern:
+    nodes.append({
+        "id": n[0],
+        "type": n[1]
+    })
+
+
+# -------------------------
+# Extract Connections
+# -------------------------
+edge_pattern = re.findall(r'connection.*?source\s*=\s*(\w+).*?target\s*=\s*(\w+)', content)
+
+edges = []
+for e in edge_pattern:
+    edges.append({
+        "source": e[0],
+        "target": e[1]
+    })
+
+
+# -------------------------
+# Extract Properties
+# -------------------------
+prop_pattern = re.findall(r'property.*?name\s*=\s*(\w+).*?value\s*=\s*"(.*?)"', content)
+
+properties = []
+for p in prop_pattern:
+    properties.append({
+        "name": p[0],
+        "value": p[1]
+    })
+
+
+# -------------------------
+# Final Structure
+# -------------------------
+workflow = {
+    "nodes": nodes,
+    "edges": edges,
+    "properties": properties
+}
+
+# Save JSON
+with open("workflow.json", "w") as f:
+    json.dump(workflow, f, indent=4)
+
+print("Structured workflow created!")
