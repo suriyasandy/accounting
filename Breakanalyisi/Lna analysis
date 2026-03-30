@@ -25,52 +25,95 @@ def clean_code(code):
 
 
 # ==========================================
-# STEP 3: Extract nodes + logic
+# 🔥 STEP 3: SAFE VALUE EXTRACTOR (NO TRUNCATION)
+# ==========================================
+def extract_value_safe(text, start_index):
+    """
+    Extract string value handling escaped quotes properly
+    """
+    i = start_index
+    value = ""
+    escape = False
+
+    while i < len(text):
+        char = text[i]
+
+        if escape:
+            value += char
+            escape = False
+        elif char == "\\":
+            escape = True
+        elif char == '"':
+            return value, i  # end of string
+        else:
+            value += char
+
+        i += 1
+
+    return value, i
+
+
+# ==========================================
+# STEP 4: Extract parameterName + FULL value
+# ==========================================
+def extract_parameters(chunk):
+    params = {}
+    idx = 0
+
+    while True:
+        param_pos = chunk.find('"parameterName"', idx)
+        if param_pos == -1:
+            break
+
+        # Extract parameter name
+        name_match = re.search(r'"parameterName"\s*:\s*"([^"]+)"', chunk[param_pos:])
+        if not name_match:
+            break
+
+        name = name_match.group(1)
+
+        # Find corresponding value
+        value_key_pos = chunk.find('"value"', param_pos)
+        if value_key_pos == -1:
+            break
+
+        # Find first quote after value:
+        value_start = chunk.find('"', value_key_pos + 7) + 1
+
+        # 🔥 Extract safely (THIS FIXES YOUR ISSUE)
+        value, end_pos = extract_value_safe(chunk, value_start)
+
+        params[name] = clean_code(value)
+
+        idx = value_start + len(value)
+
+    return params
+
+
+# ==========================================
+# STEP 5: Extract nodes
 # ==========================================
 def extract_nodes(content):
     nodes = []
 
-    # Split based on internalName (node type)
     chunks = re.split(r'"internalName"\s*:\s*"', content)
 
     for chunk in chunks[1:]:
         node = {}
 
-        # -----------------------------
-        # Node Type
-        # -----------------------------
-        node_type = chunk.split('"')[0]
-        node["type"] = node_type
+        # Node type
+        node["type"] = chunk.split('"')[0]
 
-        # -----------------------------
         # Node ID
-        # -----------------------------
         id_match = re.search(r'"id"\s*:\s*"([^"]+)"', chunk)
         node["id"] = id_match.group(1) if id_match else None
 
-        # -----------------------------
         # Inputs / Outputs
-        # -----------------------------
-        inputs = re.findall(r'"id"\s*:\s*"(__in_[^"]+__)"', chunk)
-        outputs = re.findall(r'"id"\s*:\s*"(__out_[^"]+__)"', chunk)
+        node["inputs"] = list(set(re.findall(r'"id"\s*:\s*"(__in_[^"]+__)"', chunk)))
+        node["outputs"] = list(set(re.findall(r'"id"\s*:\s*"(__out_[^"]+__)"', chunk)))
 
-        node["inputs"] = list(set(inputs))
-        node["outputs"] = list(set(outputs))
-
-        # -----------------------------
-        # Extract Parameters (CORE)
-        # -----------------------------
-        param_blocks = re.findall(
-            r'"parameterName"\s*:\s*"([^"]+)".*?"value"\s*:\s*"(.*?)"',
-            chunk,
-            re.DOTALL
-        )
-
-        logic = {}
-        for name, value in param_blocks:
-            logic[name] = clean_code(value)
-
-        node["operations"] = logic
+        # 🔥 FULL parameter extraction (fixed)
+        node["operations"] = extract_parameters(chunk)
 
         nodes.append(node)
 
@@ -78,14 +121,13 @@ def extract_nodes(content):
 
 
 # ==========================================
-# STEP 4: Extract edges (best effort)
+# STEP 6: Extract edges (optional)
 # ==========================================
 def extract_edges(content):
     edges = []
 
     connect_ids = re.findall(r'"connectableId"\s*:\s*"([^"]+)"', content)
 
-    # Pair sequentially
     for i in range(0, len(connect_ids) - 1, 2):
         edges.append({
             "source": connect_ids[i],
@@ -96,28 +138,24 @@ def extract_edges(content):
 
 
 # ==========================================
-# STEP 5: Build execution sequence
+# STEP 7: Execution sequence
 # ==========================================
 def build_execution_sequence(nodes):
     sequence = []
 
-    for idx, node in enumerate(nodes):
-        step = {
-            "step": idx + 1,
+    for i, node in enumerate(nodes):
+        sequence.append({
+            "step": i + 1,
             "node_id": node["id"],
             "type": node["type"],
-            "inputs": node["inputs"],
-            "outputs": node["outputs"],
             "operations": node["operations"]
-        }
-
-        sequence.append(step)
+        })
 
     return sequence
 
 
 # ==========================================
-# STEP 6: Main parser
+# STEP 8: MAIN
 # ==========================================
 def parse_lod(file_path):
     content = load_lod(file_path)
@@ -126,17 +164,15 @@ def parse_lod(file_path):
     edges = extract_edges(content)
     sequence = build_execution_sequence(nodes)
 
-    workflow = {
+    return {
         "nodes": nodes,
         "edges": edges,
         "execution_sequence": sequence
     }
 
-    return workflow
-
 
 # ==========================================
-# STEP 7: Save output
+# STEP 9: Save output
 # ==========================================
 def save_output(workflow, output_file="parsed_workflow.json"):
     with open(output_file, "w") as f:
@@ -145,14 +181,13 @@ def save_output(workflow, output_file="parsed_workflow.json"):
     print(f"\n✅ Output saved to {output_file}")
     print(f"📊 Nodes: {len(workflow['nodes'])}")
     print(f"🔗 Edges: {len(workflow['edges'])}")
-    print(f"⚙️ Steps: {len(workflow['execution_sequence'])}")
 
 
 # ==========================================
-# MAIN
+# RUN
 # ==========================================
 if __name__ == "__main__":
-    file_path = "your_file.lod"   # 👈 UPDATE THIS
+    file_path = "your_file.lod"  # 👈 update path
 
     workflow = parse_lod(file_path)
 
