@@ -37,11 +37,14 @@ ALL EXISTING FIXES RETAINED:
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import math
 import os
+import re
 import tempfile
+import time
 from datetime import date as _date
 from io import BytesIO
 
@@ -57,6 +60,25 @@ try:
     HAS_AGGRID = True
 except ImportError:
     HAS_AGGRID = False
+
+try:
+    from jira import Jira as _JiraClient
+    HAS_JIRA = True
+except ImportError:
+    HAS_JIRA = False
+
+try:
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import joblib
+    import scipy.sparse as _sp
+    HAS_ML = True
+except ImportError:
+    HAS_ML = False
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -74,6 +96,40 @@ BG_LIGHT     = "#F7F7F5"
 WARN         = "#A84B2F"
 BUCKET_ORDER = ["0-15","16-30","31-60","61-90","91-180","181-365","365+","Unknown"]
 MAX_JS_INT   = 2 ** 53
+
+# ── ML / Threshold constants ──────────────────────────────────────────────────
+ML_TARGETS = {
+    "ISSUE CATEGORY":     "issue_category",
+    "ISSUE CATEGORY2":    "issue_category2",
+    "SYSTEM TO BE FIXED": "system_to_be_fixed",
+}
+ML_TARGET_COL_KEYS = {
+    "issue_category":     "ISSUE CATEGORY",
+    "issue_category2":    "ISSUE CATEGORY2",
+    "system_to_be_fixed": "SYSTEM TO BE FIXED",
+}
+ML_FEATURE_CAT_KEYS = [
+    "Rec Name (as per Rec Cube)", "Team", "Entity", "Type of break",
+    "Asset Class", "Account Group", "Products Reconciled", "TRADE CCY",
+    "True/Systemic Breaks", "Cash/Non Cash", "ABS GBP(Greater than 1mn)", "Bucket",
+]
+ML_FEATURE_NUM_KEYS = ["ABS GBP", "BREAK AMOUNT GBP", "Age Days"]
+HGBT_PARAMS = {
+    "max_iter": 300,
+    "learning_rate": 0.05,
+    "min_samples_leaf": 50,
+    "class_weight": "balanced",
+    "random_state": 42,
+    "early_stopping": True,
+    "n_iter_no_change": 15,
+}
+CONFIDENCE_THRESHOLDS = {"High": 0.75, "Medium": 0.50}
+JIRA_SIM_THRESHOLDS   = {"High": 0.70, "Medium": 0.45}
+ACTION_RECOMMENDATIONS = {
+    "High":   "Auto-route to predicted category. Flag for confirmation only.",
+    "Medium": "Suggest predicted category. Analyst should verify before routing.",
+    "Low":    "Manual review required. Insufficient historical pattern.",
+}
 
 st.markdown(f"""
 <style>
@@ -127,7 +183,7 @@ def format_short(val) -> str:
         return "N/A"
     abs_v = abs(v)
     if abs_v >= 1e15:
-        return f"{v/1e15:.1f}P"
+        return f"{v/1e15:.1f}Q"
     if abs_v >= 1e12:
         return f"{v/1e12:.1f}T"
     if abs_v >= 1e9:
@@ -202,11 +258,49 @@ def render_grid(df: pd.DataFrame, height: int = 400, key: str = "grid") -> None:
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_default_column(resizable=True, sortable=True, filter=True, floatingFilter=True)
         gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=20)
+        _apply_computed_headers(gb, df.columns.tolist())
         AgGrid(df, gridOptions=gb.build(), height=height, key=key,
                allow_unsafe_jscode=True, theme="streamlit",
                update_mode=GridUpdateMode.NO_UPDATE)
     else:
         st.dataframe(df, width='stretch', height=height)
+
+
+# ── Computed-column header styling ────────────────────────────────────────────
+_COMPUTED_HEADER_COLS = frozenset({
+    # Summary / Ageing aggregates
+    "Break Count", "Avg Age Days", "Max Age Days",
+    ">90d", ">90 Day %", ">90 Day Breaks", ">180d", ">180 Day Breaks", ">365d", ">365 Day Breaks",
+    "Total ABS GBP", "Avg GBP / Break", "Unique Jira Refs",
+    # MoM analytics
+    "MoM Δ", "MoM Δ %",
+    # Jira API enrichment
+    "Jira Summary", "Assignee", "Reporter", "Status", "Created Date",
+    # FP Thresholding priority outputs
+    "Priority", "Latest ABS GBP", "Hist Avg ABS GBP", "vs Hist Avg %", "Trend",
+    "Latest Break Count", "Hist Avg Break Count", "vs Hist Count %", "Count Trend",
+    "Tag for Review",
+    # Derived/renamed aggregates
+    "Top Jira", "Jira Desc",
+    # Ageing detail table renames
+    "Age Days", "Ageing Bucket", "Period",
+})
+_PERIOD_RE     = re.compile(r'^\d{4}-\d{2}$')
+_ABS_CNT_RE    = re.compile(r'^(ABS|Cnt) \d{4}-\d{2}$')
+_YELLOW_HEADER = {"backgroundColor": "#FFF176", "color": "#212121", "fontWeight": "bold"}
+
+
+def _is_computed_col(col: str) -> bool:
+    return (col in _COMPUTED_HEADER_COLS
+            or _PERIOD_RE.match(col) is not None
+            or _ABS_CNT_RE.match(col) is not None)
+
+
+def _apply_computed_headers(gb, df_cols) -> None:
+    """Apply yellow headerStyle to every computed/derived column in df_cols."""
+    for col in df_cols:
+        if _is_computed_col(col):
+            gb.configure_column(col, headerStyle=_YELLOW_HEADER)
 
 
 # ── DuckDB setup ──────────────────────────────────────────────────────────────
@@ -239,6 +333,235 @@ def dq_local(sql: str, **named_dfs) -> pd.DataFrame:
 
 def safe_amt(col: str) -> str:
     return f"TRY_CAST(\"{col}\" AS DOUBLE)"
+
+
+@st.cache_data(show_spinner=False)
+def _compute_trade_recurring(
+    df_key_hash: str,          # cache-bust key (md5 of shape+cols)
+    _df: pd.DataFrame,         # underscore prefix → Streamlit skips hashing this
+    rec_col: str,
+    trade_ref_col: str,
+    abs_col: str | None,
+):
+    """Pre-compute Trade ID Recurring Analysis.  Cached by df_key_hash so it
+    runs only once per unique dataset, regardless of which factor is selected."""
+    _has_abs = bool(abs_col)
+    _abs_cte_expr = f', ROUND(AVG(ABS("{abs_col}")), 2) AS avg_break_val_p' if _has_abs else ""
+    _abs_sel_expr = ', ROUND(AVG(avg_break_val_p), 2) AS "Avg Break Value"'  if _has_abs else ""
+
+    # Shared WHERE clause used across all queries in this function
+    _W = f"""
+        "{rec_col}" IS NOT NULL
+        AND "{trade_ref_col}" IS NOT NULL
+        AND TRIM(CAST("{trade_ref_col}" AS VARCHAR))
+            NOT IN ('','nan','None','N/A','-')
+    """
+
+    # ── Main trade stats ──────────────────────────────────────────────────────
+    _trade_stats = dq_local(f"""
+        WITH period_counts AS (
+            SELECT
+                "{rec_col}"        AS rec_name,
+                "{trade_ref_col}"  AS trade_id,
+                _Period_label      AS period,
+                COUNT(*)           AS cnt_in_period
+                {_abs_cte_expr}
+            FROM tbl
+            WHERE {_W}
+            GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+        )
+        SELECT
+            rec_name AS "RecName",
+            trade_id AS "Trade ID",
+            COUNT(DISTINCT period)  AS distinct_periods,
+            MAX(cnt_in_period)      AS max_in_period,
+            SUM(cnt_in_period)      AS total_occurrences
+            {_abs_sel_expr}
+        FROM period_counts
+        GROUP BY rec_name, trade_id
+        ORDER BY rec_name, trade_id
+    """, tbl=_df)
+
+    # ── Period breakdown string: "Jan-24 ×3 | Feb-24 ×1" ────────────────────
+    _period_brkdown = dq_local(f"""
+        WITH pc AS (
+            SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                   _Period_label AS period, COUNT(*) AS cnt
+            FROM tbl
+            WHERE {_W}
+            GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+        )
+        SELECT rec_name  AS "RecName",
+               trade_id  AS "Trade ID",
+               STRING_AGG(period || ' ×' || CAST(cnt AS VARCHAR), ' | '
+                          ORDER BY period) AS "Period Breakdown"
+        FROM pc
+        GROUP BY rec_name, trade_id
+    """, tbl=_df)
+    _trade_stats = _trade_stats.merge(_period_brkdown, on=["RecName", "Trade ID"], how="left")
+
+    # ── Stale detection (requires break amount column) ────────────────────────
+    if _has_abs and "Avg Break Value" in _trade_stats.columns:
+        # Recurring stale: same break value across ALL periods
+        _stale_check = dq_local(f"""
+            SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                   COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_break_vals,
+                   COUNT(DISTINCT _Period_label)              AS period_count
+            FROM tbl
+            WHERE {_W}
+            GROUP BY "{rec_col}", "{trade_ref_col}"
+        """, tbl=_df)
+        _stale_check["is_stale"] = (
+            (_stale_check["period_count"] >= 2) &
+            (_stale_check["distinct_break_vals"] == 1)
+        )
+        _stale_map = _stale_check.set_index(["rec_name", "trade_id"])["is_stale"].to_dict()
+        _trade_stats["is_stale"] = _trade_stats.apply(
+            lambda r: _stale_map.get((r["RecName"], r["Trade ID"]), False), axis=1
+        )
+
+        # Duplicate+Stale: appears ≥2× in same period with identical break value
+        _dup_stale_q = dq_local(f"""
+            WITH dup_p AS (
+                SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                       _Period_label AS period, COUNT(*) AS cnt,
+                       COUNT(DISTINCT ROUND(ABS("{abs_col}"), 2)) AS distinct_vals
+                FROM tbl
+                WHERE {_W}
+                GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+                HAVING cnt >= 2
+            )
+            SELECT rec_name, trade_id,
+                   BOOL_OR(distinct_vals = 1) AS is_dup_stale
+            FROM dup_p
+            GROUP BY rec_name, trade_id
+        """, tbl=_df)
+        _dup_stale_map = _dup_stale_q.set_index(
+            ["rec_name", "trade_id"]
+        )["is_dup_stale"].to_dict()
+        _trade_stats["is_dup_stale"] = _trade_stats.apply(
+            lambda r: _dup_stale_map.get((r["RecName"], r["Trade ID"]), False), axis=1
+        )
+
+        # Excess break amount for duplicates: (cnt_in_period − 1) × avg_val summed
+        _dup_excess = dq_local(f"""
+            WITH dup_p AS (
+                SELECT "{rec_col}" AS rec_name, "{trade_ref_col}" AS trade_id,
+                       COUNT(*) AS cnt,
+                       ROUND(AVG(ABS("{abs_col}")), 2) AS avg_val
+                FROM tbl
+                WHERE {_W}
+                GROUP BY "{rec_col}", "{trade_ref_col}", _Period_label
+                HAVING cnt >= 2
+            )
+            SELECT rec_name  AS "RecName",
+                   trade_id  AS "Trade ID",
+                   ROUND(SUM((cnt - 1) * avg_val), 2) AS "Excess Break (Dup)"
+            FROM dup_p
+            GROUP BY rec_name, trade_id
+        """, tbl=_df)
+        _trade_stats = _trade_stats.merge(
+            _dup_excess, on=["RecName", "Trade ID"], how="left"
+        )
+    else:
+        _trade_stats["is_stale"]     = False
+        _trade_stats["is_dup_stale"] = False
+
+    # ── STEP 2: Classify with priority order (no double-counting) ────────────
+    def _classify_trade(row):
+        if row.get("is_dup_stale", False):        return "Duplicate + Stale"
+        if row.get("max_in_period", 0) >= 2:      return "Duplicate"
+        if row.get("is_stale", False):             return "Recurring + Stale"
+        if row.get("distinct_periods", 0) >= 2:   return "Recurring"
+        return "New"
+
+    _trade_stats["Type"] = _trade_stats.apply(_classify_trade, axis=1)
+
+    # ── STEP 3: Aggregate to RecName level (non-overlapping, Type-driven) ─────
+    _rec_summary = (
+        _trade_stats.groupby("RecName")
+        .agg(
+            unique_tradeid_count  =("Trade ID", "nunique"),
+            new_count             =("Type", lambda x: (x == "New").sum()),
+            recurring_count       =("Type", lambda x: (x == "Recurring").sum()),
+            recurring_stale_count =("Type", lambda x: (x == "Recurring + Stale").sum()),
+            duplicate_count       =("Type", lambda x: (x == "Duplicate").sum()),
+            dup_stale_count       =("Type", lambda x: (x == "Duplicate + Stale").sum()),
+        )
+        .reset_index()
+    )
+
+    # ── STEP 4: Rename columns (UI ready) ────────────────────────────────────
+    _rec_summary.columns = [
+        "RecName",
+        "Unique Tradeid Count",
+        "No. of New Tradeids",
+        "No. of Recurring Tradeids",
+        "No. of Recurring + Stale Tradeids",
+        "No. of Duplicate Tradeids",
+        "No. of Dup+Stale Tradeids",
+    ]
+
+    # ── STEP 5: Cast to int ───────────────────────────────────────────────────
+    for _c in [
+        "No. of New Tradeids", "No. of Recurring Tradeids",
+        "No. of Recurring + Stale Tradeids",
+        "No. of Duplicate Tradeids", "No. of Dup+Stale Tradeids",
+    ]:
+        _rec_summary[_c] = _rec_summary[_c].astype(int)
+
+    # ── STEP 6: Validation — every trade counted exactly once ─────────────────
+    _rec_summary["_Check_Total"] = (
+        _rec_summary["No. of New Tradeids"]
+        + _rec_summary["No. of Recurring Tradeids"]
+        + _rec_summary["No. of Recurring + Stale Tradeids"]
+        + _rec_summary["No. of Duplicate Tradeids"]
+        + _rec_summary["No. of Dup+Stale Tradeids"]
+    )
+    assert all(
+        _rec_summary["Unique Tradeid Count"] == _rec_summary["_Check_Total"]
+    ), "Trade ID count mismatch — classification overlap detected!"
+    _rec_summary = _rec_summary.drop(columns=["_Check_Total"])
+
+    # ── % Recurring Breaks (break rows, not Trade IDs) for confidence ─────────
+    _total_rows = (
+        _df[_df[rec_col].notna()]
+        .groupby(rec_col).size()
+        .reset_index(name="_total_rows")
+        .rename(columns={rec_col: "RecName"})
+    )
+    _recur_ids = set(
+        _trade_stats.loc[
+            _trade_stats["Type"].isin(["Recurring", "Recurring + Stale"]),
+            "Trade ID"
+        ].astype(str)
+    )
+    _recur_rows = (
+        _df[
+            _df[rec_col].notna() &
+            _df[trade_ref_col].astype(str).isin(_recur_ids)
+        ]
+        .groupby(rec_col).size()
+        .reset_index(name="_recur_rows")
+        .rename(columns={rec_col: "RecName"})
+    )
+    _rec_summary = _rec_summary.merge(_total_rows, on="RecName", how="left")
+    _rec_summary = _rec_summary.merge(_recur_rows, on="RecName", how="left")
+    _rec_summary["_recur_rows"] = _rec_summary["_recur_rows"].fillna(0).astype(int)
+    _rec_summary["% Recurring Breaks"] = (
+        (_rec_summary["_recur_rows"] /
+         _rec_summary["_total_rows"].replace(0, np.nan) * 100)
+        .round(1).fillna(0.0)
+    )
+    _rec_summary = _rec_summary.drop(columns=["_total_rows", "_recur_rows"])
+
+    _rec_summary = _rec_summary.sort_values(
+        "No. of Recurring Tradeids", ascending=False
+    ).reset_index(drop=True)
+    _trade_stats = _trade_stats.reset_index(drop=True)
+
+    return _trade_stats, _rec_summary
+
 
 
 # ── Parquet cache functions ───────────────────────────────────────────────────
@@ -415,6 +738,525 @@ def drop_blank_trailing(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(how="all")
 
 
+# ── Part A: Per-Rec Adaptive Threshold helpers ────────────────────────────────
+
+def rec_thresh_path() -> str:
+    return os.path.join(_cache_dir(), "rec_thresholds.json")
+
+
+def load_rec_thresholds() -> dict | None:
+    path = rec_thresh_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_rec_thresholds(data: dict) -> None:
+    try:
+        with open(rec_thresh_path(), "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def compute_rec_thresholds(
+    combined_df: pd.DataFrame,
+    col_map: dict,
+    seg_col: str,
+    cnt_weight: float,
+    abs_col: str,
+) -> dict:
+    """Compute per-Rec volatility-aware High/Medium thresholds from historical data.
+
+    Uses the same composite score formula as tab_fp_thresholding():
+      composite = (1 - w) * abs_gbp_dev_pct + w * count_dev_pct
+    where dev_pct is the per-period deviation from the Rec's own mean.
+    High  = 75th percentile of that Rec's historical scores (min 15)
+    Medium = 50th percentile / median                         (min  8)
+    """
+    if "_Period_label" not in combined_df.columns or seg_col not in combined_df.columns:
+        return {}
+
+    w = cnt_weight / 100.0
+    period_order = sorted(combined_df["_Period_label"].dropna().unique().tolist())
+    if len(period_order) < 2:
+        return {}
+
+    # ABS GBP per period per seg
+    grp_amt = (
+        combined_df.groupby([seg_col, "_Period_label"])[abs_col]
+        .sum()
+        .reset_index()
+    )
+    pivot_amt = grp_amt.pivot_table(
+        index=seg_col, columns="_Period_label", values=abs_col, fill_value=0.0
+    ).reset_index()
+
+    # Count per period per seg
+    grp_cnt = (
+        combined_df.groupby([seg_col, "_Period_label"])
+        .size()
+        .reset_index(name="_cnt")
+    )
+    pivot_cnt = grp_cnt.pivot_table(
+        index=seg_col, columns="_Period_label", values="_cnt", fill_value=0
+    ).reset_index()
+
+    recs_data = {}
+    for idx, row in pivot_amt.iterrows():
+        rec_name = row[seg_col]
+        amt_vals = np.array([float(row.get(p, 0.0)) for p in period_order])
+        cnt_row  = pivot_cnt[pivot_cnt[seg_col] == rec_name]
+        if len(cnt_row) == 0:
+            cnt_vals = np.zeros(len(period_order))
+        else:
+            cnt_vals = np.array([float(cnt_row.iloc[0].get(p, 0)) for p in period_order])
+
+        n_periods = len(period_order)
+        scores = []
+        for i in range(1, n_periods):
+            hist_amt  = float(np.mean(amt_vals[:i]))
+            hist_cnt  = float(np.mean(cnt_vals[:i]))
+            dev_amt   = (amt_vals[i] - hist_amt)  / max(hist_amt, 1.0) * 100.0
+            dev_cnt   = (cnt_vals[i] - hist_cnt)  / max(hist_cnt, 1.0) * 100.0
+            composite = (1.0 - w) * dev_amt + w * dev_cnt
+            scores.append(composite)
+
+        if len(scores) < 1:
+            continue
+
+        scores_arr = np.array(scores)
+        hist_mean  = float(np.mean(scores_arr))
+        hist_std   = float(np.std(scores_arr))
+        cv         = hist_std / max(abs(hist_mean), 1.0)
+        high_t     = float(max(15.0, np.percentile(scores_arr, 75)))
+        med_t      = float(max(8.0,  np.percentile(scores_arr, 50)))
+
+        recs_data[str(rec_name)] = {
+            "high_thresh": round(high_t, 2),
+            "med_thresh":  round(med_t,  2),
+            "n_periods":   n_periods,
+            "cv":          round(cv, 4),
+        }
+
+    latest_period = period_order[-1] if period_order else ""
+    return {
+        "calibrated_at":  latest_period,
+        "n_periods_used": len(period_order),
+        "segment_col":    seg_col,
+        "recs":           recs_data,
+    }
+
+
+def apply_rec_thresholds(
+    pivot_df: pd.DataFrame,
+    composite_score: np.ndarray,
+    seg_col: str,
+    rec_thresh_data: dict | None,
+    global_high: float,
+    global_med:  float,
+) -> pd.Series:
+    """Assign priority per row using per-Rec thresholds where available."""
+    min_periods = 3
+    priorities = []
+    recs_lookup = (rec_thresh_data or {}).get("recs", {})
+    for i, (_, row) in enumerate(pivot_df.iterrows()):
+        rec_name = str(row.get(seg_col, ""))
+        rec_info = recs_lookup.get(rec_name, {})
+        if rec_info and rec_info.get("n_periods", 0) >= min_periods:
+            ht = rec_info["high_thresh"]
+            mt = rec_info["med_thresh"]
+        else:
+            ht = global_high
+            mt = global_med
+        score = float(composite_score[i])
+        if score >= ht:
+            priorities.append("🔴 High")
+        elif score >= mt:
+            priorities.append("🟡 Medium")
+        else:
+            priorities.append("🟢 Low / FP Candidate")
+    return pd.Series(priorities, index=pivot_df.index)
+
+
+# ── Part B: ML Prediction helpers ─────────────────────────────────────────────
+
+def ml_cache_dir() -> str:
+    d = os.path.join(_cache_dir(), "ml_models")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def ml_model_path(slug: str) -> str:
+    return os.path.join(ml_cache_dir(), f"{slug}_model.joblib")
+
+
+def ml_encoder_path(slug: str) -> str:
+    return os.path.join(ml_cache_dir(), f"{slug}_encoder.joblib")
+
+
+def ml_ord_encoder_path(slug: str) -> str:
+    return os.path.join(ml_cache_dir(), f"{slug}_ord_encoder.joblib")
+
+
+def ml_meta_path() -> str:
+    return os.path.join(ml_cache_dir(), "ml_training_meta.json")
+
+
+def _load_ml_meta() -> dict | None:
+    path = ml_meta_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _delete_ml_models() -> None:
+    import shutil
+    try:
+        shutil.rmtree(ml_cache_dir(), ignore_errors=True)
+    except Exception:
+        pass
+
+
+def build_feature_matrix(
+    df: pd.DataFrame,
+    col_map: dict,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build the feature matrix X for ML training/inference."""
+    rows = pd.DataFrame(index=df.index)
+
+    # Categorical features
+    cat_cols_present = []
+    for key in ML_FEATURE_CAT_KEYS:
+        col = col_map.get(key)
+        if col and col in df.columns:
+            rows[key] = df[col].fillna("Unknown").astype(str)
+            cat_cols_present.append(key)
+        else:
+            rows[key] = "Unknown"
+            cat_cols_present.append(key)
+
+    # Bucket ordinal
+    bucket_key = "Bucket"
+    if bucket_key in rows.columns:
+        bmap = {b: i for i, b in enumerate(BUCKET_ORDER)}
+        rows["age_bucket_int"] = rows[bucket_key].map(bmap).fillna(len(BUCKET_ORDER) - 1).astype(float)
+    else:
+        rows["age_bucket_int"] = 0.0
+
+    # Rec+Team combo
+    rows["rec_team_combo"] = rows.get("Rec Name (as per Rec Cube)", "Unknown").astype(str) + "|" + rows.get("Team", "Unknown").astype(str)
+
+    # Numerical features
+    abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+    if abs_col and abs_col in df.columns:
+        vals = pd.to_numeric(df[abs_col], errors="coerce").fillna(0.0).abs()
+        rows["log_abs_gbp"] = np.log1p(vals)
+        rows["is_high_value"] = (vals > 1_000_000).astype(float)
+    else:
+        rows["log_abs_gbp"]   = 0.0
+        rows["is_high_value"] = 0.0
+
+    brk_col = col_map.get("BREAK AMOUNT GBP")
+    if brk_col and brk_col in df.columns and brk_col != abs_col:
+        rows["log_break_gbp"] = np.log1p(pd.to_numeric(df[brk_col], errors="coerce").fillna(0.0).abs())
+    else:
+        rows["log_break_gbp"] = rows["log_abs_gbp"]
+
+    age_col = col_map.get("Age Days")
+    if age_col and age_col in df.columns:
+        age = pd.to_numeric(df[age_col], errors="coerce").fillna(0.0).clip(0, 3650)
+        rows["age_norm"] = age / 365.0
+    else:
+        rows["age_norm"] = 0.0
+
+    # Cyclical month encoding from _Period_label (YYYYMM int)
+    if "_Period_label" in df.columns:
+        periods = pd.to_numeric(df["_Period_label"], errors="coerce").fillna(0)
+        month = (periods % 100).clip(1, 12)
+        rows["month_sin"] = np.sin(2 * np.pi * month / 12.0)
+        rows["month_cos"] = np.cos(2 * np.pi * month / 12.0)
+    else:
+        rows["month_sin"] = 0.0
+        rows["month_cos"] = 0.0
+
+    # Identify categorical feature column names in X
+    feature_names = list(rows.columns)
+    return rows, feature_names
+
+
+def _get_cat_feature_indices(feature_names: list[str]) -> list[int]:
+    """Return indices of categorical (string) features for HistGBT."""
+    cat_set = set(ML_FEATURE_CAT_KEYS) | {"rec_team_combo"}
+    return [i for i, n in enumerate(feature_names) if n in cat_set]
+
+
+def train_single_model(
+    df: pd.DataFrame,
+    col_map: dict,
+    target_key: str,
+) -> dict:
+    """Train one HistGradientBoostingClassifier for the given target_key."""
+    if not HAS_ML:
+        return {"error": "scikit-learn not installed"}
+
+    slug       = ML_TARGETS[target_key]
+    target_col = col_map.get(target_key)
+    if not target_col or target_col not in df.columns:
+        return {"error": f"Column '{target_key}' not found in data"}
+
+    # Non-null mask
+    mask = (
+        df[target_col].notna()
+        & (df[target_col].astype(str).str.strip() != "")
+        & (~df[target_col].astype(str).isin(["nan", "None", "N/A", "-"]))
+    )
+    if mask.sum() < 100:
+        return {"error": f"Fewer than 100 labeled rows for '{target_key}'"}
+
+    X_raw, feature_names = build_feature_matrix(df[mask], col_map)
+    y_raw = df.loc[mask, target_col].astype(str)
+
+    # Label encode target
+    le = LabelEncoder()
+    y  = le.fit_transform(y_raw)
+
+    # Ordinal encode categoricals (required by HistGBT)
+    cat_indices = _get_cat_feature_indices(feature_names)
+    cat_cols    = [feature_names[i] for i in cat_indices]
+    num_cols    = [c for c in feature_names if c not in cat_cols]
+
+    oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    X_cat = oe.fit_transform(X_raw[cat_cols].astype(str)) if cat_cols else np.zeros((len(X_raw), 0))
+    X_num = X_raw[num_cols].astype(float).values if num_cols else np.zeros((len(X_raw), 0))
+    X = np.hstack([X_cat, X_num])
+    cat_feat_indices = list(range(len(cat_cols)))  # categorical cols are first after hstack
+
+    # Store column order metadata alongside model
+    col_meta = {"cat_cols": cat_cols, "num_cols": num_cols, "feature_names": feature_names}
+
+    # Stratified split
+    try:
+        X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    except ValueError:
+        X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    params = dict(HGBT_PARAMS)
+    if len(le.classes_) > 2:
+        params.pop("class_weight", None)  # multiclass doesn't support class_weight in HGBT
+
+    model = HistGradientBoostingClassifier(
+        **params,
+        categorical_features=cat_feat_indices if cat_feat_indices else None,
+    )
+    model.fit(X_tr, y_tr)
+
+    acc = float(accuracy_score(y_val, model.predict(X_val)))
+
+    # Persist
+    joblib.dump(model,      ml_model_path(slug))
+    joblib.dump(le,         ml_encoder_path(slug))
+    joblib.dump((oe, col_meta), ml_ord_encoder_path(slug))
+
+    return {
+        "accuracy":  acc,
+        "n_train":   int(mask.sum()),
+        "n_classes": int(len(le.classes_)),
+    }
+
+
+def build_jira_similarity_index(df: pd.DataFrame, col_map: dict) -> dict:
+    """Build TF-IDF index on JIRA DESC for Jira reference similarity matching."""
+    if not HAS_ML:
+        return {"error": "scikit-learn not installed"}
+
+    jira_ref_col  = col_map.get("Jira Reference")
+    jira_desc_col = col_map.get("Jira Desc")
+    if not jira_ref_col or jira_desc_col is None:
+        return {"error": "Jira Reference or Jira Desc column not found"}
+    if jira_ref_col not in df.columns or jira_desc_col not in df.columns:
+        return {"error": "Jira columns absent from dataframe"}
+
+    sub = df[[jira_ref_col, jira_desc_col]].dropna(subset=[jira_ref_col, jira_desc_col])
+    sub = sub[sub[jira_desc_col].astype(str).str.strip() != ""]
+    if len(sub) < 10:
+        return {"error": "Fewer than 10 rows with both Jira ref and description"}
+
+    # Most frequent description per Jira ref
+    ref_desc = (
+        sub.groupby(jira_ref_col)[jira_desc_col]
+        .agg(lambda x: x.value_counts().index[0])
+        .reset_index()
+    )
+    corpus     = ref_desc[jira_desc_col].astype(str).tolist()
+    ref_lookup = ref_desc[jira_ref_col].astype(str).tolist()
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2), max_features=10_000, sublinear_tf=True, min_df=2
+    )
+    corpus_matrix = vectorizer.fit_transform(corpus)
+
+    joblib.dump(vectorizer,    os.path.join(ml_cache_dir(), "tfidf_vectorizer.joblib"))
+    joblib.dump(corpus_matrix, os.path.join(ml_cache_dir(), "tfidf_corpus_matrix.joblib"))
+    joblib.dump(ref_lookup,    os.path.join(ml_cache_dir(), "jira_ref_lookup.joblib"))
+
+    return {"n_jira_refs": len(ref_lookup)}
+
+
+def train_all_models(
+    df: pd.DataFrame,
+    col_map: dict,
+    progress_cb=None,
+) -> dict:
+    """Train all 3 classifiers + Jira similarity index. Returns metrics dict."""
+    if not HAS_ML:
+        return {"error": "scikit-learn not installed"}
+
+    results = {}
+    steps   = list(ML_TARGETS.keys()) + ["jira_index"]
+    for i, target_key in enumerate(ML_TARGETS.keys()):
+        res = train_single_model(df, col_map, target_key)
+        results[target_key] = res
+        if progress_cb:
+            progress_cb((i + 1) / len(steps))
+
+    jira_res = build_jira_similarity_index(df, col_map)
+    results["jira_index"] = jira_res
+    if progress_cb:
+        progress_cb(1.0)
+
+    # Save metadata
+    import datetime as _dt
+    meta = {
+        "trained_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "n_rows":     int(len(df)),
+        "metrics": {
+            k: {"accuracy": v.get("accuracy"), "n_train": v.get("n_train")}
+            for k, v in results.items() if isinstance(v, dict) and "accuracy" in v
+        },
+    }
+    try:
+        with open(ml_meta_path(), "w") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+
+    return results
+
+
+def load_models() -> dict:
+    """Load all saved ML models. Returns {} if none trained yet."""
+    if not HAS_ML:
+        return {}
+    models = {}
+    for target_key, slug in ML_TARGETS.items():
+        mp = ml_model_path(slug)
+        ep = ml_encoder_path(slug)
+        op = ml_ord_encoder_path(slug)
+        if os.path.exists(mp) and os.path.exists(ep) and os.path.exists(op):
+            try:
+                models[slug] = {
+                    "model":       joblib.load(mp),
+                    "le":          joblib.load(ep),
+                    "oe_meta":     joblib.load(op),
+                }
+            except Exception:
+                pass
+    # Jira TF-IDF
+    vp  = os.path.join(ml_cache_dir(), "tfidf_vectorizer.joblib")
+    cmp = os.path.join(ml_cache_dir(), "tfidf_corpus_matrix.joblib")
+    rlp = os.path.join(ml_cache_dir(), "jira_ref_lookup.joblib")
+    if os.path.exists(vp) and os.path.exists(cmp) and os.path.exists(rlp):
+        try:
+            models["jira"] = {
+                "vectorizer":    joblib.load(vp),
+                "corpus_matrix": joblib.load(cmp),
+                "ref_lookup":    joblib.load(rlp),
+            }
+        except Exception:
+            pass
+    return models
+
+
+def confidence_tier(score: float, mode: str = "classifier") -> str:
+    thresholds = JIRA_SIM_THRESHOLDS if mode == "jira" else CONFIDENCE_THRESHOLDS
+    if score >= thresholds["High"]:
+        return "High"
+    if score >= thresholds["Medium"]:
+        return "Medium"
+    return "Low"
+
+
+def _encode_for_inference(X_raw: pd.DataFrame, oe_meta: tuple) -> np.ndarray:
+    """Apply saved OrdinalEncoder + column ordering for inference."""
+    oe, col_meta = oe_meta
+    cat_cols = col_meta["cat_cols"]
+    num_cols = col_meta["num_cols"]
+    X_cat = oe.transform(X_raw[cat_cols].astype(str)) if cat_cols else np.zeros((len(X_raw), 0))
+    X_num = X_raw[num_cols].astype(float).values if num_cols else np.zeros((len(X_raw), 0))
+    return np.hstack([X_cat, X_num])
+
+
+def predict_breaks(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
+    """Return df enriched with _pred_* and _conf_* columns for each target."""
+    if not HAS_ML:
+        return df
+
+    models = load_models()
+    if not models:
+        return df
+
+    out = df.copy()
+    X_raw, feature_names = build_feature_matrix(df, col_map)
+
+    for target_key, slug in ML_TARGETS.items():
+        if slug not in models:
+            continue
+        m    = models[slug]["model"]
+        le   = models[slug]["le"]
+        oe_m = models[slug]["oe_meta"]
+        try:
+            X = _encode_for_inference(X_raw, oe_m)
+            proba    = m.predict_proba(X)
+            pred_idx = proba.argmax(axis=1)
+            conf     = proba[np.arange(len(proba)), pred_idx]
+            pred_lbl = le.inverse_transform(pred_idx)
+            out[f"_pred_{slug}"]      = pred_lbl
+            out[f"_conf_{slug}"]      = np.round(conf, 4)
+            out[f"_conf_tier_{slug}"] = [confidence_tier(c) for c in conf]
+        except Exception:
+            pass
+
+    # Jira reference via TF-IDF similarity
+    if "jira" in models:
+        jira_desc_col = col_map.get("Jira Desc")
+        if jira_desc_col and jira_desc_col in df.columns:
+            vec    = models["jira"]["vectorizer"]
+            corpus = models["jira"]["corpus_matrix"]
+            refs   = models["jira"]["ref_lookup"]
+            descs  = df[jira_desc_col].fillna("").astype(str).tolist()
+            try:
+                q_mat    = vec.transform(descs)
+                sim_mat  = cosine_similarity(q_mat, corpus)
+                top_idx  = sim_mat.argmax(axis=1)
+                top_conf = sim_mat[np.arange(len(sim_mat)), top_idx]
+                out["_pred_jira_ref"]       = [refs[i] for i in top_idx]
+                out["_conf_jira_ref"]       = np.round(top_conf, 4)
+                out["_conf_tier_jira_ref"]  = [confidence_tier(c, "jira") for c in top_conf]
+            except Exception:
+                pass
+
+    return out
+
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 def run_pipeline(raw_bytes: bytes) -> dict:
@@ -564,7 +1406,9 @@ def build_sidebar_filters(df: pd.DataFrame, col_map: dict) -> dict:
 
 def _reset_filters():
     for k in ["_filters_applied", "_fp_seg_keys", "_fp_seg_cols",
-              "_drill_rec", "_overflow"]:
+              "_drill_rec", "_overflow",
+              "_ml_predictions_df", "_rec_thresh_calibrated",
+              "_use_rec_thresh"]:
         if k in st.session_state:
             del st.session_state[k]
 
@@ -572,12 +1416,16 @@ def _reset_filters():
 def clear_all_cache() -> int:
     """Delete all cached Parquet files and the period index from disk,
     then wipe all session state keys. Returns number of files deleted."""
+    import shutil
     cache = _cache_dir()
     deleted = 0
     for fname in os.listdir(cache):
         fpath = os.path.join(cache, fname)
         try:
-            os.remove(fpath)
+            if os.path.isdir(fpath):
+                shutil.rmtree(fpath, ignore_errors=True)
+            else:
+                os.remove(fpath)
             deleted += 1
         except Exception:
             pass
@@ -587,6 +1435,60 @@ def clear_all_cache() -> int:
         except Exception:
             pass
     return deleted
+
+
+def _fetch_one_issue(ref_str: str, url: str, email: str, token: str) -> tuple:
+    """Fetch one Jira issue; per-thread connection (thread-safe). Retries on 429."""
+    ref_str = ref_str.strip()
+    _NF = {"Jira Summary": "Not Found", "Assignee": "Not Found",
+           "Reporter": "Not Found", "Status": "Not Found", "Created Date": "Not Found"}
+    _delays = [2, 4, 8]
+    for attempt, _delay in enumerate([0] + _delays):
+        if _delay:
+            time.sleep(_delay)
+        try:
+            conn  = _JiraClient(options={"server": url}, basic_auth=(email, token))
+            issue = conn.issue(ref_str, fields="summary,assignee,reporter,status,created")
+            return ref_str, {
+                "Jira Summary": issue.fields.summary or "—",
+                "Assignee":     getattr(issue.fields.assignee, "displayName", "—")
+                                if issue.fields.assignee else "—",
+                "Reporter":     getattr(issue.fields.reporter, "displayName", "—")
+                                if issue.fields.reporter else "—",
+                "Status":       getattr(issue.fields.status, "name", "—")
+                                if issue.fields.status else "—",
+                "Created Date": str(issue.fields.created)[:10]
+                                if issue.fields.created else "—",
+            }
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate" in err.lower():
+                if attempt < len(_delays):
+                    continue          # retry after sleep
+                return ref_str, {**_NF, "Jira Summary": "Rate limited — try again later"}
+            return ref_str, {**_NF, "Jira Summary": f"Error: {type(e).__name__}: {err[:120]}"}
+    return ref_str, {**_NF, "Jira Summary": "Rate limited — try again later"}
+
+
+def fetch_jira_metadata(ctrls_refs: list, url: str, email: str, token: str,
+                        progress_bar=None) -> dict:
+    """
+    Parallel-fetch Jira metadata for pre-filtered CTRLS- refs only.
+    Each worker creates its own Jira connection (thread-safe; no shared session).
+    """
+    if not ctrls_refs:
+        return {}
+    total, done, result = len(ctrls_refs), 0, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, total)) as pool:
+        futures = {pool.submit(_fetch_one_issue, r, url, email, token): r
+                   for r in ctrls_refs}
+        for future in concurrent.futures.as_completed(futures):
+            ref_str, meta = future.result()
+            result[ref_str] = meta
+            done += 1
+            if progress_bar is not None:
+                progress_bar.progress(done / total)
+    return result
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -664,7 +1566,19 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
         pct = n_null / max(len(df_f), 1) * 100
         null_rows.append({"Column": col, "Null Count": n_null, "Null %": round(pct, 1)})
     null_df = pd.DataFrame(null_rows).sort_values("Null %", ascending=False)
-    st.dataframe(null_df, width='stretch', hide_index=True)
+    try:
+        st.dataframe(
+            null_df,
+            column_config={
+                "Null %": st.column_config.ProgressColumn(
+                    "Null %", format="%.1f%%", min_value=0, max_value=100,
+                )
+            },
+            hide_index=True,
+            use_container_width=True,
+        )
+    except Exception:
+        st.dataframe(null_df, width='stretch', hide_index=True)
 
     overflow_count = st.session_state.get("_overflow", 0)
     if overflow_count and overflow_count > 0:
@@ -672,6 +1586,14 @@ def tab_data_quality(df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict) -> Non
             f'<div class="banner-warn">⚠️ {overflow_count} amount value(s) exceed JavaScript safe integer '
             f'({MAX_JS_INT:,}) and may display imprecisely in charts.</div>',
             unsafe_allow_html=True)
+
+
+def tab_quality_and_ageing(
+    df: pd.DataFrame, df_f: pd.DataFrame, col_map: dict, hist_df=None
+) -> None:
+    tab_data_quality(df, df_f, col_map)
+    st.markdown("---")
+    tab_ageing_validation(df_f, col_map, hist_df)
 
 
 # ── Tab: Ageing Validation ────────────────────────────────────────────────────
@@ -715,7 +1637,7 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
 
     # KPIs
     total = len(df_f)
-    old_mask = df_f["_Computed_Bucket"].isin(["91-180","181-365","365+"])
+    old_mask = df_f["_Computed_Bucket"].isin(["31-60","61-90","91-180","181-365","365+"])
     old_count = int(old_mask.sum())
     old_pct = old_count / max(total, 1) * 100
 
@@ -723,29 +1645,29 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
     with k1:
         kpi_card("Total Breaks", format_number(total))
     with k2:
-        kpi_card("Breaks >90 Days", format_number(old_count),
+        kpi_card("Breaks >30 Days (SLA breach)", format_number(old_count),
                  f"{old_pct:.1f}% of total", warn=old_pct > 20)
     with k3:
         if "_Computed_Age_Days" in df_f.columns:
             avg_age = df_f["_Computed_Age_Days"].mean()
             kpi_card("Avg Age (Days)", format_number(avg_age, 1))
 
-    # ── Pass/Fail Row A: Threshold Compliance (≤90d = Pass, >90d = Fail) ──
+    # ── Pass/Fail Row A: Threshold Compliance (≤30d = Pass, >30d = Fail) ──
     st.markdown("---")
-    st.markdown("#### Threshold Compliance (SLA: ≤90 Days)")
+    st.markdown("#### Threshold Compliance (SLA: ≤30 Days)")
     pass_count = total - old_count
     pass_rate  = pass_count / max(total, 1) * 100
     pa1, pa2, pa3 = st.columns(3)
     with pa1:
-        kpi_card("✅ Pass (≤90d)", format_number(pass_count),
+        kpi_card("✅ Pass (≤30d)", format_number(pass_count),
                  f"{pass_rate:.1f}% of total", warn=False)
     with pa2:
-        kpi_card("❌ Fail (>90d)", format_number(old_count),
+        kpi_card("❌ Fail (>30d)", format_number(old_count),
                  f"{old_pct:.1f}% of total", warn=old_pct > 20)
     with pa3:
         kpi_card("Pass Rate", f"{pass_rate:.1f}%",
-                 "% breaks within 90-day SLA", warn=pass_rate < 80)
-    st.caption("Pass = break aged ≤90 days (within SLA).  Fail = break aged >90 days (SLA breach).")
+                 "% breaks within 30-day SLA", warn=pass_rate < 80)
+    st.caption("Pass = break aged ≤30 days (within SLA).  Fail = break aged >30 days (SLA breach).")
 
     # ── Pass/Fail Row B: Source Bucket vs Computed Bucket Accuracy ──
     bucket_col = col_map.get("Ageing Bucket")
@@ -773,6 +1695,95 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
             "Compares the source system's Ageing Bucket column against the bucket computed from Age Days. "
             "A mismatch indicates a data quality issue in the source system's classification."
         )
+
+        # ── Mismatch Detail Table ─────────────────────────────────────────────
+        _mismatch_df = df_f[~match_mask].copy()
+        if len(_mismatch_df) > 0:
+            st.markdown("##### Source vs Computed Bucket — Mismatch Detail")
+
+            _gap_cols = []
+            for _lbl2, _key2 in [
+                ("Rec Name",   "Rec Name (as per Rec Cube)"),
+                ("Team",       "Team"),
+                ("Jira Ref",   "Jira Reference"),
+            ]:
+                _c2 = col_map.get(_key2)
+                if _c2 and _c2 in _mismatch_df.columns:
+                    _gap_cols.append(_c2)
+            if "_Period_label" in _mismatch_df.columns:
+                _gap_cols.append("_Period_label")
+            _gap_cols += [bucket_col, "_Computed_Bucket"]
+            if "_Computed_Age_Days" in _mismatch_df.columns:
+                _gap_cols.append("_Computed_Age_Days")
+            _abs_col_q = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+            if _abs_col_q and _abs_col_q in _mismatch_df.columns:
+                _gap_cols.append(_abs_col_q)
+
+            _gap_disp = (
+                _mismatch_df[[c for c in _gap_cols if c in _mismatch_df.columns]]
+                .rename(columns={
+                    "_Period_label":      "Period",
+                    "_Computed_Bucket":   "Computed Bucket",
+                    "_Computed_Age_Days": "Age Days",
+                    bucket_col:           "Source Bucket",
+                })
+                .sort_values("Age Days", ascending=False)
+                .reset_index(drop=True)
+            )
+
+            # Gap severity: source claims within SLA (≤30d) but computed is over SLA
+            _sla_buckets = {"0-15", "16-30"}
+            _gap_disp["Gap Severity"] = _gap_disp.apply(
+                lambda r: "Critical" if r["Source Bucket"] in _sla_buckets
+                                        and r["Computed Bucket"] not in _sla_buckets
+                          else ("Warning" if r["Source Bucket"] != r["Computed Bucket"]
+                                else "OK"),
+                axis=1,
+            )
+
+            if HAS_AGGRID:
+                _sev_cs = JsCode("""function(p){
+                    var v=(p.value||'').trim();
+                    if(v==='Critical')
+                        return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                    if(v==='Warning')
+                        return {'backgroundColor':'#FFF8E1','color':'#7A4000','fontWeight':'bold'};
+                    return {};}""")
+                _src_bkt_cs = JsCode("""function(p){
+                    var v=(p.value||'').trim();
+                    var ok=['0-15','16-30'];
+                    if(ok.indexOf(v)<0)
+                        return {'backgroundColor':'#FDECEA','color':'#A84B2F'};
+                    return {'backgroundColor':'#E8F5E9','color':'#1B5E20'};}""")
+                try:
+                    _gb_gap = GridOptionsBuilder.from_dataframe(_gap_disp)
+                    _gb_gap.configure_default_column(sortable=True, resizable=True, filter=True)
+                    _gb_gap.configure_column("Source Bucket", cellStyle=_src_bkt_cs, width=140)
+                    _gb_gap.configure_column("Computed Bucket", width=155)
+                    _gb_gap.configure_column("Gap Severity", cellStyle=_sev_cs, pinned="right", width=120)
+                    _gb_gap.configure_column("Age Days", width=110)
+                    _gb_gap.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+                    AgGrid(
+                        _gap_disp, gridOptions=_gb_gap.build(),
+                        height=380, theme="streamlit",
+                        allow_unsafe_jscode=True,
+                        key="ageing_mismatch_grid",
+                        update_mode=GridUpdateMode.NO_UPDATE,
+                    )
+                except Exception:
+                    st.dataframe(_gap_disp, height=380, use_container_width=True)
+            else:
+                st.dataframe(_gap_disp, height=380, use_container_width=True)
+
+            st.download_button(
+                "📥 Download Source vs Computed Mismatch (CSV)",
+                _gap_disp.to_csv(index=False).encode("utf-8"),
+                file_name="ageing_bucket_mismatch.csv",
+                mime="text/csv",
+                key="ageing_mismatch_dl",
+            )
+        else:
+            st.success("All rows: Source Bucket matches Computed Bucket — no gaps found.")
 
     st.markdown("---")
 
@@ -823,314 +1834,50 @@ def tab_ageing_validation(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> No
         fig3 = chart_layout(fig3, "Average Age Days Trend by Period", "Period", "Avg Age Days", height=340)
         st.plotly_chart(fig3, width='stretch')
 
-
-# ── Tab: Break Counts + Drill-Down ────────────────────────────────────────────
-
-def tab_break_counts(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
-    st.markdown("## 📈 Break Counts + Drill-Down")
-
-    rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
-    team_actual = col_map.get("Team")
-
-    if "_Period_label" not in df_f.columns:
-        st.info("No period data available.")
-        return
-
-    # Top-10 Rec Names trend
-    if rec_actual and rec_actual in df_f.columns:
-        # Combine hist + current so trend spans all available periods
-        _trend_cols = [rec_actual, "_Period_label"]
-        if (hist_df is not None and len(hist_df) > 0
-                and "_Period_label" in hist_df.columns
-                and rec_actual in hist_df.columns):
-            _trend_src = pd.concat(
-                [hist_df[_trend_cols], df_f[_trend_cols]], ignore_index=True
-            )
-        else:
-            _trend_src = df_f[_trend_cols]
-        top10_series = _trend_src[rec_actual].value_counts().head(10).index.tolist()
-        top10_df = _trend_src[_trend_src[rec_actual].isin(top10_series)]
-        trend = (
-            top10_df.groupby(["_Period_label", rec_actual])
-            .size()
-            .reset_index(name="Count")
-            .sort_values("_Period_label")
-        )
-        fig = px.line(
-            trend, x="_Period_label", y="Count", color=rec_actual,
-            color_discrete_sequence=COLORS, markers=True,
-        )
-        fig = chart_layout(fig, "Top-10 Rec Names — Break Count Trend", "Period", "Count", height=420)
-        st.plotly_chart(fig, width='stretch')
-
-        st.markdown("---")
-        # ── Drill-Down Section ────────────────────────────────────────────────
-        st.markdown("### 🔍 Drill-Down by Rec Name")
-        all_recs = sorted(df_f[rec_actual].dropna().astype(str).unique().tolist())
-
-        # Validate session state before rendering selectbox (Change 10)
-        if st.session_state.get("_drill_rec") not in all_recs:
-            st.session_state["_drill_rec"] = top10_series[0] if top10_series else (all_recs[0] if all_recs else None)
-
-        if all_recs:
-            selected_rec = st.selectbox(
-                "Select Rec Name to drill into:",
-                all_recs,
-                index=all_recs.index(st.session_state["_drill_rec"]) if st.session_state.get("_drill_rec") in all_recs else 0,
-                key="_drill_rec",
-            )
-
-            st.markdown(
-                f'<div class="banner-drill">🔬 Drilling into: <b>{selected_rec}</b></div>',
-                unsafe_allow_html=True)
-
-            rec_df = df_f[df_f[rec_actual].astype(str) == selected_rec].copy()
-
-            # Build combined source (hist + current) for trend charts
-            if (hist_df is not None and len(hist_df) > 0
-                    and "_Period_label" in hist_df.columns
-                    and rec_actual in hist_df.columns):
-                rec_hist_df = hist_df[hist_df[rec_actual].astype(str) == selected_rec].copy()
-                rec_combined_df = pd.concat([rec_hist_df, rec_df], ignore_index=True)
-            else:
-                rec_combined_df = rec_df
-
-            if len(rec_df) == 0:
-                st.warning("No data for selected Rec Name.")
-            else:
-                st.markdown(f"**{format_number(len(rec_df))} breaks** in this Rec")
-
-                with st.container():
-                    st.markdown('<div class="drill-section">', unsafe_allow_html=True)
-
-                    # ── Toggle controls ───────────────────────────────────────
-                    entity_actual = col_map.get("Entity")
-                    type_actual   = col_map.get("Type of Break")
-                    ac_actual     = col_map.get("Asset Class")
-                    abs_actual    = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
-
-                    # Build available breakdown dims (only those present in data)
-                    _dim_opts = []
-                    if team_actual   and team_actual   in rec_df.columns: _dim_opts.append("Team")
-                    if entity_actual and entity_actual in rec_df.columns: _dim_opts.append("Entity")
-                    if type_actual   and type_actual   in rec_df.columns: _dim_opts.append("Type of Break")
-                    if ac_actual     and ac_actual     in rec_df.columns: _dim_opts.append("Asset Class")
-
-                    _has_amount = bool(abs_actual and abs_actual in rec_df.columns)
-                    _metric_opts = ["Count", "Amount"] if _has_amount else ["Count"]
-
-                    tc1, tc2 = st.columns([2, 3])
-                    with tc1:
-                        _drill_metric = st.radio(
-                            "Metric", _metric_opts, horizontal=True,
-                            key="_drill_metric",
-                        )
-                    with tc2:
-                        if _dim_opts:
-                            _drill_dim = st.selectbox(
-                                "Breakdown by", _dim_opts, key="_drill_dim",
-                            )
-                        else:
-                            _drill_dim = None
-
-                    # ── Single chart based on toggle selection ─────────────────
-                    if _drill_metric == "Count" and _drill_dim:
-                        _dim_col = {
-                            "Team":          team_actual,
-                            "Entity":        entity_actual,
-                            "Type of Break": type_actual,
-                            "Asset Class":   ac_actual,
-                        }[_drill_dim]
-                        period_cnt = dq_local(
-                            f'SELECT "_Period_label", "{_dim_col}", COUNT(*) AS cnt '
-                            f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
-                            f'ORDER BY "_Period_label"',
-                            rec_tbl=rec_combined_df
-                        )
-                        fig_d = px.bar(
-                            period_cnt, x="_Period_label", y="cnt", color=_dim_col,
-                            color_discrete_sequence=COLORS, barmode="stack",
-                        )
-                        fig_d = chart_layout(
-                            fig_d,
-                            f"Breaks by Period × {_drill_dim} — {selected_rec}",
-                            "Period", "Count", height=380,
-                        )
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    elif _drill_metric == "Count" and not _drill_dim:
-                        # Fallback: plain period trend
-                        period_cnt = dq_local(
-                            'SELECT "_Period_label", COUNT(*) AS cnt '
-                            'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                            rec_tbl=rec_combined_df
-                        )
-                        fig_d = px.bar(period_cnt, x="_Period_label", y="cnt",
-                                       color_discrete_sequence=[PRIMARY])
-                        fig_d = chart_layout(fig_d, f"Breaks by Period — {selected_rec}",
-                                             "Period", "Count", height=360)
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    elif _drill_metric == "Amount":
-                        if _drill_dim and _drill_dim in ("Team", "Entity"):
-                            _dim_col = team_actual if _drill_dim == "Team" else entity_actual
-                            period_amt_stk = dq_local(
-                                f'SELECT "_Period_label", "{_dim_col}", '
-                                f'SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label", "{_dim_col}" '
-                                f'ORDER BY "_Period_label"',
-                                rec_tbl=rec_combined_df
-                            )
-                            fig_d = px.bar(
-                                period_amt_stk, x="_Period_label", y="total_amt",
-                                color=_dim_col, color_discrete_sequence=COLORS, barmode="stack",
-                            )
-                            fig_d = chart_layout(
-                                fig_d,
-                                f"ABS GBP by Period × {_drill_dim} — {selected_rec}",
-                                "Period", "ABS GBP (£)", height=380,
-                            )
-                        else:
-                            # Amount by period only (no useful stack for Type/Asset Class)
-                            period_amt = dq_local(
-                                f'SELECT "_Period_label", SUM({safe_amt(abs_actual)}) AS total_amt '
-                                f'FROM rec_tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-                                rec_tbl=rec_combined_df
-                            )
-                            fig_d = px.bar(period_amt, x="_Period_label", y="total_amt",
-                                           color_discrete_sequence=[PRIMARY])
-                            fig_d.update_traces(
-                                text=[format_short(v) for v in period_amt["total_amt"]],
-                                textposition="outside",
-                            )
-                            fig_d = chart_layout(
-                                fig_d, f"ABS GBP by Period — {selected_rec}",
-                                "Period", "ABS GBP (£)", height=360,
-                            )
-                        st.plotly_chart(fig_d, width='stretch')
-
-                    st.markdown('</div>', unsafe_allow_html=True)
-    else:
-        # No rec column — show overall period trend using hist+current data
-        if "_Period_label" in df_f.columns:
-            if (hist_df is not None and len(hist_df) > 0
-                    and "_Period_label" in hist_df.columns):
-                _all_src = pd.concat(
-                    [hist_df[["_Period_label"]], df_f[["_Period_label"]]], ignore_index=True
-                )
-            else:
-                _all_src = df_f[["_Period_label"]]
-            period_cnt = _all_src.groupby("_Period_label").size().reset_index(name="Count").sort_values("_Period_label")
-            fig = px.bar(period_cnt, x="_Period_label", y="Count", color_discrete_sequence=[PRIMARY])
-            fig = chart_layout(fig, "Break Count by Period", "Period", "Count", height=380)
-            st.plotly_chart(fig, width='stretch')
-
-
-# ── Tab: Amount Analysis ──────────────────────────────────────────────────────
-
-def tab_amount_analysis(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None:
-    st.markdown("## 💷 Amount Analysis")
-
-    abs_actual = col_map.get("ABS GBP")
-    brk_actual = col_map.get("BREAK AMOUNT GBP")
-    amt_col = abs_actual or brk_actual
-
-    if not amt_col or amt_col not in df_f.columns:
-        st.info("No amount column found. Ensure 'ABS GBP' or 'BREAK AMOUNT GBP' is present.")
-        return
-
-    total_amt = df_f[amt_col].abs().sum()
-    avg_amt   = df_f[amt_col].abs().mean()
-    max_amt   = df_f[amt_col].abs().max()
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        kpi_card("Total ABS Amount (£)", format_short(total_amt))
-    with k2:
-        kpi_card("Avg ABS Amount (£)", format_short(avg_amt))
-    with k3:
-        kpi_card("Max ABS Amount (£)", format_short(max_amt))
-    with k4:
-        kpi_card("Total Breaks", format_number(len(df_f)))
-
+    # ── Ageing Detail: breaks > 90 days ──────────────────────────────────────
     st.markdown("---")
+    st.markdown("### 🔍 Breaks Exceeding 90-Day Threshold")
 
-    # ── Chart view toggle ─────────────────────────────────────────────────────
-    rec_actual  = col_map.get("Rec Name (as per Rec Cube)")
-    team_actual = col_map.get("Team")
+    if "_Computed_Age_Days" in df_f.columns:
+        _age_cols = []
+        for _lbl, _key in [
+            ("Jira Reference",     "Jira Reference"),
+            ("Rec Name",           "Rec Name (as per Rec Cube)"),
+            ("System to be Fixed", "System to be Fixed"),
+            ("Team",               "Team"),
+            ("Issue Category",     "Issue Category"),
+        ]:
+            _c = col_map.get(_key)
+            if _c and _c in df_f.columns:
+                _age_cols.append(_c)
+        if "_Period_label" in df_f.columns:
+            _age_cols.append("_Period_label")
+        _age_cols += ["_Computed_Age_Days", "_Computed_Bucket"]
+        _abs_col = col_map.get("ABS GBP") or col_map.get("BREAK AMOUNT GBP")
+        if _abs_col and _abs_col in df_f.columns:
+            _age_cols.append(_abs_col)
 
-    _view_opts = ["By Period"]
-    if rec_actual  and rec_actual  in df_f.columns: _view_opts.append("By Rec Name")
-    if team_actual and team_actual in df_f.columns: _view_opts.append("By Team")
-    _view_opts.append("Distribution")
-
-    _amt_view = st.radio("View", _view_opts, horizontal=True, key="_amt_view")
-
-    if _amt_view == "By Period" and "_Period_label" in df_f.columns:
-        # Merge historical periods so the chart shows full trend
-        if (hist_df is not None and len(hist_df) > 0
-                and "_Period_label" in hist_df.columns
-                and amt_col in hist_df.columns):
-            _period_src = pd.concat(
-                [hist_df[["_Period_label", amt_col]],
-                 df_f[["_Period_label", amt_col]]], ignore_index=True
-            )
-        else:
-            _period_src = df_f[["_Period_label", amt_col]]
-        period_amt = dq_local(
-            f'SELECT "_Period_label", SUM({safe_amt(amt_col)}) AS total_amt '
-            f'FROM tbl GROUP BY "_Period_label" ORDER BY "_Period_label"',
-            tbl=_period_src
+        _age_df = (
+            df_f[[c for c in _age_cols if c in df_f.columns]]
+            .rename(columns={
+                "_Period_label":      "Period",
+                "_Computed_Age_Days": "Age Days",
+                "_Computed_Bucket":   "Ageing Bucket",
+            })
         )
-        fig = px.bar(
-            period_amt, x="_Period_label", y="total_amt",
-            color_discrete_sequence=[PRIMARY],
-            text=[format_short(v) for v in period_amt["total_amt"]],
-        )
-        fig.update_traces(textposition="outside")
-        fig = chart_layout(fig, "Total ABS Amount (£) by Period", "Period", "ABS GBP (£)", height=400)
-        st.plotly_chart(fig, width='stretch')
+        _age_df = _age_df[_age_df["Age Days"] > 30].sort_values("Age Days", ascending=False)
 
-    elif _amt_view == "By Rec Name" and rec_actual and rec_actual in df_f.columns:
-        rec_amt = (
-            df_f.groupby(rec_actual)[amt_col]
-            .apply(lambda x: x.abs().sum())
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
+        st.markdown(f"##### Breaks Exceeding 30-Day SLA")
+        st.caption(f"**{len(_age_df):,}** break record(s) with Age Days > 30")
+        render_grid(_age_df, height=420, key="ageing_detail_grid")
+        st.download_button(
+            "📥 Download Ageing Detail (CSV)",
+            _age_df.to_csv(index=False).encode("utf-8"),
+            file_name="ageing_breaks_over_30d.csv",
+            mime="text/csv",
         )
-        rec_amt.columns = [rec_actual, "Total ABS (£)"]
-        fig2 = px.bar(
-            rec_amt, x=rec_actual, y="Total ABS (£)",
-            color_discrete_sequence=[PRIMARY],
-            text=[format_short(v) for v in rec_amt["Total ABS (£)"]],
-        )
-        fig2.update_traces(textposition="outside")
-        fig2 = chart_layout(fig2, "Top-10 Rec Names by ABS Amount (£)", rec_actual, "ABS GBP (£)", height=420)
-        st.plotly_chart(fig2, width='stretch')
-
-    elif _amt_view == "By Team" and team_actual and team_actual in df_f.columns:
-        team_amt = (
-            df_f.groupby(team_actual)[amt_col]
-            .apply(lambda x: x.abs().sum())
-            .sort_values(ascending=False)
-            .reset_index()
-        )
-        team_amt.columns = [team_actual, "Total ABS (£)"]
-        fig3 = px.bar(
-            team_amt, x=team_actual, y="Total ABS (£)",
-            color_discrete_sequence=COLORS[:len(team_amt)],
-            text=[format_short(v) for v in team_amt["Total ABS (£)"]],
-        )
-        fig3.update_traces(textposition="outside")
-        fig3 = chart_layout(fig3, "ABS Amount (£) by Team", team_actual, "ABS GBP (£)", height=400)
-        st.plotly_chart(fig3, width='stretch')
-
-    else:  # Distribution
-        amt_data = df_f[amt_col].dropna()
-        fig4 = px.histogram(amt_data, nbins=50, color_discrete_sequence=[PRIMARY])
-        fig4 = chart_layout(fig4, "Distribution of ABS Amounts (£)", "ABS Amount (£)", "Count", height=400)
-        st.plotly_chart(fig4, width='stretch')
+    else:
+        st.info("Age data unavailable — ensure 'Age Days' or 'Date' column is mapped.")
 
 
 # ── Tab: Jira Factor Analysis ─────────────────────────────────────────────────
@@ -1309,6 +2056,23 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     else:
         _summary_src = df
 
+    # ── Pre-compute Trade ID Recurring Analysis (cached, runs once per dataset) ──
+    _trade_ref_col = col_map.get("TRADE REF")
+    _cached_trade_stats: pd.DataFrame | None = None
+    _cached_rec_summary: pd.DataFrame | None = None
+    if (
+        _trade_ref_col and _trade_ref_col in _summary_src.columns
+        and rec_col and rec_col in _summary_src.columns
+        and "_Period_label" in _summary_src.columns
+    ):
+        _src_hash = hashlib.md5(
+            f"{_summary_src.shape}{list(_summary_src.columns)}".encode()
+        ).hexdigest()
+        _abs_for_cache = abs_col if (abs_col and abs_col in _summary_src.columns) else None
+        _cached_trade_stats, _cached_rec_summary = _compute_trade_recurring(
+            _src_hash, _summary_src, rec_col, _trade_ref_col, _abs_for_cache
+        )
+
     summary_df = dq(f"""
         SELECT
             "{dim_col}"  AS "{selected_label}",
@@ -1348,10 +2112,66 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
              summary_df[prev].replace(0, np.nan)) * 100
         ).round(1)
 
+    # ── Live Jira Enrichment (incremental per-ref cache + parallel fetch) ──────────
+    _jira_enriched_cols = []
+    if selected_label == "Jira Reference" and HAS_JIRA:
+        _jira_url   = st.session_state.get("_jira_url", "")
+        _jira_email = st.session_state.get("_jira_email", "")
+        _jira_token = st.session_state.get("_jira_token", "")
+        if _jira_url and _jira_email and _jira_token:
+            # Clear store when credentials change
+            _cred_hash = hashlib.md5((_jira_url + _jira_email + _jira_token).encode()).hexdigest()[:12]
+            if st.session_state.get("_jira_cred_hash") != _cred_hash:
+                st.session_state["_jira_cred_hash"]  = _cred_hash
+                st.session_state["_jira_meta_store"] = {}
+            _store = st.session_state.setdefault("_jira_meta_store", {})
+
+            _all_refs = sorted({str(r).strip() for r in summary_df[selected_label].tolist()
+                                if str(r).strip() not in ("", "nan", "None")})
+            _SKIP = {"Jira Summary": "Skip", "Assignee": "Skip", "Reporter": "Skip",
+                     "Status": "Skip", "Created Date": "Skip"}
+
+            # Mark non-CTRLS refs as Skip immediately (no API call ever)
+            for _r in _all_refs:
+                if "CTRLS-" not in _r.upper() and _r not in _store:
+                    _store[_r] = _SKIP
+
+            # Only fetch CTRLS- refs not yet in store
+            _to_fetch = [r for r in _all_refs if "CTRLS-" in r.upper() and r not in _store]
+
+            if _to_fetch:
+                _pbar = st.progress(0.0, text=f"Fetching {len(_to_fetch)} new CTRLS- ref(s)…")
+                _new  = fetch_jira_metadata(_to_fetch, _jira_url, _jira_email, _jira_token,
+                                            progress_bar=_pbar)
+                _store.update(_new)
+                _pbar.empty()
+
+            _jira_meta = {r: _store[r] for r in _all_refs if r in _store}
+            _n_fetched = sum(1 for v in _jira_meta.values()
+                             if v.get("Jira Summary") not in ("Skip", "Not Found", "")
+                             and not str(v.get("Jira Summary", "")).startswith("Connect error"))
+            _n_skip    = sum(1 for v in _jira_meta.values() if v.get("Jira Summary") == "Skip")
+            st.caption(f"🔗 Jira: **{_n_fetched}** CTRLS- fetched · **{_n_skip}** skipped · "
+                       f"**{len(_store)}** in store")
+            _meta_df = (
+                pd.DataFrame.from_dict(_jira_meta, orient="index")
+                .reset_index()
+                .rename(columns={"index": selected_label})
+            )
+            summary_df = summary_df.merge(_meta_df, on=selected_label, how="left")
+            _jira_enriched_cols = ["Jira Summary", "Assignee", "Reporter", "Status", "Created Date"]
+        else:
+            st.caption("🔗 Enter Jira credentials in the sidebar (**🔗 Jira Integration**) to enable live enrichment.")
+
+    if len(period_order) < 2:
+        st.info("💡 **MoM Δ unavailable** — upload a historical file (sidebar) or ensure "
+                "the dataset spans 2+ periods to enable month-over-month comparison.")
+
     # ── Column order: metadata, Break Count, all period columns oldest→latest, MoM, ageing, amounts ──
     col_order = [selected_label]
-    for c in ["Jira Description", "System to be Fixed", "Account Group",
-              "Products Reconciled", "Unique Jira Refs"]:
+    for c in ["Jira Description", "System to be Fixed",
+              "Jira Summary", "Assignee", "Reporter", "Status", "Created Date",
+              "Account Group", "Products Reconciled", "Unique Jira Refs"]:
         if c in summary_df.columns: col_order.append(c)
     col_order.append("Break Count")
     # All period columns in chronological order
@@ -1383,9 +2203,32 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
                                 tooltipField="Jira Description")
         if "System to be Fixed" in summary_df.columns:
             gb.configure_column("System to be Fixed", width=200)
+        if "Jira Summary" in summary_df.columns:
+            gb.configure_column("Jira Summary", width=300, tooltipField="Jira Summary")
+        if "Assignee" in summary_df.columns:
+            gb.configure_column("Assignee", width=150)
+        if "Reporter" in summary_df.columns:
+            gb.configure_column("Reporter", width=150)
+        if "Created Date" in summary_df.columns:
+            gb.configure_column("Created Date", width=120)
         for c in ["Break Count"] + period_order:
             if c in summary_df.columns:
                 gb.configure_column(c, width=110)
+        # Apply yellow header styling first; cell-level styling below takes final precedence
+        _apply_computed_headers(gb, summary_df.columns.tolist())
+        if "Status" in summary_df.columns:
+            status_cs = JsCode("""function(p){
+                var v=(p.value||'').toLowerCase().trim();
+                if(v==='done')
+                    return {'backgroundColor':'#E8F5E9','color':'#1B5E20','fontWeight':'bold'};
+                if(v==='to do'||v==='todo')
+                    return {'backgroundColor':'#F5F5F5','color':'#424242','fontWeight':'bold'};
+                if(v==='backlog')
+                    return {'backgroundColor':'#FFEBEE','color':'#B71C1C','fontWeight':'bold'};
+                if(['in analysis','in development','in testing'].indexOf(v)>=0)
+                    return {'backgroundColor':'#E3F2FD','color':'#0D47A1','fontWeight':'bold'};
+                return {};}""")
+            gb.configure_column("Status", cellStyle=status_cs, width=110)
         if "MoM Δ" in summary_df.columns:
             mom_cs = JsCode("""function(p){
                 var v=p.value;
@@ -1414,6 +2257,308 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         file_name=f"factor_{selected_label.replace(' ','_').lower()}.csv",
         mime="text/csv",
     )
+    # Raw underlying rows for current filtered upload (no internal _ columns)
+    _raw_dl = df.rename(columns={"_Period_label": "Period"})
+    _raw_dl = _raw_dl[[c for c in _raw_dl.columns if not c.startswith("_")]]
+    st.download_button(
+        "📥 Download Raw Breaks — Latest File (CSV)",
+        _raw_dl.to_csv(index=False).encode("utf-8"),
+        file_name="raw_breaks_latest.csv",
+        mime="text/csv",
+    )
+
+    # ── RecName Trade ID Recurring Analysis (shown only when Rec Name factor is selected) ──
+    if selected_label == "Rec Name":
+        st.markdown("---")
+        st.markdown("### RecName — Trade ID Recurring Analysis")
+
+        if _cached_rec_summary is not None:
+            # Use pre-computed (cached) results — no heavy query on rerender
+            _trade_stats  = _cached_trade_stats
+            _rec_summary  = _cached_rec_summary
+
+            st.caption(
+                "**Recurring** = same Trade ID in ≥ 2 distinct periods. "
+                "**Recurring + Stale** = recurring with unchanged break value. "
+                "**Duplicate** = same Trade ID ≥ 2× within one period. "
+                "**Duplicate + Stale** = duplicate with identical break value. "
+                "**New** = Trade ID seen once, in one period. "
+                "**% Recurring Breaks** = share of raw break rows belonging to recurring Trade IDs."
+            )
+
+            _sel_rec_name = None
+            if HAS_AGGRID:
+                _gb_rec = GridOptionsBuilder.from_dataframe(_rec_summary)
+                _gb_rec.configure_selection("single", use_checkbox=True)
+                _gb_rec.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+                _gb_rec.configure_default_column(sortable=True, resizable=True, filter=True)
+                _gb_rec.configure_column("RecName", pinned="left", width=200)
+                for _c in ["Unique Tradeid Count", "No. of New Tradeids",
+                           "No. of Recurring Tradeids",
+                           "No. of Recurring + Stale Tradeids",
+                           "No. of Duplicate Tradeids",
+                           "No. of Dup+Stale Tradeids"]:
+                    if _c in _rec_summary.columns:
+                        _gb_rec.configure_column(_c, width=175)
+                _new_cs = JsCode("""function(p){
+                    var v=parseInt(p.value);
+                    if(v>0) return {'backgroundColor':'#E8F5E9','color':'#1B5E20','fontWeight':'bold'};
+                    return {};}""")
+                if "No. of New Tradeids" in _rec_summary.columns:
+                    _gb_rec.configure_column("No. of New Tradeids", cellStyle=_new_cs)
+                _stale_cs = JsCode("""function(p){
+                    var v=parseInt(p.value);
+                    if(v>0) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                    return {};}""")
+                if "No. of Recurring + Stale Tradeids" in _rec_summary.columns:
+                    _gb_rec.configure_column("No. of Recurring + Stale Tradeids", cellStyle=_stale_cs)
+                _dup_stale_cs = JsCode("""function(p){
+                    var v=parseInt(p.value);
+                    if(v>0) return {'backgroundColor':'#F3E5F5','color':'#5C2D91','fontWeight':'bold'};
+                    return {};}""")
+                if "No. of Dup+Stale Tradeids" in _rec_summary.columns:
+                    _gb_rec.configure_column("No. of Dup+Stale Tradeids", cellStyle=_dup_stale_cs)
+                # % Recurring Breaks — colour coded for confidence
+                _pct_rec_cs = JsCode("""function(p){
+                    var v=parseFloat(p.value);
+                    if(v>=50) return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                    if(v>=20) return {'backgroundColor':'#FFF8E1','color':'#7A4000','fontWeight':'bold'};
+                    return {'backgroundColor':'#E8F5E9','color':'#1B5E20'};}""")
+                if "% Recurring Breaks" in _rec_summary.columns:
+                    _gb_rec.configure_column(
+                        "% Recurring Breaks", cellStyle=_pct_rec_cs, width=160,
+                    )
+                try:
+                    _rec_grid_resp = AgGrid(
+                        _rec_summary.reset_index(drop=True),
+                        gridOptions=_gb_rec.build(),
+                        height=400,
+                        theme="streamlit",
+                        allow_unsafe_jscode=True,
+                        key="recname_tradeid_summary_grid",
+                        update_mode=GridUpdateMode.SELECTION_CHANGED,
+                    )
+                    # ── Fix: handle both DataFrame and list-of-dict returns from AgGrid ──
+                    _sel_rows = _rec_grid_resp.get("selected_rows")
+                    _sel_rec_name = None
+                    if _sel_rows is not None:
+                        if isinstance(_sel_rows, pd.DataFrame):
+                            if len(_sel_rows) > 0:
+                                _sel_rec_name = _sel_rows.iloc[0]["RecName"]
+                        elif isinstance(_sel_rows, list) and len(_sel_rows) > 0:
+                            _first = _sel_rows[0]
+                            _sel_rec_name = _first["RecName"] if isinstance(_first, dict) else str(_first)
+                except Exception:
+                    st.dataframe(_rec_summary.reset_index(drop=True), height=400)
+                    _sel_rec_name = st.selectbox(
+                        "Select RecName to view Trade ID details:",
+                        [""] + _rec_summary["RecName"].tolist(),
+                        key="recname_tradeid_sel_fallback",
+                    ) or None
+            else:
+                st.dataframe(_rec_summary, height=400)
+                _sel_rec_name = st.selectbox(
+                    "Select RecName to view Trade ID details:",
+                    [""] + _rec_summary["RecName"].tolist(),
+                    key="recname_tradeid_sel",
+                ) or None
+
+            # ── Detail view for selected RecName ─────────────────────────────
+            if _sel_rec_name:
+                st.markdown(f"#### Trade ID Details — **{_sel_rec_name}**")
+                _detail = _trade_stats[_trade_stats["RecName"] == _sel_rec_name].copy()
+                # Period Breakdown replaces the three separate numeric columns
+                _show_cols = ["Trade ID", "Type", "Period Breakdown"]
+                if "Avg Break Value" in _detail.columns:
+                    _show_cols.append("Avg Break Value")
+                if "Excess Break (Dup)" in _detail.columns:
+                    _show_cols.append("Excess Break (Dup)")
+                _detail_disp = (
+                    _detail[[c for c in _show_cols if c in _detail.columns]]
+                    .reset_index(drop=True)
+                )
+
+                if HAS_AGGRID:
+                    _type_cs = JsCode("""function(p){
+                        var v=(p.value||'').trim();
+                        if(v==='Recurring + Stale')
+                            return {'backgroundColor':'#FDECEA','color':'#A84B2F','fontWeight':'bold'};
+                        if(v==='Recurring')
+                            return {'backgroundColor':'#FFF8E1','color':'#7A4000','fontWeight':'bold'};
+                        if(v==='Duplicate + Stale')
+                            return {'backgroundColor':'#F3E5F5','color':'#5C2D91','fontWeight':'bold'};
+                        if(v==='Duplicate')
+                            return {'backgroundColor':'#E3F2FD','color':'#0D47A1','fontWeight':'bold'};
+                        if(v==='New')
+                            return {'backgroundColor':'#E8F5E9','color':'#1B5E20','fontWeight':'bold'};
+                        return {};}""")
+                    _gb_det = GridOptionsBuilder.from_dataframe(_detail_disp)
+                    _gb_det.configure_default_column(sortable=True, resizable=True, filter=True)
+                    _gb_det.configure_column("Trade ID", pinned="left", width=180)
+                    _gb_det.configure_column("Type", cellStyle=_type_cs, width=185)
+                    _gb_det.configure_column(
+                        "Period Breakdown", width=320, wrapText=True, autoHeight=True,
+                    )
+                    if "Avg Break Value" in _detail_disp.columns:
+                        _gb_det.configure_column("Avg Break Value", width=140)
+                    if "Excess Break (Dup)" in _detail_disp.columns:
+                        _gb_det.configure_column("Excess Break (Dup)", width=155)
+                    _gb_det.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+                    try:
+                        AgGrid(
+                            _detail_disp,
+                            gridOptions=_gb_det.build(),
+                            height=400,
+                            theme="streamlit",
+                            allow_unsafe_jscode=True,
+                            key="recname_tradeid_detail_grid",
+                            update_mode=GridUpdateMode.NO_UPDATE,
+                        )
+                    except Exception:
+                        st.dataframe(_detail_disp, height=400)
+                else:
+                    st.dataframe(_detail_disp, height=350)
+
+                # ── Downloads ────────────────────────────────────────────────
+                _dl_col1, _dl_col2, _dl_col3 = st.columns(3)
+
+                def _make_dl(ids):
+                    _type_lookup = _detail.set_index("Trade ID")["Type"].to_dict()
+                    _src = _summary_src[
+                        (_summary_src[rec_col].astype(str) == str(_sel_rec_name)) &
+                        (_summary_src[_trade_ref_col].isin(ids))
+                    ].copy()
+                    _src["Break Type"] = _src[_trade_ref_col].astype(str).map(_type_lookup)
+                    _src = _src.rename(columns={"_Period_label": "Period"})
+                    return _src[[c for c in _src.columns if not c.startswith("_")]]
+
+                _stale_ids = _detail.loc[
+                    _detail["Type"].isin(["Recurring", "Recurring + Stale"]), "Trade ID"
+                ].tolist()
+                with _dl_col1:
+                    st.download_button(
+                        f"📥 Recurring / Stale — {str(_sel_rec_name)[:25]}",
+                        _make_dl(_stale_ids).to_csv(index=False).encode("utf-8"),
+                        file_name=f"stale_{str(_sel_rec_name).replace('/', '_')[:25]}.csv",
+                        mime="text/csv",
+                        key="recname_dl_stale",
+                    )
+
+                _new_ids = _detail.loc[_detail["Type"] == "New", "Trade ID"].tolist()
+                with _dl_col2:
+                    st.download_button(
+                        f"📥 New / Non-Reoccurred — {str(_sel_rec_name)[:22]}",
+                        _make_dl(_new_ids).to_csv(index=False).encode("utf-8"),
+                        file_name=f"new_{str(_sel_rec_name).replace('/', '_')[:25]}.csv",
+                        mime="text/csv",
+                        key="recname_dl_new",
+                    )
+
+                _dup_ids = _detail.loc[
+                    _detail["Type"].isin(["Duplicate", "Duplicate + Stale"]),
+                    "Trade ID",
+                ].tolist()
+                with _dl_col3:
+                    st.download_button(
+                        f"📥 Duplicate Trades — {str(_sel_rec_name)[:25]}",
+                        _make_dl(_dup_ids).to_csv(index=False).encode("utf-8"),
+                        file_name=f"dup_{str(_sel_rec_name).replace('/', '_')[:25]}.csv",
+                        mime="text/csv",
+                        key="recname_dl_dup",
+                    )
+
+                # ── Distribution chart for selected RecName ───────────────────
+                _type_col_chart = col_map.get("Type of Break")
+                _chart_dims = {
+                    k: v for k, v in {
+                        "Asset Class":   ac_col,
+                        "Entity":        entity_col,
+                        "True/Systemic": ts_col,
+                        "Type of Break": _type_col_chart,
+                    }.items()
+                    if v and v in _summary_src.columns
+                }
+
+                if _chart_dims:
+                    st.markdown("---")
+                    st.markdown(f"#### Trade ID Distribution — **{_sel_rec_name}**")
+
+                    # Raw rows for selected RecName
+                    _sel_raw = _summary_src[
+                        _summary_src[rec_col].astype(str) == str(_sel_rec_name)
+                    ].copy()
+
+                    # Map Trade ID → Type (from pre-computed stats)
+                    _type_map = dict(zip(
+                        _trade_stats["Trade ID"].astype(str),
+                        _trade_stats["Type"],
+                    ))
+                    _sel_raw["_TType"] = (
+                        _sel_raw[_trade_ref_col].astype(str).map(_type_map).fillna("Unknown")
+                    )
+
+                    # One row per distinct Trade ID — first value per dimension
+                    _agg_d = {"_TType": "first"}
+                    _agg_d.update({v: "first" for v in _chart_dims.values()})
+                    _per_trade = (
+                        _sel_raw.groupby(_sel_raw[_trade_ref_col].astype(str), sort=False)
+                        .agg(_agg_d)
+                        .reset_index()
+                        .rename(columns={_trade_ref_col: "Trade ID"})
+                    )
+
+                    _type_color_map = {
+                        "Recurring + Stale":      "#A84B2F",
+                        "Recurring":              "#FFC553",
+                        "Duplicate + Stale":      "#5C2D91",
+                        "Duplicate":              "#4F98A3",
+                        "New":                    "#01696F",
+                        "Unknown":                "#7A7974",
+                    }
+
+                    _chart_items = list(_chart_dims.items())
+                    for _ci in range(0, len(_chart_items), 2):
+                        _row_cols = st.columns(min(2, len(_chart_items) - _ci))
+                        for _cj, (_dlabel, _dcol_name) in enumerate(_chart_items[_ci:_ci + 2]):
+                            with _row_cols[_cj]:
+                                _grp = (
+                                    _per_trade.groupby([_dcol_name, "_TType"], sort=False)
+                                    .size()
+                                    .reset_index(name="Trade ID Count")
+                                    .rename(columns={_dcol_name: _dlabel, "_TType": "Type"})
+                                )
+                                _fig_dist = px.bar(
+                                    _grp,
+                                    x="Trade ID Count",
+                                    y=_dlabel,
+                                    color="Type",
+                                    color_discrete_map=_type_color_map,
+                                    orientation="h",
+                                    barmode="stack",
+                                    text="Trade ID Count",
+                                )
+                                _fig_dist = chart_layout(
+                                    _fig_dist,
+                                    f"By {_dlabel}",
+                                    "Trade ID Count",
+                                    _dlabel,
+                                    height=max(300, _grp[_dlabel].nunique() * 45 + 120),
+                                )
+                                _fig_dist.update_traces(
+                                    textposition="inside", textfont_size=11
+                                )
+                                _fig_dist.update_layout(legend_title_text="Type")
+                                st.plotly_chart(_fig_dist, use_container_width=True)
+        else:
+            st.info(
+                "💡 **RecName Trade ID Summary** requires a **'TRADE REF'** column in your data "
+                "to detect recurring and stale breaks across periods."
+            )
+    elif _cached_rec_summary is not None:
+        st.info(
+            "💡 Switch the factor dimension to **Rec Name** to view the "
+            "Trade ID Recurring Analysis table (pre-computed and ready)."
+        )
 
     # ── Drill-Down: select a dimension value and break it by a secondary dim ──
     st.markdown("---")
@@ -1463,6 +2608,15 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
             _drill_src = _summary_src[
                 _summary_src[dim_col].astype(str) == _sel_val
             ].copy()
+
+            _drill_dl = _drill_src.rename(columns={"_Period_label": "Period"})
+            _drill_dl = _drill_dl[[c for c in _drill_dl.columns if not c.startswith("_")]]
+            st.download_button(
+                f"📥 Download Breaks for {_sel_val} (CSV)",
+                _drill_dl.to_csv(index=False).encode("utf-8"),
+                file_name=f"breaks_{str(_sel_val).replace('/', '_')[:40]}.csv",
+                mime="text/csv",
+            )
 
             if len(_drill_src) == 0:
                 st.info(f"No data found for {selected_label} = {_sel_val}.")
@@ -1524,119 +2678,31 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
     # ─────────────────────────────────────────────────────────────────────
     dmap = _desc_map() if selected_label == "Jira Reference" else {}
 
-    row1a, row1b = st.columns(2)
-
     # ── Chart 1: Top 15 by Break Count ──
-    with row1a:
-        top_cnt = dq(f"""
-            SELECT "{dim_col}" AS factor, COUNT(*) AS cnt
-            FROM tbl
-            WHERE "{dim_col}" IS NOT NULL
-              AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-            GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 15
-        """, df).sort_values("cnt", ascending=True)
+    top_cnt = dq(f"""
+        SELECT "{dim_col}" AS factor, COUNT(*) AS cnt
+        FROM tbl
+        WHERE "{dim_col}" IS NOT NULL
+          AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
+        GROUP BY "{dim_col}" ORDER BY cnt DESC LIMIT 15
+    """, df).sort_values("cnt", ascending=True)
 
-        if dmap:
-            top_cnt["hover_desc"] = top_cnt["factor"].map(dmap).fillna("")
-            fig = go.Figure(go.Bar(
-                x=top_cnt["cnt"], y=top_cnt["factor"],
-                orientation="h", marker_color=PRIMARY,
-                text=top_cnt["cnt"], textposition="outside",
-                customdata=top_cnt["hover_desc"],
-                hovertemplate="<b>%{y}</b><br>%{customdata}<br>Breaks: %{x}<extra></extra>",
-            ))
-        else:
-            fig = px.bar(top_cnt, x="cnt", y="factor", orientation="h",
-                         color_discrete_sequence=[PRIMARY], text="cnt")
-            fig.update_traces(textposition="outside")
-        fig = chart_layout(fig, f"Top 15 {selected_label} by Break Count",
-                           "Break Count", "", height=max(360, len(top_cnt) * 32))
-        st.plotly_chart(fig, width='stretch')
-
-    # ── Chart 2: Risk Matrix — Age vs Break Count (bubble = ABS GBP) ──
-    with row1b:
-        if "_Computed_Age_Days" in df.columns:
-            _abs_expr = (
-                f', ROUND(SUM(ABS("{abs_col}")), 0) AS total_abs'
-                if abs_col and abs_col in df.columns else ""
-            )
-            risk_matrix = dq(f"""
-                SELECT "{dim_col}" AS factor,
-                       ROUND(AVG(_Computed_Age_Days), 1) AS avg_age,
-                       COUNT(*) AS brk_cnt
-                       {_abs_expr}
-                FROM tbl
-                WHERE "{dim_col}" IS NOT NULL
-                  AND TRIM(CAST("{dim_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-                  AND _Computed_Age_Days IS NOT NULL
-                GROUP BY "{dim_col}" ORDER BY avg_age DESC LIMIT 20
-            """, df)
-
-            if len(risk_matrix) > 0:
-                bubble_colors = [
-                    WARN      if v > 180 else
-                    COLORS[8] if v > 90  else
-                    COLORS[0]
-                    for v in risk_matrix["avg_age"]
-                ]
-                if "total_abs" in risk_matrix.columns:
-                    max_abs = risk_matrix["total_abs"].replace(0, np.nan).max() or 1
-                    bubble_sizes = (
-                        (risk_matrix["total_abs"].fillna(0) / max_abs * 50 + 10)
-                        .clip(10, 60).tolist()
-                    )
-                    size_label = risk_matrix["total_abs"].apply(format_short)
-                else:
-                    bubble_sizes = [20] * len(risk_matrix)
-                    size_label = pd.Series(["N/A"] * len(risk_matrix))
-
-                if dmap:
-                    risk_matrix["hover_desc"] = risk_matrix["factor"].map(dmap).fillna("")
-                    htext = (
-                        "<b>%{customdata[0]}</b><br>%{customdata[1]}<br>"
-                        "Avg Age: %{x}d<br>Breaks: %{y}<br>"
-                        "ABS GBP: %{customdata[2]}<extra></extra>"
-                    )
-                    cdata = list(zip(
-                        risk_matrix["factor"],
-                        risk_matrix["hover_desc"],
-                        size_label,
-                    ))
-                else:
-                    htext = (
-                        "<b>%{customdata[0]}</b><br>"
-                        "Avg Age: %{x}d<br>Breaks: %{y}<br>"
-                        "ABS GBP: %{customdata[1]}<extra></extra>"
-                    )
-                    cdata = list(zip(risk_matrix["factor"], size_label))
-
-                fig = go.Figure(go.Scatter(
-                    x=risk_matrix["avg_age"],
-                    y=risk_matrix["brk_cnt"],
-                    mode="markers+text",
-                    text=risk_matrix["factor"].apply(
-                        lambda v: (str(v)[:18] + "…") if len(str(v)) > 18 else str(v)
-                    ),
-                    textposition="top center",
-                    textfont=dict(size=9),
-                    marker=dict(
-                        size=bubble_sizes,
-                        color=bubble_colors,
-                        opacity=0.75,
-                        line=dict(width=1, color="white"),
-                    ),
-                    customdata=cdata,
-                    hovertemplate=htext,
-                ))
-                fig.add_vline(x=90,  line_dash="dash", line_color=COLORS[8], line_width=1.2,
-                              annotation_text="90d",  annotation_position="top right")
-                fig.add_vline(x=180, line_dash="dash", line_color=WARN,      line_width=1.2,
-                              annotation_text="180d", annotation_position="top right")
-                fig = chart_layout(fig,
-                    f"Risk Matrix: {selected_label} — Age vs Break Count",
-                    "Avg Age Days", "Break Count", height=420)
-                fig.update_xaxes(type="linear")
-                st.plotly_chart(fig, width='stretch')
+    if dmap:
+        top_cnt["hover_desc"] = top_cnt["factor"].map(dmap).fillna("")
+        fig = go.Figure(go.Bar(
+            x=top_cnt["cnt"], y=top_cnt["factor"],
+            orientation="h", marker_color=PRIMARY,
+            text=top_cnt["cnt"], textposition="outside",
+            customdata=top_cnt["hover_desc"],
+            hovertemplate="<b>%{y}</b><br>%{customdata}<br>Breaks: %{x}<extra></extra>",
+        ))
+    else:
+        fig = px.bar(top_cnt, x="cnt", y="factor", orientation="h",
+                     color_discrete_sequence=[PRIMARY], text="cnt")
+        fig.update_traces(textposition="outside")
+    fig = chart_layout(fig, f"Top 15 {selected_label} by Break Count",
+                       "Break Count", "", height=max(360, len(top_cnt) * 32))
+    st.plotly_chart(fig, width='stretch')
 
     if abs_col and abs_col in df.columns:
         row2a, row2b = st.columns(2)
@@ -1793,54 +2859,6 @@ def tab_jira_factor_analysis(df: pd.DataFrame, col_map: dict, hist_df=None):
         st.caption("🟩 Teal = More breaks this period (worse)   "
                    "🟥 Red = Fewer breaks this period (improvement)")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Jira Reference × System to be Fixed heatmap
-    # ─────────────────────────────────────────────────────────────────────
-    if (jira_ref_col  and jira_ref_col  in df.columns and
-            system_col and system_col in df.columns):
-        st.markdown("### Jira Reference × System to be Fixed — Break Count Heatmap")
-        cross = dq(f"""
-            SELECT "{jira_ref_col}" AS jira_ref,
-                   "{system_col}"   AS system_fix,
-                   COUNT(*)         AS cnt
-            FROM tbl
-            WHERE "{jira_ref_col}" IS NOT NULL AND "{system_col}" IS NOT NULL
-              AND TRIM(CAST("{jira_ref_col}" AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-              AND TRIM(CAST("{system_col}"   AS VARCHAR)) NOT IN ('','nan','None','N/A','-')
-            GROUP BY "{jira_ref_col}", "{system_col}"
-        """, df)
-
-        if len(cross) > 0:
-            if jira_desc_col and jira_desc_col in df.columns:
-                desc_map_h = dq(f"""
-                    SELECT "{jira_ref_col}" AS ref,
-                           FIRST("{jira_desc_col}") AS d
-                    FROM tbl WHERE "{jira_ref_col}" IS NOT NULL
-                    GROUP BY "{jira_ref_col}"
-                """, df).set_index("ref")["d"].to_dict()
-                cross["jira_label"] = cross["jira_ref"].apply(
-                    lambda x: _short_label(x, desc_map_h, max_chars=30))
-            else:
-                cross["jira_label"] = cross["jira_ref"]
-
-            pivot = cross.pivot_table(
-                index="jira_label", columns="system_fix",
-                values="cnt", fill_value=0)
-            jira_totals = cross.groupby("jira_label")["cnt"].sum()
-            top20_labels = jira_totals.nlargest(20).index
-            pivot = pivot.loc[pivot.index.isin(top20_labels)]
-
-            fig = px.imshow(
-                pivot,
-                color_continuous_scale=["#E8F5E9","#FFC553","#A84B2F"],
-                aspect="auto", text_auto=".0f",
-            )
-            fig = chart_layout(fig,
-                "Jira Reference × System to be Fixed (Top 20 Jiras — Break Count)",
-                "", "", height=max(400, len(pivot) * 30))
-            st.plotly_chart(fig, width='stretch')
-        else:
-            st.info("No data found for Jira Reference × System to be Fixed cross-analysis.")
 
 
 # ── Tab: FP Thresholding ──────────────────────────────────────────────────────
@@ -1993,11 +3011,78 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
     w_cnt           = cnt_weight / 100.0
     composite_score = (1.0 - w_cnt) * dev_pct + w_cnt * dev_pct_cnt
 
-    conditions = [
-        composite_score >= high_thresh,
-        composite_score >= med_thresh,
-    ]
-    pivot["Priority"] = np.select(conditions, ["🔴 High", "🟡 Medium"], default="🟢 Low / FP Candidate")
+    # ── Adaptive Threshold Calibration Panel ─────────────────────────────────
+    with st.expander("⚙️ Adaptive Threshold Calibration", expanded=False):
+        rec_thresh_data = load_rec_thresholds()
+        _cal_col1, _cal_col2, _cal_col3, _cal_col4 = st.columns(4)
+        with _cal_col1:
+            _is_cal = rec_thresh_data is not None and "recs" in rec_thresh_data
+            kpi_card("Calibrated?", "Yes" if _is_cal else "No",
+                     warn=(not _is_cal))
+        with _cal_col2:
+            kpi_card("Last Calibrated Period",
+                     rec_thresh_data.get("calibrated_at", "—") if rec_thresh_data else "—")
+        with _cal_col3:
+            n_cal = len(rec_thresh_data.get("recs", {})) if rec_thresh_data else 0
+            kpi_card("Recs Calibrated", str(n_cal))
+        with _cal_col4:
+            kpi_card("Segment Used",
+                     rec_thresh_data.get("segment_col", "—") if rec_thresh_data else "—")
+
+        if st.button("Calibrate Thresholds from Historical Data",
+                     key="_thresh_calibrate_btn",
+                     help="Compute per-Rec High/Medium thresholds from all available historical periods"):
+            with st.spinner("Calibrating per-Rec thresholds…"):
+                cal_result = compute_rec_thresholds(
+                    combined, col_map, seg_sel, cnt_weight, abs_col
+                )
+            if cal_result.get("recs"):
+                save_rec_thresholds(cal_result)
+                st.session_state["_rec_thresh_calibrated"] = True
+                st.success(
+                    f"✅ Calibrated thresholds for {len(cal_result['recs'])} Recs "
+                    f"using {cal_result['n_periods_used']} periods."
+                )
+                st.rerun()
+            else:
+                st.warning("Not enough historical periods to calibrate (need ≥ 2).")
+
+        _use_rec = st.checkbox(
+            "Use per-Rec adaptive thresholds (recommended)",
+            value=True,
+            key="_use_rec_thresh",
+            help="When enabled, each Rec uses its own volatility-calibrated threshold. "
+                 "Recs with < 3 historical periods fall back to the global sliders above."
+        )
+
+        if rec_thresh_data and rec_thresh_data.get("recs"):
+            recs_table = []
+            for _rn, _rv in rec_thresh_data["recs"].items():
+                _n = _rv.get("n_periods", 0)
+                recs_table.append({
+                    "Rec Name":    _rn,
+                    "High Thresh": _rv.get("high_thresh"),
+                    "Med Thresh":  _rv.get("med_thresh"),
+                    "CV":          _rv.get("cv"),
+                    "N Periods":   _n,
+                    "Source":      "Calibrated" if _n >= 3 else "Global Fallback (< 3 periods)",
+                })
+            _thresh_tbl = pd.DataFrame(recs_table)
+            st.dataframe(_thresh_tbl, use_container_width=True, hide_index=True)
+            st.download_button(
+                "📥 Download Threshold Table (CSV)",
+                _thresh_tbl.to_csv(index=False).encode("utf-8"),
+                file_name="rec_thresholds.csv",
+                mime="text/csv",
+                key="_dl_thresh_csv",
+            )
+
+    # Apply per-Rec or global thresholds
+    _use_adaptive = st.session_state.get("_use_rec_thresh", True)
+    _loaded_thresh = load_rec_thresholds() if _use_adaptive else None
+    pivot["Priority"] = apply_rec_thresholds(
+        pivot, composite_score, seg_sel, _loaded_thresh, high_thresh, med_thresh
+    )
     pivot["Tag for Review"] = pivot["Priority"] == "🔴 High"
 
     # Per-period display columns
@@ -2112,6 +3197,7 @@ def tab_fp_thresholding(df_f: pd.DataFrame, col_map: dict, hist_df=None) -> None
         if "Issue Category 2" in display_df.columns:
             gb_fp.configure_column("Issue Category 2", width=200)
         gb_fp.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        _apply_computed_headers(gb_fp, display_df.columns.tolist())
         fp_grid = AgGrid(
             display_df,
             gridOptions=gb_fp.build(),
@@ -2337,6 +3423,361 @@ def tab_period_comparison(df_f: pd.DataFrame, hist_df, col_map: dict) -> None:
     )
 
 
+# ── Tab: ML Predictions ───────────────────────────────────────────────────────
+
+def tab_ml_predictions(
+    df: pd.DataFrame,
+    df_f: pd.DataFrame,
+    col_map: dict,
+    hist_df,
+) -> None:
+    st.markdown("## 🤖 ML Break Outcome Predictions")
+    st.markdown(
+        '<div class="banner-info">🤖 Train models on your labeled historical breaks, '
+        'then predict <b>Issue Category</b>, <b>Issue Category 2</b>, '
+        '<b>System to be Fixed</b>, and <b>Jira Reference</b> for new unlabeled breaks. '
+        'Confidence scores help route each break automatically or flag it for manual review.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not HAS_ML:
+        st.warning(
+            "ML dependencies not installed. Run:\n\n"
+            "```\npip install scikit-learn joblib\n```\n\n"
+            "then restart the app."
+        )
+        return
+
+    # Combine current + historical for training
+    combined_frames = [df]
+    if hist_df is not None and len(hist_df) > 0:
+        combined_frames.append(hist_df)
+    combined_df = pd.concat(combined_frames, ignore_index=True)
+
+    # ── A: Training Panel ─────────────────────────────────────────────────────
+    st.subheader("Model Training")
+    meta = _load_ml_meta()
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        kpi_card("Models Trained?", "Yes" if meta else "No", warn=(meta is None))
+    with m2:
+        kpi_card("Trained On (rows)", f"{meta['n_rows']:,}" if meta else "—")
+    with m3:
+        kpi_card("Last Trained", meta["trained_at"][:10] if meta else "—")
+    with m4:
+        if meta and meta.get("metrics"):
+            acc_vals = [v["accuracy"] for v in meta["metrics"].values() if v.get("accuracy")]
+            avg_acc  = sum(acc_vals) / len(acc_vals) if acc_vals else 0.0
+            kpi_card("Avg Model Accuracy", f"{avg_acc:.1%}")
+        else:
+            kpi_card("Avg Model Accuracy", "—")
+
+    if meta and meta.get("metrics"):
+        acc_rows = []
+        for tgt, vals in meta["metrics"].items():
+            if vals.get("accuracy") is not None:
+                acc_rows.append({
+                    "Target":    tgt,
+                    "Accuracy":  f"{vals['accuracy']:.1%}",
+                    "Train Rows": f"{vals.get('n_train', 0):,}",
+                })
+        if acc_rows:
+            st.dataframe(pd.DataFrame(acc_rows), hide_index=True, use_container_width=True)
+
+    with st.expander("Advanced Training Options", expanded=False):
+        _incl_hist = st.checkbox("Include historical data in training", value=True, key="_ml_incl_hist")
+        _retrain_single = st.selectbox(
+            "Retrain single target only (or train all)",
+            ["All"] + list(ML_TARGETS.keys()),
+            key="_ml_retrain_sel",
+        )
+
+    train_df = combined_df if st.session_state.get("_ml_incl_hist", True) else df
+
+    if st.button("🚀 Train Models on Current + Historical Data", key="_ml_train_btn", type="primary"):
+        _prog = st.progress(0.0, text="Training…")
+        def _cb(p):
+            _prog.progress(min(p, 1.0), text=f"Training… {int(p*100)}%")
+
+        with st.spinner("Training ML models (may take 1–3 minutes for large datasets)…"):
+            _sel = st.session_state.get("_ml_retrain_sel", "All")
+            if _sel == "All":
+                train_results = train_all_models(train_df, col_map, progress_cb=_cb)
+            else:
+                train_results = {_sel: train_single_model(train_df, col_map, _sel)}
+                _cb(1.0)
+
+        _prog.empty()
+        errors = {k: v for k, v in train_results.items()
+                  if isinstance(v, dict) and "error" in v}
+        if errors:
+            for k, v in errors.items():
+                st.warning(f"{k}: {v['error']}")
+        successes = {k: v for k, v in train_results.items()
+                     if isinstance(v, dict) and "accuracy" in v}
+        if successes:
+            st.success(
+                f"✅ Trained {len(successes)} model(s). "
+                + "  |  ".join(f"{k}: {v['accuracy']:.1%}" for k, v in successes.items())
+            )
+        st.rerun()
+
+    st.divider()
+
+    # ── B: Predictions Panel ──────────────────────────────────────────────────
+    st.subheader("Predictions for Current Upload")
+
+    if not meta:
+        st.info("Train models first using the panel above.")
+    else:
+        if st.button("▶️ Run Predictions on Current Data", key="_ml_predict_btn"):
+            with st.spinner("Running predictions…"):
+                pred_df = predict_breaks(df_f, col_map)
+            st.session_state["_ml_predictions_df"] = pred_df
+            st.success(f"Predictions complete for {len(pred_df):,} rows.")
+            st.rerun()
+
+        pred_df = st.session_state.get("_ml_predictions_df")
+        if pred_df is not None and len(pred_df) > 0:
+            # Summary KPIs
+            _conf_cols = [c for c in pred_df.columns if c.startswith("_conf_tier_")]
+            if _conf_cols:
+                _tier_counts = {t: 0 for t in ["High", "Medium", "Low"]}
+                for cc in _conf_cols:
+                    for t in _tier_counts:
+                        _tier_counts[t] += int((pred_df[cc] == t).sum())
+                _total_cells = len(pred_df) * len(_conf_cols)
+                pk1, pk2, pk3, pk4 = st.columns(4)
+                with pk1: kpi_card("Rows Predicted", f"{len(pred_df):,}")
+                with pk2: kpi_card("High Confidence", f"{_tier_counts['High']:,}", f"{_tier_counts['High']/_total_cells:.0%} of all predictions")
+                with pk3: kpi_card("Medium Confidence", f"{_tier_counts['Medium']:,}", f"{_tier_counts['Medium']/_total_cells:.0%} of all predictions", warn=True)
+                with pk4: kpi_card("Low Confidence", f"{_tier_counts['Low']:,}", f"{_tier_counts['Low']/_total_cells:.0%} — manual review needed", warn=(_tier_counts['Low'] > _total_cells * 0.3))
+
+                # Confidence tier breakdown chart
+                tier_rows = []
+                for cc in _conf_cols:
+                    lbl = cc.replace("_conf_tier_", "").replace("_", " ").title()
+                    vc  = pred_df[cc].value_counts()
+                    for t in ["High", "Medium", "Low"]:
+                        tier_rows.append({"Target": lbl, "Tier": t, "Count": int(vc.get(t, 0))})
+                tier_chart_df = pd.DataFrame(tier_rows)
+                fig_tier = px.bar(
+                    tier_chart_df, x="Target", y="Count", color="Tier",
+                    color_discrete_map={"High": "#01696F", "Medium": "#FFC553", "Low": "#A84B2F"},
+                    barmode="stack",
+                )
+                fig_tier = chart_layout(fig_tier, "Confidence Tier Breakdown by Target",
+                                        "Target", "Rows", height=350)
+                st.plotly_chart(fig_tier, use_container_width=True)
+
+            # Predictions table — only show prediction columns
+            pred_display_cols = [c for c in pred_df.columns
+                                 if not c.startswith("_conf_") and not c.startswith("_pred_")]
+            for slug in ML_TARGETS.values():
+                if f"_pred_{slug}" in pred_df.columns:
+                    pred_display_cols += [f"_pred_{slug}", f"_conf_{slug}", f"_conf_tier_{slug}"]
+            if "_pred_jira_ref" in pred_df.columns:
+                pred_display_cols += ["_pred_jira_ref", "_conf_jira_ref", "_conf_tier_jira_ref"]
+
+            cc_map = {}
+            for slug in ML_TARGETS.values():
+                if f"_conf_{slug}" in pred_df.columns:
+                    cc_map[f"_conf_{slug}"] = st.column_config.ProgressColumn(
+                        f"Conf {slug.replace('_',' ').title()}", min_value=0, max_value=1
+                    )
+
+            disp_cols_present = [c for c in pred_display_cols if c in pred_df.columns]
+            st.dataframe(
+                pred_df[disp_cols_present],
+                use_container_width=True,
+                hide_index=True,
+                column_config=cc_map,
+            )
+            st.download_button(
+                "📥 Download Predictions (CSV)",
+                pred_df[disp_cols_present].to_csv(index=False).encode("utf-8"),
+                file_name="ml_break_predictions.csv",
+                mime="text/csv",
+                key="_dl_pred_csv",
+            )
+
+    st.divider()
+
+    # ── C: Pattern Analysis ───────────────────────────────────────────────────
+    st.subheader("Pattern Analysis")
+    pat1, pat2, pat3, pat4 = st.tabs([
+        "Feature Importance", "Recurring Patterns",
+        "Confidence Distribution", "Category Trends",
+    ])
+
+    with pat1:
+        models_loaded = load_models()
+        if not models_loaded:
+            st.info("Train models to view feature importance.")
+        else:
+            _tgt_sel = st.selectbox(
+                "Select target",
+                [k for k in ML_TARGETS if ML_TARGETS[k] in models_loaded],
+                key="_fi_tgt_sel",
+            )
+            if _tgt_sel:
+                _slug = ML_TARGETS[_tgt_sel]
+                _model = models_loaded[_slug]["model"]
+                _oe_m  = models_loaded[_slug]["oe_meta"]
+                _, _col_meta = _oe_m
+                _feat_names  = _col_meta["cat_cols"] + _col_meta["num_cols"]
+                _importances = _model.feature_importances_
+                if len(_feat_names) == len(_importances):
+                    _fi_df = pd.DataFrame({
+                        "Feature":    _feat_names,
+                        "Importance": _importances,
+                    }).sort_values("Importance", ascending=True).tail(20)
+                    fig_fi = px.bar(
+                        _fi_df, x="Importance", y="Feature", orientation="h",
+                        color_discrete_sequence=[PRIMARY],
+                    )
+                    fig_fi = chart_layout(fig_fi, f"Top Feature Importance — {_tgt_sel}",
+                                         "Importance (gain)", "Feature", height=500)
+                    st.plotly_chart(fig_fi, use_container_width=True)
+
+    with pat2:
+        issue_col  = col_map.get("ISSUE CATEGORY")
+        system_col = col_map.get("System to be Fixed")
+        rec_col    = col_map.get("Rec Name (as per Rec Cube)")
+        if issue_col and system_col and rec_col and all(
+            c in df.columns for c in [issue_col, system_col, rec_col]
+        ):
+            _pat_df = (
+                df[[issue_col, system_col, rec_col]]
+                .dropna(subset=[issue_col, system_col])
+                .groupby([issue_col, system_col])
+                .size()
+                .reset_index(name="Count")
+                .nlargest(30, "Count")
+            )
+            fig_pat = px.density_heatmap(
+                _pat_df, x=system_col, y=issue_col, z="Count",
+                color_continuous_scale="Teal",
+            )
+            fig_pat = chart_layout(fig_pat, "Top Recurring Patterns: Issue Category × System to be Fixed",
+                                   "System to be Fixed", "Issue Category", height=500)
+            st.plotly_chart(fig_pat, use_container_width=True)
+        else:
+            st.info("Requires ISSUE CATEGORY, SYSTEM TO BE FIXED, and Rec Name columns.")
+
+    with pat3:
+        pred_df_c3 = st.session_state.get("_ml_predictions_df")
+        if pred_df_c3 is None:
+            st.info("Run predictions first to view confidence distributions.")
+        else:
+            _conf_num_cols = [c for c in pred_df_c3.columns if c.startswith("_conf_") and "tier" not in c]
+            if _conf_num_cols:
+                _conf_melt = pd.melt(
+                    pred_df_c3[_conf_num_cols],
+                    var_name="Target", value_name="Confidence",
+                )
+                _conf_melt["Target"] = _conf_melt["Target"].str.replace("_conf_", "").str.replace("_", " ").str.title()
+                fig_conf = px.histogram(
+                    _conf_melt, x="Confidence", color="Target", nbins=25,
+                    barmode="overlay", color_discrete_sequence=COLORS, opacity=0.75,
+                )
+                fig_conf = chart_layout(fig_conf, "Confidence Score Distribution by Target",
+                                        "Confidence", "Count", height=400)
+                st.plotly_chart(fig_conf, use_container_width=True)
+            else:
+                st.info("No confidence columns found in predictions.")
+
+    with pat4:
+        _issue_col2 = col_map.get("ISSUE CATEGORY")
+        if _issue_col2 and _issue_col2 in df.columns and "_Period_label" in df.columns:
+            _trend_df = (
+                df[[_issue_col2, "_Period_label"]]
+                .dropna(subset=[_issue_col2])
+                .groupby(["_Period_label", _issue_col2])
+                .size()
+                .reset_index(name="Count")
+            )
+            _top_cats = (
+                _trend_df.groupby(_issue_col2)["Count"].sum()
+                .nlargest(8).index.tolist()
+            )
+            _trend_df = _trend_df[_trend_df[_issue_col2].isin(_top_cats)]
+            fig_cat = px.bar(
+                _trend_df.sort_values("_Period_label"),
+                x="_Period_label", y="Count", color=_issue_col2,
+                barmode="stack", color_discrete_sequence=COLORS,
+            )
+            fig_cat = chart_layout(fig_cat, "Issue Category Breakdown by Period",
+                                   "Period", "Break Count", height=420)
+            st.plotly_chart(fig_cat, use_container_width=True)
+        else:
+            st.info("Requires ISSUE CATEGORY and Period columns.")
+
+    st.divider()
+
+    # ── D: Action Recommendations ─────────────────────────────────────────────
+    st.subheader("Action Recommendations")
+    pred_df_d = st.session_state.get("_ml_predictions_df")
+    if pred_df_d is None:
+        st.info("Run predictions first to generate action recommendations.")
+        return
+
+    _conf_tier_cols = [c for c in pred_df_d.columns if c.startswith("_conf_tier_")]
+    if not _conf_tier_cols:
+        st.info("No prediction confidence columns found.")
+        return
+
+    # Use first target's tier as primary routing signal
+    _primary_tier_col = _conf_tier_cols[0]
+    _tier_dfs = {t: pred_df_d[pred_df_d[_primary_tier_col] == t] for t in ["High", "Medium", "Low"]}
+
+    col_h, col_m, col_l = st.columns(3)
+    for col_ui, tier, color, icon in [
+        (col_h, "High",   "#01696F", "🟢"),
+        (col_m, "Medium", "#FFC553", "🟡"),
+        (col_l, "Low",    "#A84B2F", "🔴"),
+    ]:
+        with col_ui:
+            tier_sub = _tier_dfs[tier]
+            st.metric(f"{icon} {tier} Confidence", f"{len(tier_sub):,} rows",
+                      f"{len(tier_sub)/max(len(pred_df_d),1):.0%} of total")
+            st.caption(ACTION_RECOMMENDATIONS[tier])
+            if len(tier_sub) > 0:
+                _show_cols = [c for c in [
+                    col_map.get("Rec Name (as per Rec Cube)"),
+                    col_map.get("Team"),
+                    col_map.get("Type of break"),
+                    "_pred_issue_category",
+                    "_pred_system_to_be_fixed",
+                    f"_conf_{list(ML_TARGETS.values())[0]}",
+                ] if c and c in tier_sub.columns]
+                st.dataframe(
+                    tier_sub[_show_cols].head(5),
+                    hide_index=True, use_container_width=True,
+                )
+
+    # Excel download with 3 sheets
+    _excel_buf = BytesIO()
+    with pd.ExcelWriter(_excel_buf, engine="openpyxl") as _xw:
+        for tier in ["High", "Medium", "Low"]:
+            _tier_dfs[tier].to_excel(_xw, sheet_name=f"{tier} Confidence", index=False)
+        _summary = pd.DataFrame([
+            {"Tier": t, "Count": len(_tier_dfs[t]),
+             "Pct": f"{len(_tier_dfs[t])/max(len(pred_df_d),1):.1%}",
+             "Action": ACTION_RECOMMENDATIONS[t]}
+            for t in ["High", "Medium", "Low"]
+        ])
+        _summary.to_excel(_xw, sheet_name="Summary", index=False)
+    st.download_button(
+        "📥 Download Action Plan (Excel)",
+        _excel_buf.getvalue(),
+        file_name="ml_action_recommendations.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="_dl_action_excel",
+    )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2357,6 +3798,58 @@ def main():
             n = clear_all_cache()
             st.success(f"Cleared {n} cached file(s). Upload a new file to begin.")
             st.rerun()
+
+    # ── ML Model Status ──
+    with st.sidebar.expander("🤖 ML Model Status", expanded=False):
+        _meta = _load_ml_meta()
+        if _meta:
+            st.caption(f"Trained: {_meta.get('trained_at', '—')[:10]}")
+            st.caption(f"Rows: {_meta.get('n_rows', 0):,}")
+            for _tgt, _mv in (_meta.get("metrics") or {}).items():
+                if _mv.get("accuracy") is not None:
+                    st.caption(f"{_tgt}: {_mv['accuracy']:.1%}")
+        else:
+            st.caption("No models trained yet. Use the ML Predictions tab.")
+        if HAS_ML and st.button("🗑️ Delete ML Models", key="_ml_delete_btn"):
+            _delete_ml_models()
+            st.success("ML models deleted.")
+            st.rerun()
+
+    # ── Jira Integration ──
+    with st.sidebar.expander("🔗 Jira Integration", expanded=False):
+        if not HAS_JIRA:
+            st.warning("Install the `jira` package to enable live Jira enrichment.\n\n`pip install jira`")
+        else:
+            st.caption("Credentials are used only this session and never stored to disk.")
+            _jira_url_inp   = st.text_input(
+                "Jira URL", value=st.session_state.get("_jira_url", ""),
+                placeholder="https://yourcompany.atlassian.net", key="_jira_url_inp")
+            _jira_email_inp = st.text_input(
+                "Email", value=st.session_state.get("_jira_email", ""),
+                key="_jira_email_inp")
+            _jira_token_inp = st.text_input(
+                "Password / API Token", value=st.session_state.get("_jira_token", ""),
+                type="password", key="_jira_token_inp")
+            if st.button("Save Credentials", key="_jira_save"):
+                st.session_state["_jira_url"]   = _jira_url_inp
+                st.session_state["_jira_email"] = _jira_email_inp
+                st.session_state["_jira_token"] = _jira_token_inp
+                # Clear all Jira metadata so next tab load re-fetches with new creds
+                for _k in [k for k in list(st.session_state.keys())
+                           if k.startswith("_jira_meta_") or k == "_jira_cred_hash"]:
+                    del st.session_state[_k]
+                st.success("Credentials saved. Metadata will refresh on next tab load.")
+            if st.button("🗑️ Clear Jira Metadata", key="_jira_clear_meta",
+                         help="Remove all cached Jira API results so they are re-fetched"):
+                _cleared = 0
+                for _k in [k for k in list(st.session_state.keys())
+                           if k in ("_jira_meta_store", "_jira_cred_hash")
+                           or k.startswith("_jira_meta_")]:
+                    del st.session_state[_k]
+                    _cleared += 1
+                st.success(f"Jira metadata cache cleared ({_cleared} key(s) removed).")
+            if st.session_state.get("_jira_url"):
+                st.caption(f"Connected to: {st.session_state['_jira_url']}")
 
     uploaded_latest = st.sidebar.file_uploader(
         "📂 Latest Period File",
@@ -2422,28 +3915,35 @@ def main():
     filters = build_sidebar_filters(df, col_map)
     df_f = apply_filters(df, filters)
 
-    # Tabs — Period Comparison removed; historical data surfaced inside each tab
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🧹 Data Quality",
-        "📅 Ageing Validation",
-        "📈 Break Counts + Drill-Down",
-        "💷 Amount Analysis",
+    # ── Stale threshold warning ───────────────────────────────────────────────
+    _thresh_data = load_rec_thresholds()
+    if _thresh_data:
+        _cal_period   = _thresh_data.get("calibrated_at", "")
+        _curr_periods = sorted(df["_Period_label"].dropna().unique().tolist()) if "_Period_label" in df.columns else []
+        _latest_period = _curr_periods[-1] if _curr_periods else ""
+        if _cal_period and _latest_period and str(_cal_period) != str(_latest_period):
+            st.sidebar.warning(
+                f"⚠️ Thresholds calibrated on **{_cal_period}**. "
+                f"New data available (**{_latest_period}**). "
+                "Recalibrate in the **🎯 FP Thresholding** tab."
+            )
+
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🧹 Data Quality & Ageing",
         "🔍 Jira Factor Analysis",
         "🎯 FP Thresholding",
+        "🤖 ML Predictions",
     ])
 
     with tab1:
-        tab_data_quality(df, df_f, col_map)
+        tab_quality_and_ageing(df, df_f, col_map, hist_df)
     with tab2:
-        tab_ageing_validation(df_f, col_map, hist_df)
-    with tab3:
-        tab_break_counts(df_f, col_map, hist_df)
-    with tab4:
-        tab_amount_analysis(df_f, col_map, hist_df)
-    with tab5:
         tab_jira_factor_analysis(df_f, col_map, hist_df)
-    with tab6:
+    with tab3:
         tab_fp_thresholding(df_f, col_map, hist_df)
+    with tab4:
+        tab_ml_predictions(df, df_f, col_map, hist_df)
 
 
 if __name__ == "__main__":
