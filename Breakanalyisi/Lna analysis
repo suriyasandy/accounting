@@ -1,55 +1,46 @@
-import re
+"""
+Lavastorm D3S .lod → Workflow JSON Parser
+"""
+
 import json
 import sys
+import re
+from collections import defaultdict, deque
 
-# ==========================================
+
 # STEP 1: Load file
-# ==========================================
-def load_lod(file_path):
+def load_lod(file_path: str) -> str:
     with open(file_path, "rb") as f:
         return f.read().decode(errors="ignore")
 
 
-# ==========================================
-# STEP 2: Parse Lavastorm array-tuple format
-# ==========================================
-def preprocess_to_json(content):
-    """
-    Convert raw LOD content into JSON.
-    """
+# STEP 2: Parse JSON
+def parse_raw(content: str):
     try:
         return json.loads(content)
     except json.JSONDecodeError as e:
-        print(f"[WARN] Direct JSON parse failed: {e}")
-        return None
+        print(f"[ERROR] JSON parse failed: {e}")
+        sys.exit(1)
 
 
-# ==========================================
-# STEP 3: Resolve Lavastorm typed tuples
-# ==========================================
+# STEP 3: Resolve Lavastorm tuples
 def resolve(obj):
-    """Convert ["Class", {...}] → {"__type__": "Class", ...}"""
-
     if isinstance(obj, list):
         if (
-            len(obj) >= 2
+            len(obj) == 2
             and isinstance(obj[0], str)
-            and obj[0].startswith("com.lavastorm")
+            and "." in obj[0]
+            and isinstance(obj[1], (dict, list))
         ):
             class_name = obj[0].split(".")[-1]
-            payload = obj[1] if len(obj) > 1 else {}
+            inner = resolve(obj[1])
 
-            resolved = {"__type__": class_name}
-
-            if isinstance(payload, dict):
-                for k, v in payload.items():
-                    resolved[k] = resolve(v)
+            if isinstance(inner, dict):
+                return {"__type__": class_name, **inner}
             else:
-                resolved["__value__"] = resolve(payload)
-
-            return resolved
+                return {"__type__": class_name, "__value__": inner}
         else:
-            return [resolve(item) for item in obj]
+            return [resolve(i) for i in obj]
 
     elif isinstance(obj, dict):
         return {k: resolve(v) for k, v in obj.items()}
@@ -57,77 +48,34 @@ def resolve(obj):
     return obj
 
 
-# ==========================================
-# STEP 4: Extract nodes
-# ==========================================
-def find_nodes(obj, nodes=None):
-    if nodes is None:
-        nodes = []
-
+# STEP 4: Collect all objects by type
+def collect_all(obj, bucket: dict):
     if isinstance(obj, dict):
         t = obj.get("__type__", "")
-
-        if "id" in obj and ("type" in obj or "LeafNode" in t or "GraphDpo" in t):
-            node_type = obj.get("type") or t
-            node_id = obj.get("id")
-
-            params = extract_param_values(obj.get("parameterValueMap", {}))
-
-            in_clock = safe_get(obj, "inClock", "connectableId")
-            in_event = safe_get(obj, "inEvent", "connectableId")
-            out_event = safe_get(obj, "outEvent", "connectableId")
-
-            input_ids = [v for v in [in_clock, in_event] if v]
-            output_ids = [v for v in [out_event] if v]
-
-            obj_str = json.dumps(obj)
-            input_ids += list(set(re.findall(r'__in_[^"\\]+', obj_str)))
-            output_ids += list(set(re.findall(r'__out_[^"\\]+', obj_str)))
-
-            nodes.append({
-                "id": node_id,
-                "type": node_type,
-                "parent": obj.get("parent"),
-                "deleted": obj.get("deleted", False),
-                "definitionalContainer": obj.get("definitionalContainer"),
-                "inputs": list(set(input_ids)),
-                "outputs": list(set(output_ids)),
-                "parameters": params,
-            })
-
+        if t:
+            bucket.setdefault(t, []).append(obj)
         for v in obj.values():
-            find_nodes(v, nodes)
+            collect_all(v, bucket)
 
     elif isinstance(obj, list):
         for item in obj:
-            find_nodes(item, nodes)
-
-    return nodes
+            collect_all(item, bucket)
 
 
-def safe_get(obj, *keys):
-    cur = obj
-    for k in keys:
-        if isinstance(cur, dict):
-            cur = cur.get(k)
-        else:
-            return None
-    return cur
-
-
-# ==========================================
 # STEP 5: Extract parameters
-# ==========================================
-def extract_param_values(param_map):
-    if not isinstance(param_map, dict):
+def extract_params(param_value_map):
+    if not isinstance(param_value_map, dict):
         return {}
 
     result = {}
 
-    for key, val in param_map.items():
+    for key, val in param_value_map.items():
+        if key == "__type__":
+            continue
+
         if isinstance(val, dict):
-            name = val.get("parameterName") or key
-            result[name] = {
+            p_name = val.get("parameterName") or key
+            result[p_name] = {
                 "value": val.get("value"),
                 "source": val.get("source"),
                 "dataType": val.get("dataType"),
@@ -138,140 +86,179 @@ def extract_param_values(param_map):
     return result
 
 
-# ==========================================
-# STEP 6: Extract edges
-# ==========================================
-def find_edges(obj, edges=None):
-    if edges is None:
-        edges = []
+# STEP 6: Extract nodes
+def extract_nodes(bucket: dict) -> list:
+    nodes = []
+    seen_ids = set()
 
-    if isinstance(obj, dict):
-        node_id = obj.get("id")
-        out_connectables = obj.get("outputDataConnectables")
+    node_type_keys = [
+        k for k in bucket
+        if "LeafNode" in k or "CompositeNode" in k or "GraphDpo" in k
+    ]
 
-        if node_id and isinstance(out_connectables, list):
-            for conn in out_connectables:
-                if isinstance(conn, dict):
-                    target = conn.get("connectableId")
-                    if target:
-                        edges.append({"source": node_id, "target": target})
+    for key in node_type_keys:
+        for obj in bucket[key]:
+            node_id = obj.get("id")
 
-        for v in obj.values():
-            find_edges(v, edges)
+            if not node_id or node_id in seen_ids:
+                continue
 
-    elif isinstance(obj, list):
-        for item in obj:
-            find_edges(item, edges)
+            seen_ids.add(node_id)
+
+            internal_name = obj.get("internalName") or obj.get("handle") or ""
+            node_type = obj.get("type") or obj.get("parentType") or key.split(".")[-1]
+            parent = obj.get("parent") or obj.get("containerElementId")
+
+            # Ports
+            in_clock = (obj.get("inClock") or {}).get("connectableId")
+            in_event = (obj.get("inEvent") or {}).get("connectableId")
+            out_clock = (obj.get("outClock") or {}).get("connectableId")
+            out_event = (obj.get("outEvent") or {}).get("connectableId")
+
+            in_data, out_data = [], []
+
+            for v in (obj.get("inputDataConnectables") or {}).values():
+                if isinstance(v, dict):
+                    cid = v.get("connectableId") or v.get("id")
+                    if cid:
+                        in_data.append(cid)
+
+            for v in (obj.get("outputDataConnectables") or {}).values():
+                if isinstance(v, dict):
+                    cid = v.get("connectableId") or v.get("id")
+                    if cid:
+                        out_data.append(cid)
+
+            params = extract_params(obj.get("parameterValueMap") or {})
+
+            nodes.append({
+                "id": node_id,
+                "internalName": internal_name,
+                "type": node_type,
+                "parent": parent,
+                "deleted": obj.get("deleted", False),
+                "ports": {
+                    "in_clock": in_clock,
+                    "in_event": in_event,
+                    "out_clock": out_clock,
+                    "out_event": out_event,
+                    "in_data": list(set(in_data)),
+                    "out_data": list(set(out_data)),
+                },
+                "parameters": params,
+            })
+
+    return nodes
+
+
+# STEP 7: Extract edges
+def extract_edges(bucket: dict) -> list:
+    edges = []
+    seen = set()
+
+    for key in bucket:
+        if "Connection" in key:
+            for obj in bucket[key]:
+                start = obj.get("startPoint")
+                end = obj.get("endPoint")
+
+                if not start or not end:
+                    continue
+
+                edge_key = f"{start}|{end}"
+                if edge_key in seen:
+                    continue
+
+                seen.add(edge_key)
+
+                anchor = obj.get("anchor") or {}
+
+                edges.append({
+                    "id": obj.get("containerElementId"),
+                    "source": start,
+                    "target": end,
+                    "connectableId": anchor.get("connectableId"),
+                    "startWiring": obj.get("startPointWiring"),
+                    "endWiring": obj.get("endPointWiring"),
+                })
 
     return edges
 
 
-# ==========================================
-# STEP 7: Metadata
-# ==========================================
-def extract_graph_metadata(resolved):
+# STEP 8: Metadata
+def extract_metadata(bucket: dict) -> dict:
     meta = {}
-    obj_str = json.dumps(resolved)
 
-    gid = re.search(r'"graphElementId"\s*:\s*"([^"]+)"', obj_str)
-    meta["graphElementId"] = gid.group(1) if gid else None
+    for key in bucket:
+        if "GraphDpo" in key:
+            obj = bucket[key][0]
+            meta["graphId"] = obj.get("id")
+            meta["graphElementId"] = obj.get("graphElementId")
 
-    gid2 = re.search(r'"id"\s*:\s*"([0-9a-f\-]{36})"', obj_str)
-    meta["graphId"] = gid2.group(1) if gid2 else None
-
-    major = re.search(r'"major"\s*:\s*(\d+)', obj_str)
-    minor = re.search(r'"minor"\s*:\s*(\d+)', obj_str)
-    name = re.search(r'"name"\s*:\s*"([^"]+)"', obj_str)
-
-    meta["modelVersion"] = {
-        "major": int(major.group(1)) if major else None,
-        "minor": int(minor.group(1)) if minor else None,
-        "name": name.group(1) if name else None,
-    }
+    for key in bucket:
+        if "ModelVersion" in key:
+            obj = bucket[key][0]
+            meta["modelVersion"] = {
+                "major": obj.get("major"),
+                "minor": obj.get("minor"),
+                "patch": obj.get("patch"),
+                "name": obj.get("name"),
+            }
 
     return meta
 
 
-# ==========================================
-# STEP 8: Execution sequence
-# ==========================================
+# STEP 9: Topological sort
 def build_execution_sequence(nodes, edges):
-    sequence = []
-    seen = set()
-
-    targets = {e["target"] for e in edges}
-    start_nodes = [n for n in nodes if n["id"] not in targets]
-
-    queue = list(start_nodes)
-
-    id_to_node = {n["id"]: n for n in nodes if n["id"]}
-    outgoing = {}
+    id_map = {n["id"]: n for n in nodes}
+    in_degree = defaultdict(int)
+    graph = defaultdict(list)
 
     for e in edges:
-        outgoing.setdefault(e["source"], []).append(e["target"])
+        s, t = e["source"], e["target"]
+        if s in id_map and t in id_map:
+            graph[s].append(t)
+            in_degree[t] += 1
 
+    queue = deque([n for n in id_map if in_degree[n] == 0])
+
+    sequence = []
     step = 1
 
-    for node in queue:
-        nid = node["id"]
-        if nid in seen:
-            continue
-
-        seen.add(nid)
+    while queue:
+        nid = queue.popleft()
+        node = id_map[nid]
 
         sequence.append({
             "step": step,
             "node_id": nid,
+            "internalName": node["internalName"],
             "type": node["type"],
             "parameters": node["parameters"],
         })
 
         step += 1
 
-        for target_id in outgoing.get(nid, []):
-            if target_id not in seen and target_id in id_to_node:
-                queue.append(id_to_node[target_id])
-
-    for node in nodes:
-        if node["id"] not in seen:
-            sequence.append({
-                "step": step,
-                "node_id": node["id"],
-                "type": node["type"],
-                "parameters": node["parameters"],
-            })
-            step += 1
+        for nxt in graph[nid]:
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                queue.append(nxt)
 
     return sequence
 
 
-# ==========================================
-# STEP 9: MAIN
-# ==========================================
+# MAIN
 def parse_lod(file_path):
-    print(f"Loading: {file_path}")
-
     content = load_lod(file_path)
-
-    print("Parsing...")
-    raw = preprocess_to_json(content)
-
-    if raw is None:
-        print("Failed to parse JSON")
-        sys.exit(1)
-
+    raw = parse_raw(content)
     resolved = resolve(raw)
 
-    metadata = extract_graph_metadata(resolved)
+    bucket = {}
+    collect_all(resolved, bucket)
 
-    nodes = find_nodes(resolved)
-
-    # Deduplicate
-    seen_ids = set()
-    nodes = [n for n in nodes if n["id"] and not (n["id"] in seen_ids or seen_ids.add(n["id"]))]
-
-    edges = find_edges(resolved)
-
+    nodes = extract_nodes(bucket)
+    edges = extract_edges(bucket)
+    metadata = extract_metadata(bucket)
     sequence = build_execution_sequence(nodes, edges)
 
     return {
@@ -282,19 +269,13 @@ def parse_lod(file_path):
     }
 
 
-# ==========================================
-# STEP 10: Save
-# ==========================================
+# SAVE
 def save_output(workflow, output_file="parsed_workflow.json"):
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(workflow, f, indent=4)
-
-    print(f"Saved: {output_file}")
+        json.dump(workflow, f, indent=2)
 
 
-# ==========================================
 # RUN
-# ==========================================
 if __name__ == "__main__":
     file_path = sys.argv[1] if len(sys.argv) > 1 else "graph.lod"
     output_path = sys.argv[2] if len(sys.argv) > 2 else "parsed_workflow.json"
