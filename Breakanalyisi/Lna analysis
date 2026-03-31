@@ -3,379 +3,301 @@ import json
 import sys
 
 # ==========================================
-
 # STEP 1: Load file
-
 # ==========================================
-
 def load_lod(file_path):
-with open(file_path, “rb”) as f:
-return f.read().decode(errors=“ignore”)
+    with open(file_path, "rb") as f:
+        return f.read().decode(errors="ignore")
+
 
 # ==========================================
-
 # STEP 2: Parse Lavastorm array-tuple format
-
-# [“com.lavastorm…ClassName”, { …fields… }]
-
-# This is NOT standard JSON — we pre-process it into valid JSON first.
-
 # ==========================================
-
 def preprocess_to_json(content):
-“””
-The LOD format wraps everything in a top-level array of tagged tuples.
-Each tagged object looks like:
-[ “com.lavastorm.xxx.ClassName”, { … } ]
-We convert this into a proper JSON object by tagging each tuple.
-Strategy: parse the raw text into Python objects using a tolerant JSON parse.
-“””
-# The file is actually valid JSON — just very deeply nested arrays.
-# Try direct parse first.
-try:
-return json.loads(content)
-except json.JSONDecodeError as e:
-print(f”[WARN] Direct JSON parse failed: {e}”)
-return None
+    """
+    Convert raw LOD content into JSON.
+    """
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"[WARN] Direct JSON parse failed: {e}")
+        return None
+
 
 # ==========================================
-
-# STEP 3: Recursively resolve Lavastorm typed tuples
-
-# [“com.lavastorm…Class”, { fields }]  →  { “**type**”: “Class”, …fields }
-
+# STEP 3: Resolve Lavastorm typed tuples
 # ==========================================
-
 def resolve(obj):
-“”“Recursively convert Lavastorm [ClassName, {fields}] tuples into dicts.”””
-if isinstance(obj, list):
-# Check if it’s a typed tuple: first element is a class name string
-if (
-len(obj) >= 2
-and isinstance(obj[0], str)
-and obj[0].startswith(“com.lavastorm”)
-):
-class_name = obj[0].split(”.”)[-1]  # short name
-payload = obj[1] if len(obj) > 1 else {}
-resolved = {”**type**”: class_name}
-if isinstance(payload, dict):
-for k, v in payload.items():
-resolved[k] = resolve(v)
-else:
-resolved[”**value**”] = resolve(payload)
-return resolved
-else:
-return [resolve(item) for item in obj]
-elif isinstance(obj, dict):
-return {k: resolve(v) for k, v in obj.items()}
-else:
-return obj
+    """Convert ["Class", {...}] → {"__type__": "Class", ...}"""
+
+    if isinstance(obj, list):
+        if (
+            len(obj) >= 2
+            and isinstance(obj[0], str)
+            and obj[0].startswith("com.lavastorm")
+        ):
+            class_name = obj[0].split(".")[-1]
+            payload = obj[1] if len(obj) > 1 else {}
+
+            resolved = {"__type__": class_name}
+
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    resolved[k] = resolve(v)
+            else:
+                resolved["__value__"] = resolve(payload)
+
+            return resolved
+        else:
+            return [resolve(item) for item in obj]
+
+    elif isinstance(obj, dict):
+        return {k: resolve(v) for k, v in obj.items()}
+
+    return obj
+
 
 # ==========================================
-
-# STEP 4: Extract all graph nodes from resolved structure
-
+# STEP 4: Extract nodes
 # ==========================================
-
 def find_nodes(obj, nodes=None):
-“”“Walk resolved structure and collect all LeafNode / graph element objects.”””
-if nodes is None:
-nodes = []
+    if nodes is None:
+        nodes = []
 
-```
-if isinstance(obj, dict):
-    t = obj.get("__type__", "")
+    if isinstance(obj, dict):
+        t = obj.get("__type__", "")
 
-    # A graph node: has an 'id', 'type', and parameterValueMap
-    if "id" in obj and ("type" in obj or "LeafNode" in t or "GraphDpo" in t):
-        node_type = obj.get("type") or t
-        node_id = obj.get("id")
+        if "id" in obj and ("type" in obj or "LeafNode" in t or "GraphDpo" in t):
+            node_type = obj.get("type") or t
+            node_id = obj.get("id")
 
-        # Extract parameters
-        params = extract_param_values(obj.get("parameterValueMap", {}))
+            params = extract_param_values(obj.get("parameterValueMap", {}))
 
-        # Extract connections
-        in_clock = safe_get(obj, "inClock", "connectableId")
-        in_event = safe_get(obj, "inEvent", "connectableId")
-        out_event = safe_get(obj, "outEvent", "connectableId")
+            in_clock = safe_get(obj, "inClock", "connectableId")
+            in_event = safe_get(obj, "inEvent", "connectableId")
+            out_event = safe_get(obj, "outEvent", "connectableId")
 
-        input_ids = [v for v in [in_clock, in_event] if v]
-        output_ids = [v for v in [out_event] if v]
+            input_ids = [v for v in [in_clock, in_event] if v]
+            output_ids = [v for v in [out_event] if v]
 
-        # Collect all __in_ and __out_ connectableIds from full object dump
-        obj_str = json.dumps(obj)
-        input_ids += list(set(re.findall(r'__in_[^"\\]+', obj_str)))
-        output_ids += list(set(re.findall(r'__out_[^"\\]+', obj_str)))
+            obj_str = json.dumps(obj)
+            input_ids += list(set(re.findall(r'__in_[^"\\]+', obj_str)))
+            output_ids += list(set(re.findall(r'__out_[^"\\]+', obj_str)))
 
-        nodes.append({
-            "id": node_id,
-            "type": node_type,
-            "parent": obj.get("parent"),
-            "deleted": obj.get("deleted", False),
-            "definitionalContainer": obj.get("definitionalContainer"),
-            "inputs": list(set(input_ids)),
-            "outputs": list(set(output_ids)),
-            "parameters": params,
-        })
+            nodes.append({
+                "id": node_id,
+                "type": node_type,
+                "parent": obj.get("parent"),
+                "deleted": obj.get("deleted", False),
+                "definitionalContainer": obj.get("definitionalContainer"),
+                "inputs": list(set(input_ids)),
+                "outputs": list(set(output_ids)),
+                "parameters": params,
+            })
 
-    # Recurse into all values
-    for v in obj.values():
-        find_nodes(v, nodes)
+        for v in obj.values():
+            find_nodes(v, nodes)
 
-elif isinstance(obj, list):
-    for item in obj:
-        find_nodes(item, nodes)
+    elif isinstance(obj, list):
+        for item in obj:
+            find_nodes(item, nodes)
 
-return nodes
-```
+    return nodes
+
 
 def safe_get(obj, *keys):
-“”“Safely traverse nested dict keys.”””
-cur = obj
-for k in keys:
-if isinstance(cur, dict):
-cur = cur.get(k)
-else:
-return None
-return cur
+    cur = obj
+    for k in keys:
+        if isinstance(cur, dict):
+            cur = cur.get(k)
+        else:
+            return None
+    return cur
+
 
 # ==========================================
-
-# STEP 5: Extract parameterValueMap entries
-
+# STEP 5: Extract parameters
 # ==========================================
-
 def extract_param_values(param_map):
-“””
-parameterValueMap is a dict like:
-{ “Script”: { **type**: ParameterValueDpo, parameterName: “Script”, value: “…”, source: “Literal” } }
-“””
-if not isinstance(param_map, dict):
-return {}
+    if not isinstance(param_map, dict):
+        return {}
 
-```
-result = {}
-for key, val in param_map.items():
-    if isinstance(val, dict):
-        name = val.get("parameterName") or key
-        value = val.get("value")
-        source = val.get("source")
-        dtype = val.get("dataType")
-        result[name] = {
-            "value": value,
-            "source": source,
-            "dataType": dtype,
-        }
-    else:
-        result[key] = {"value": val}
-return result
-```
+    result = {}
+
+    for key, val in param_map.items():
+        if isinstance(val, dict):
+            name = val.get("parameterName") or key
+            result[name] = {
+                "value": val.get("value"),
+                "source": val.get("source"),
+                "dataType": val.get("dataType"),
+            }
+        else:
+            result[key] = {"value": val}
+
+    return result
+
 
 # ==========================================
-
-# STEP 6: Extract edges from connectableId pairs
-
+# STEP 6: Extract edges
 # ==========================================
-
 def find_edges(obj, edges=None):
-“””
-Edges are encoded as connectableId references on inClock/inEvent/outEvent.
-We walk the structure looking for outputDataConnectables → connectableId links.
-“””
-if edges is None:
-edges = []
+    if edges is None:
+        edges = []
 
-```
-if isinstance(obj, dict):
-    # outputDataConnectables list contains target connectableIds
-    out_connectables = obj.get("outputDataConnectables")
-    node_id = obj.get("id")
+    if isinstance(obj, dict):
+        node_id = obj.get("id")
+        out_connectables = obj.get("outputDataConnectables")
 
-    if node_id and isinstance(out_connectables, list):
-        for conn in out_connectables:
-            if isinstance(conn, dict):
-                target = conn.get("connectableId")
-                if target:
-                    edges.append({"source": node_id, "target": target})
+        if node_id and isinstance(out_connectables, list):
+            for conn in out_connectables:
+                if isinstance(conn, dict):
+                    target = conn.get("connectableId")
+                    if target:
+                        edges.append({"source": node_id, "target": target})
 
-    for v in obj.values():
-        find_edges(v, edges)
+        for v in obj.values():
+            find_edges(v, edges)
 
-elif isinstance(obj, list):
-    for item in obj:
-        find_edges(item, edges)
+    elif isinstance(obj, list):
+        for item in obj:
+            find_edges(item, edges)
 
-return edges
-```
+    return edges
+
 
 # ==========================================
-
-# STEP 7: Extract graph-level metadata
-
+# STEP 7: Metadata
 # ==========================================
-
 def extract_graph_metadata(resolved):
-meta = {}
-obj_str = json.dumps(resolved)
+    meta = {}
+    obj_str = json.dumps(resolved)
 
-```
-# Graph ID
-gid = re.search(r'"graphElementId"\s*:\s*"([^"]+)"', obj_str)
-meta["graphElementId"] = gid.group(1) if gid else None
+    gid = re.search(r'"graphElementId"\s*:\s*"([^"]+)"', obj_str)
+    meta["graphElementId"] = gid.group(1) if gid else None
 
-# Graph UUID (top-level id)
-gid2 = re.search(r'"id"\s*:\s*"([0-9a-f\-]{36})"', obj_str)
-meta["graphId"] = gid2.group(1) if gid2 else None
+    gid2 = re.search(r'"id"\s*:\s*"([0-9a-f\-]{36})"', obj_str)
+    meta["graphId"] = gid2.group(1) if gid2 else None
 
-# Version
-major = re.search(r'"major"\s*:\s*(\d+)', obj_str)
-minor = re.search(r'"minor"\s*:\s*(\d+)', obj_str)
-name = re.search(r'"name"\s*:\s*"([^"]+)"', obj_str)
-meta["modelVersion"] = {
-    "major": int(major.group(1)) if major else None,
-    "minor": int(minor.group(1)) if minor else None,
-    "name": name.group(1) if name else None,
-}
+    major = re.search(r'"major"\s*:\s*(\d+)', obj_str)
+    minor = re.search(r'"minor"\s*:\s*(\d+)', obj_str)
+    name = re.search(r'"name"\s*:\s*"([^"]+)"', obj_str)
 
-return meta
-```
+    meta["modelVersion"] = {
+        "major": int(major.group(1)) if major else None,
+        "minor": int(minor.group(1)) if minor else None,
+        "name": name.group(1) if name else None,
+    }
+
+    return meta
+
 
 # ==========================================
-
-# STEP 8: Build execution sequence (topological order by parent/id)
-
+# STEP 8: Execution sequence
 # ==========================================
-
 def build_execution_sequence(nodes, edges):
-“””
-Simple topological sort based on edges.
-Falls back to insertion order if no edges available.
-“””
-# Build adjacency
-targets = {e[“target”] for e in edges}
-sources = {e[“source”] for e in edges}
+    sequence = []
+    seen = set()
 
-```
-# Nodes with no incoming edges go first
-sequence = []
-seen = set()
+    targets = {e["target"] for e in edges}
+    start_nodes = [n for n in nodes if n["id"] not in targets]
 
-# Start nodes (no incoming)
-start_nodes = [n for n in nodes if n["id"] not in targets]
-queue = list(start_nodes)
+    queue = list(start_nodes)
 
-# BFS
-id_to_node = {n["id"]: n for n in nodes if n["id"]}
-outgoing = {}
-for e in edges:
-    outgoing.setdefault(e["source"], []).append(e["target"])
+    id_to_node = {n["id"]: n for n in nodes if n["id"]}
+    outgoing = {}
 
-step = 1
-for node in queue:
-    nid = node["id"]
-    if nid in seen:
-        continue
-    seen.add(nid)
-    sequence.append({
-        "step": step,
-        "node_id": nid,
-        "type": node["type"],
-        "parameters": node["parameters"],
-    })
-    step += 1
-    for target_id in outgoing.get(nid, []):
-        if target_id not in seen and target_id in id_to_node:
-            queue.append(id_to_node[target_id])
+    for e in edges:
+        outgoing.setdefault(e["source"], []).append(e["target"])
 
-# Append any remaining nodes not reachable via edges
-for node in nodes:
-    if node["id"] not in seen:
+    step = 1
+
+    for node in queue:
+        nid = node["id"]
+        if nid in seen:
+            continue
+
+        seen.add(nid)
+
         sequence.append({
             "step": step,
-            "node_id": node["id"],
+            "node_id": nid,
             "type": node["type"],
             "parameters": node["parameters"],
         })
+
         step += 1
 
-return sequence
-```
+        for target_id in outgoing.get(nid, []):
+            if target_id not in seen and target_id in id_to_node:
+                queue.append(id_to_node[target_id])
+
+    for node in nodes:
+        if node["id"] not in seen:
+            sequence.append({
+                "step": step,
+                "node_id": node["id"],
+                "type": node["type"],
+                "parameters": node["parameters"],
+            })
+            step += 1
+
+    return sequence
+
 
 # ==========================================
-
-# STEP 9: MAIN PARSER
-
+# STEP 9: MAIN
 # ==========================================
-
 def parse_lod(file_path):
-print(f”📂 Loading: {file_path}”)
-content = load_lod(file_path)
+    print(f"Loading: {file_path}")
 
-```
-print("🔍 Parsing LOD structure...")
-raw = preprocess_to_json(content)
+    content = load_lod(file_path)
 
-if raw is None:
-    print("❌ Could not parse LOD file as JSON.")
-    sys.exit(1)
+    print("Parsing...")
+    raw = preprocess_to_json(content)
 
-print("🔄 Resolving Lavastorm typed tuples...")
-resolved = resolve(raw)
+    if raw is None:
+        print("Failed to parse JSON")
+        sys.exit(1)
 
-print("🗂️  Extracting metadata...")
-metadata = extract_graph_metadata(resolved)
+    resolved = resolve(raw)
 
-print("📦 Extracting nodes...")
-nodes = find_nodes(resolved)
-# Deduplicate nodes by id
-seen_ids = set()
-unique_nodes = []
-for n in nodes:
-    if n["id"] and n["id"] not in seen_ids:
-        seen_ids.add(n["id"])
-        unique_nodes.append(n)
-nodes = unique_nodes
+    metadata = extract_graph_metadata(resolved)
 
-print("🔗 Extracting edges...")
-edges = find_edges(resolved)
+    nodes = find_nodes(resolved)
 
-print("📋 Building execution sequence...")
-sequence = build_execution_sequence(nodes, edges)
+    # Deduplicate
+    seen_ids = set()
+    nodes = [n for n in nodes if n["id"] and not (n["id"] in seen_ids or seen_ids.add(n["id"]))]
 
-return {
-    "metadata": metadata,
-    "nodes": nodes,
-    "edges": edges,
-    "execution_sequence": sequence,
-}
-```
+    edges = find_edges(resolved)
+
+    sequence = build_execution_sequence(nodes, edges)
+
+    return {
+        "metadata": metadata,
+        "nodes": nodes,
+        "edges": edges,
+        "execution_sequence": sequence,
+    }
+
 
 # ==========================================
+# STEP 10: Save
+# ==========================================
+def save_output(workflow, output_file="parsed_workflow.json"):
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(workflow, f, indent=4)
 
-# STEP 10: Save output
+    print(f"Saved: {output_file}")
+
 
 # ==========================================
-
-def save_output(workflow, output_file=“parsed_workflow.json”):
-with open(output_file, “w”, encoding=“utf-8”) as f:
-json.dump(workflow, f, indent=4, ensure_ascii=False)
-
-```
-print(f"\n✅ Output saved to: {output_file}")
-print(f"📊 Nodes     : {len(workflow['nodes'])}")
-print(f"🔗 Edges     : {len(workflow['edges'])}")
-print(f"📋 Seq Steps : {len(workflow['execution_sequence'])}")
-print(f"🆔 Graph ID  : {workflow['metadata'].get('graphId')}")
-```
-
-# ==========================================
-
 # RUN
-
 # ==========================================
+if __name__ == "__main__":
+    file_path = sys.argv[1] if len(sys.argv) > 1 else "graph.lod"
+    output_path = sys.argv[2] if len(sys.argv) > 2 else "parsed_workflow.json"
 
-if **name** == “**main**”:
-file_path = sys.argv[1] if len(sys.argv) > 1 else “graph.lod”
-workflow = parse_lod(file_path)
-output_path = sys.argv[2] if len(sys.argv) > 2 else “parsed_workflow.json”
-save_output(workflow, output_path)
+    workflow = parse_lod(file_path)
+    save_output(workflow, output_path)
