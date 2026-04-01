@@ -1,0 +1,29 @@
+import pandas as pd
+import os
+
+# Folder path
+folder_path = r"/path/to/your/folder"
+
+# List to store dataframes
+all_dfs = []
+
+# Loop through all Excel files
+for file in os.listdir(folder_path):
+    if file.endswith(".xlsx") or file.endswith(".xls"):
+        file_path = os.path.join(folder_path, file)
+        
+        df = pd.read_excel(file_path)
+        
+        # Optional: add filename column (very useful for tracking)
+        df["source_file"] = file
+        
+        all_dfs.append(df)
+
+# Combine all dataframes
+consolidated_df = pd.concat(all_dfs, ignore_index=True)
+
+# Save output
+output_path = os.path.join(folder_path, "consolidated_output.xlsx")
+consolidated_df.to_excel(output_path, index=False)
+
+print("Consolidation completed!")
