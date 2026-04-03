@@ -1,0 +1,197 @@
+import os, glob, calendar
+from datetime import datetime, date
+from pathlib import Path
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# CONFIG
+DAILY_BREAK_DIR = r"C:\BreakFiles\Daily"
+MONTHLY_MI_PATH = r"C:\BreakFiles\Monthly\mi_report.xlsx"
+OUTPUT_DIR = r"C:\BreakFiles\Output"
+TARGET_MONTHS = [(2025, 12), (2026, 1), (2026, 2)]
+DAILY_FILE_EXT = ".xlsx"
+
+COL_TRADE_ID = "TRAD_REF"
+COL_BREAK_DATE = "BREAK_DATE"
+COL_BREAK_AMOUNT = "BREAK_AMOUNT"
+COL_COMMENT = "COMMENT"
+
+MI_COL_TRADE_ID = "TRAD_REF"
+MI_COL_EPIC = "EPIC"
+MI_REMEDIATED = "Remediated"
+
+MI_EXPECTED_COLS = [
+    "TRAD_REF", "BREAK_AMOUNT", "JIRA_REFERENCE",
+    "JOURNAL_POSTED", "ISSUE_CATEGORY", "JIRA_DESC", "EPIC",
+]
+
+BREAK_DATE_CUTOFF = datetime(2025, 12, 1)
+
+CLR_REMEDIATED = "FF92D050"
+CLR_NOT_REMEDIATED = "FFFFC000"
+CLR_MISSING_MI = "FFFF0000"
+CLR_AMOUNT_CHG = "FFFFC000"
+CLR_COMMENT_CHG = "FFB4C6E7"
+CLR_BOTH_CHG = "FFFF0000"
+CLR_HEADER = "FF203864"
+
+# HELPERS
+def read_file(path, **kw):
+    ext = Path(path).suffix.lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        return pd.read_excel(path, **kw)
+    if ext == ".csv":
+        return pd.read_csv(path, **kw)
+    raise ValueError(f"Unsupported: {ext}")
+
+def normalise_date(s):
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
+
+def last_weekday_of_month(year, month):
+    last = calendar.monthrange(year, month)[1]
+    d = date(year, month, last)
+    while d.weekday() > 4:
+        d = date(year, month, d.day - 1)
+    return d
+
+def apply_header(ws, row=1):
+    for cell in ws[row]:
+        cell.fill = PatternFill("solid", fgColor=CLR_HEADER)
+        cell.font = Font(bold=True, color="FFFFFFFF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+def auto_fit(ws, mn=12, mx=45):
+    for col in ws.columns:
+        letter = get_column_letter(col[0].column)
+        w = max((len(str(c.value)) if c.value else 0 for c in col), default=mn)
+        ws.column_dimensions[letter].width = min(max(w + 2, mn), mx)
+
+def thin_border(ws):
+    s = Side(style="thin")
+    b = Border(left=s, right=s, top=s, bottom=s)
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = b
+
+def fill(cell, colour):
+    cell.fill = PatternFill("solid", fgColor=colour)
+
+def cidx(ws):
+    return {c.value: c.column for c in ws[1]}
+
+def add_legend(wb, sheet_name, rows, colour_map):
+    ws = wb.create_sheet(sheet_name)
+    for r, (lbl, meaning) in enumerate(rows, 1):
+        ws.cell(r, 1, lbl)
+        ws.cell(r, 2, meaning)
+        if lbl in colour_map:
+            ws.cell(r, 1).fill = PatternFill("solid", fgColor=colour_map[lbl])
+    apply_header(ws, row=1)
+
+# STEP 1 – Load last weekday break files
+def load_last_weekday_breaks():
+    frames = []
+    for year, month in TARGET_MONTHS:
+        target = last_weekday_of_month(year, month)
+        date_str = target.strftime("%Y%m%d")
+        month_lbl = f"{calendar.month_abbr[month]}-{year}"
+
+        matched = [
+            fp for fp in glob.glob(os.path.join(DAILY_BREAK_DIR, f"*{DAILY_FILE_EXT}"))
+            if date_str in Path(fp).stem
+        ]
+
+        if not matched:
+            print(f"⚠ [{month_lbl}] No file found for {target}")
+            continue
+
+        df = read_file(matched[0])
+        df.columns = df.columns.str.strip()
+        df["SOURCE_FILE"] = Path(matched[0]).name
+        df["FILE_DATE"] = pd.Timestamp(target)
+        df["MONTH_LABEL"] = month_lbl
+
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True)
+    return combined
+
+def filter_and_clean(df):
+    df = df.copy()
+    df[COL_BREAK_DATE] = normalise_date(df[COL_BREAK_DATE])
+    df[COL_BREAK_AMOUNT] = pd.to_numeric(df[COL_BREAK_AMOUNT], errors="coerce")
+
+    if COL_COMMENT in df.columns:
+        df[COL_COMMENT] = df[COL_COMMENT].astype(str).str.strip()
+
+    df = df[df[COL_BREAK_DATE] >= BREAK_DATE_CUTOFF]
+    return df
+
+# STEP 2 – Consolidation
+def build_consolidated(df):
+    deduped = (
+        df.sort_values(COL_BREAK_DATE)
+        .drop_duplicates(subset=[COL_TRADE_ID, "MONTH_LABEL"], keep="last")
+    )
+
+    amt_piv = deduped.pivot_table(
+        index=COL_TRADE_ID, columns="MONTH_LABEL",
+        values=COL_BREAK_AMOUNT, aggfunc="last"
+    )
+
+    cmt_piv = deduped.pivot_table(
+        index=COL_TRADE_ID, columns="MONTH_LABEL",
+        values=COL_COMMENT, aggfunc="last"
+    )
+
+    amt_piv.columns = [f"AMOUNT_{c}" for c in amt_piv.columns]
+    cmt_piv.columns = [f"COMMENT_{c}" for c in cmt_piv.columns]
+
+    out = amt_piv.join(cmt_piv, how="outer").reset_index()
+    return out
+
+# STEP 3 – MI Reconciliation
+def load_monthly_mi():
+    mi = read_file(MONTHLY_MI_PATH)
+    mi.columns = mi.columns.str.strip().str.upper()
+    return mi
+
+def reconcile(consolidated, mi):
+    merged = consolidated.merge(
+        mi,
+        how="left",
+        left_on=COL_TRADE_ID,
+        right_on=MI_COL_TRADE_ID
+    )
+
+    merged["IN_MI"] = merged[MI_COL_TRADE_ID].notna()
+
+    def remediation(v):
+        if pd.isna(v):
+            return "Not in MI"
+        return "Remediated" if str(v).strip() == MI_REMEDIATED else "Not Remediated"
+
+    merged["REMEDIATION_STATUS"] = merged[MI_COL_EPIC].apply(remediation)
+
+    return merged
+
+# MAIN
+def run_pipeline():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    raw = load_last_weekday_breaks()
+    clean = filter_and_clean(raw)
+    consolidated = build_consolidated(clean)
+
+    mi = load_monthly_mi()
+    merged = reconcile(consolidated, mi)
+
+    consolidated.to_excel(os.path.join(OUTPUT_DIR, "consolidated_breaks.xlsx"), index=False)
+    merged.to_excel(os.path.join(OUTPUT_DIR, "mi_reconciliation.xlsx"), index=False)
+
+    return consolidated, merged
+
+if __name__ == "__main__":
+    run_pipeline()
