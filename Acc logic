@@ -1,57 +1,132 @@
 import pandas as pd
+import numpy as np
 
+# =========================================================
+# STEP 0: LOAD DATA
+# =========================================================
+# df should already contain TradeGroupKey
+# Example:
+# df = pd.read_csv("your_file.csv")
 
-def find_trade_pairs(df, tolerance_days=3):
+# =========================================================
+# STEP 1: STANDARDIZE COLUMNS
+# =========================================================
+df["date"] = pd.to_datetime(df["DATE"])
+df["abs_gbp"] = df["GBP_AMOUNT"].abs()
 
-    df = df.copy()
+# Fill nulls (important for grouping)
+df["CashFlag"] = df["CashFlag"].fillna("UNKNOWN")
+df["BreakType"] = df["BreakType"].fillna("UNKNOWN")
+df["AccountGroup"] = df["AccountGroup"].fillna("UNKNOWN")
+df["Product"] = df["Product"].fillna("UNKNOWN")
 
-    # ---- Standardize dates ----
-    date_cols = ["trade_date", "start_date", "maturity_date"]
-    for c in date_cols:
-        df[c] = pd.to_datetime(df[c], errors="coerce")
+# =========================================================
+# STEP 2: AMOUNT BUCKETING
+# =========================================================
+def amount_bucket(x):
+    if x < 1_000:
+        return "0-1K"
+    elif x < 10_000:
+        return "1K-10K"
+    elif x < 100_000:
+        return "10K-100K"
+    elif x < 1_000_000:
+        return "100K-1M"
+    else:
+        return "1M+"
 
-    # ---- Absolute nominal column ----
-    df["abs_nominal"] = df["nominal"].abs()
+df["amt_bucket"] = df["abs_gbp"].apply(amount_bucket)
 
-    # ---- Self merge on nominal ----
-    merged = df.merge(
-        df,
-        on="abs_nominal",
-        suffixes=("_1", "_2")
+# =========================================================
+# STEP 3: CREATE BREAK SIGNATURE
+# =========================================================
+df["BreakSignature"] = (
+    df["CashFlag"].astype(str) + "|" +
+    df["BreakType"].astype(str) + "|" +
+    df["AccountGroup"].astype(str) + "|" +
+    df["Product"].astype(str) + "|" +
+    df["amt_bucket"].astype(str)
+)
+
+# =========================================================
+# STEP 4: SORT DATA
+# =========================================================
+df = df.sort_values(["TradeGroupKey", "BreakSignature", "date"])
+
+# =========================================================
+# STEP 5: BREAK LINKING WITH DATE TOLERANCE (±2 DAYS)
+# =========================================================
+linked_rows = []
+global_group_id = 0
+
+for (tgk, sig), group in df.groupby(["TradeGroupKey", "BreakSignature"]):
+
+    group = group.sort_values("date").copy()
+    
+    current_cluster = []
+    base_date = None
+
+    for idx, row in group.iterrows():
+
+        if base_date is None:
+            base_date = row["date"]
+            current_cluster = [row]
+
+        else:
+            date_diff = abs((row["date"] - base_date).days)
+
+            if date_diff <= 2:
+                current_cluster.append(row)
+            else:
+                # Assign cluster ID
+                global_group_id += 1
+                for r in current_cluster:
+                    r = r.copy()
+                    r["LinkedBreakID"] = global_group_id
+                    linked_rows.append(r)
+
+                # Reset cluster
+                base_date = row["date"]
+                current_cluster = [row]
+
+    # Final cluster
+    if current_cluster:
+        global_group_id += 1
+        for r in current_cluster:
+            r = r.copy()
+            r["LinkedBreakID"] = global_group_id
+            linked_rows.append(r)
+
+# =========================================================
+# STEP 6: FINAL LINKED DATAFRAME
+# =========================================================
+linked_df = pd.DataFrame(linked_rows)
+
+# =========================================================
+# STEP 7: OPTIONAL — AGGREGATED VIEW (VERY USEFUL)
+# =========================================================
+summary = (
+    linked_df.groupby("LinkedBreakID")
+    .agg(
+        TradeGroupKey=("TradeGroupKey", "first"),
+        BreakSignature=("BreakSignature", "first"),
+        Total_Amount=("GBP_AMOUNT", "sum"),
+        Count=("GBP_AMOUNT", "count"),
+        Min_Date=("date", "min"),
+        Max_Date=("date", "max")
     )
+    .reset_index()
+)
 
-    # ---- Remove same trade matching ----
-    merged = merged[merged["trade_id_1"] != merged["trade_id_2"]]
+# =========================================================
+# OUTPUT
+# =========================================================
+print("Linked Data Sample:")
+print(linked_df.head())
 
-    # ---- Entity must be different ----
-    merged = merged[merged["entity_1"] != merged["entity_2"]]
+print("\nSummary:")
+print(summary.head())
 
-    # ---- Message receipt must be different ----
-    merged = merged[
-        merged["message_receipt_1"] != merged["message_receipt_2"]
-    ]
-
-    # ---- MTM opposite sign ----
-    merged = merged[
-        merged["mtm_usd_act_1"] * merged["mtm_usd_act_2"] < 0
-    ]
-
-    # ---- Date tolerance checks ----
-    merged = merged[
-        (abs((merged["trade_date_1"] - merged["trade_date_2"]).dt.days) <= tolerance_days) &
-        (abs((merged["start_date_1"] - merged["start_date_2"]).dt.days) <= tolerance_days) &
-        (abs((merged["maturity_date_1"] - merged["maturity_date_2"]).dt.days) <= tolerance_days)
-    ]
-
-    # ---- Select useful columns ----
-    result = merged[
-        [
-            "trade_id_1",
-            "trade_id_2",
-            "entity_1",
-            "entity_2",
-            "abs_nominal"
-        ]
-    ]
-
-    return result.reset_index(drop=True)
+# Save if needed
+# linked_df.to_csv("linked_breaks.csv", index=False)
+# summary.to_csv("linked_summary.csv", index=False)
