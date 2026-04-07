@@ -1,97 +1,211 @@
+"""
+CASHFOARE — Equities Asset Class Break Chaining
+
+Identifies root-cause breaks and traces propagation chains
+across equities recs (FO → BO → MO flow)
+"""
+
 import pandas as pd
+import numpy as np
 
 # =========================================================
-# STEP 1: STANDARDIZE DATA
+# STEP 0 — LOAD DATA
 # =========================================================
-df["Date"] = pd.to_datetime(df["Date"])
+# df = pd.read_csv("your_file.csv")
 
-# Create Trade Key (core identity)
+# =========================================================
+# STEP 1 — COLUMN NAME MAPPING
+# =========================================================
+MAP_COLS = {
+    "date": "Date",
+    "entity": "Entity",
+    "asset_class": "Asset Class",
+    "product": "High Level Product",
+    "trade_ref": "TRADE REF",
+    "rec_name": "Rec Name (as per Rec Cube)",
+    "break_amount": "BREAK AMOUNT GBP",
+    "break_id": "Break ID",
+    "team": "Team",
+}
+
+# =========================================================
+# STEP 2 — REC ORDER
+# =========================================================
+REC_ORDER = {
+    "FOBO Rec-Equities": 1,
+    "FOBO Rec-Dividend": 2,
+    "Fidessa vs FTP - Stock/Index Futures": 3,
+    "Fidessa vs Fiscal vs FTP - Cash Equity": 4,
+
+    "FLARE vs Fiscal Cash Control (Cash Equities)": 10,
+    "FLARE vs HUB Cash Contra (EQD Contra/control)": 11,
+    "FLARE vs HUB Cash Contra (L&D)": 12,
+    "Flare vs SYN - Cash Equities/SBL Control": 13,
+    "Neted Cash Control - Cash equities/SBL": 14,
+
+    "CRI COMPTA Rec - SED": 20,
+    "CRI COMPTA Rec - SEF": 21,
+    "CRI COMPTA Rec - Cash Equities/SBL": 22,
+
+    "Sophis vs FTP - Cash Equity (P&L - MTM & Cash)": 30,
+    "Sophis vs FTP - EQD (P&L - MTM & Cash)": 31,
+    "Sophis vs FTP - ETD PnL": 32,
+    "Sophis vs FTP - FX Spot/Fwd/NDF/FX swap PnL": 33,
+    "Sophis vs FTP - L&D (P&L - MTM & Cash)": 34,
+    "Sophis vs FTP - MTN (P&L - MTM & Cash)": 35,
+    "Sophis vs Vault (Murex) - FXO book level": 36,
+
+    "Global1 vs FTP ( HLR - SBL/FCT)": 40,
+    "HLR - Prime Services": 41,
+
+    "P&L Rec - CEQ": 50,
+    "P&L Rec - SED": 51,
+    "P&L Rec - SEF": 52,
+
+    "Washbook '0006 Fiscal account' - Market Charges": 60,
+}
+
+# =========================================================
+# STEP 3 — STANDARDISE
+# =========================================================
+def standardise(df):
+    df = df.copy()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    str_cols = ["Entity", "Asset Class", "High Level Product", "TRADE REF", "Rec Name (as per Rec Cube)"]
+    for col in str_cols:
+        df[col] = df[col].astype(str).str.strip().fillna("UNKNOWN")
+
+    df["BREAK AMOUNT GBP"] = pd.to_numeric(df["BREAK AMOUNT GBP"], errors="coerce").fillna(0)
+
+    return df
+
+df = standardise(df)
+
+# =========================================================
+# STEP 4 — REC RANK
+# =========================================================
+df["rec_rank"] = df["Rec Name (as per Rec Cube)"].map(REC_ORDER)
+df["rec_rank"] = df["rec_rank"].fillna(999)
+
+# =========================================================
+# STEP 5 — TRADE KEY
+# =========================================================
 df["TradeKey"] = (
-    df["Entity"].astype(str) + "|" +
-    df["Asset Class"].astype(str) + "|" +
-    df["High Level Product"].astype(str) + "|" +
-    df["TRADE REF"].astype(str)
+    df["Entity"] + "|" +
+    df["Asset Class"] + "|" +
+    df["High Level Product"] + "|" +
+    df["TRADE REF"]
 )
 
-# Sort properly
-df = df.sort_values(["TradeKey", "Date"])
+df["amt_bucket"] = (df["BREAK AMOUNT GBP"].abs() / 1000).round(0).astype(int).astype(str)
+
+df["TradeKey_Fuzzy"] = (
+    df["Entity"] + "|" +
+    df["Asset Class"] + "|" +
+    df["High Level Product"] + "|" +
+    df["amt_bucket"]
+)
 
 # =========================================================
-# STEP 2: CHAIN BREAKS ACROSS RECS
+# STEP 6 — PARAMETERS
 # =========================================================
-chain_rows = []
-chain_id = 0
+MAX_DATE_GAP = 5
 
-for trade_key, group in df.groupby("TradeKey"):
-
-    group = group.sort_values("Date").copy()
+# =========================================================
+# STEP 7 — CHAINING FUNCTION
+# =========================================================
+def chain_group(group, start_id):
+    group = group.sort_values(["Date", "rec_rank"])
+    results = []
+    chain_id = start_id
 
     current_chain = []
     last_date = None
 
-    for idx, row in group.iterrows():
+    for _, row in group.iterrows():
 
-        if last_date is None:
+        if not current_chain:
+            current_chain = [row]
+            last_date = row["Date"]
+            continue
+
+        date_gap = (row["Date"] - last_date).days
+
+        if date_gap <= MAX_DATE_GAP and row["rec_rank"] >= current_chain[-1]["rec_rank"]:
+            current_chain.append(row)
+            last_date = row["Date"]
+        else:
+            chain_id += 1
+            for i, r in enumerate(current_chain):
+                r = r.copy()
+                r["BreakChainID"] = chain_id
+                r["IsRootBreak"] = (i == 0)
+                results.append(r)
+
             current_chain = [row]
             last_date = row["Date"]
 
-        else:
-            date_diff = (row["Date"] - last_date).days
-
-            # 🔥 CORE LOGIC
-            # If break continues within 3 days → SAME CHAIN
-            if date_diff <= 3:
-                current_chain.append(row)
-                last_date = row["Date"]
-            else:
-                # Close previous chain
-                chain_id += 1
-                for r in current_chain:
-                    r = r.copy()
-                    r["BreakChainID"] = chain_id
-                    chain_rows.append(r)
-
-                # Start new chain
-                current_chain = [row]
-                last_date = row["Date"]
-
-    # Final chain
     if current_chain:
         chain_id += 1
-        for r in current_chain:
+        for i, r in enumerate(current_chain):
             r = r.copy()
             r["BreakChainID"] = chain_id
-            chain_rows.append(r)
+            r["IsRootBreak"] = (i == 0)
+            results.append(r)
 
-# Final dataframe
-chain_df = pd.DataFrame(chain_rows)
+    return results, chain_id
 
 # =========================================================
-# STEP 3: ANALYSIS VIEW (VERY IMPORTANT)
+# STEP 8 — APPLY CHAINING
 # =========================================================
+all_rows = []
+chain_id = 0
+
+for key, grp in df.groupby("TradeKey"):
+    rows, chain_id = chain_group(grp, chain_id)
+    all_rows.extend(rows)
+
+chain_df = pd.DataFrame(all_rows)
+
+# =========================================================
+# STEP 9 — SUMMARY
+# =========================================================
+def ordered_unique(x):
+    seen = []
+    for i in x:
+        if i not in seen:
+            seen.append(i)
+    return seen
+
 summary = (
-    chain_df.groupby("BreakChainID")
+    chain_df.sort_values(["BreakChainID", "Date", "rec_rank"])
+    .groupby("BreakChainID")
     .agg(
-        TradeKey=("TradeKey", "first"),
-        Trade_Ref=("TRADE REF", "first"),
-        Entity=("Entity", "first"),
+        Trade=("TRADE REF", "first"),
         Product=("High Level Product", "first"),
+        Root_Rec=("Rec Name (as per Rec Cube)", "first"),
         Start_Date=("Date", "min"),
         End_Date=("Date", "max"),
         Rec_Count=("Rec Name (as per Rec Cube)", "nunique"),
-        Rec_List=("Rec Name (as per Rec Cube)", lambda x: list(x.unique())),
+        Rec_Flow=("Rec Name (as per Rec Cube)", lambda x: " → ".join(ordered_unique(x))),
+        Total_Amount=("BREAK AMOUNT GBP", "sum"),
         Total_Breaks=("Date", "count"),
-        Total_Amount=("BREAK AMOUNT GBP", "sum")
     )
     .reset_index()
 )
 
 # =========================================================
+# STEP 10 — ROOT CAUSE
+# =========================================================
+root_cause = chain_df[chain_df["IsRootBreak"]].copy()
+
+# =========================================================
 # OUTPUT
 # =========================================================
-print(chain_df.head())
+print("\n===== SUMMARY =====")
 print(summary.head())
 
-# Optional save
-# chain_df.to_csv("break_chains.csv", index=False)
-# summary.to_csv("break_chain_summary.csv", index=False)
+print("\n===== ROOT CAUSE =====")
+print(root_cause.head())
