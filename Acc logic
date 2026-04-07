@@ -1,132 +1,475 @@
+"""
+CASHFOARE D3S PoC — Root Cause Cascade Map
+Streamlit app: upstream → downstream break linkage across all equities asset class recs.
+
+Run:
+pip install streamlit plotly pandas
+streamlit run cashfoare_poc_cascade.py
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
+from typing import Optional
 
-# =========================================================
-# STEP 0: LOAD DATA
-# =========================================================
-# df should already contain TradeGroupKey
-# Example:
-# df = pd.read_csv("your_file.csv")
+# ─── Page config ──────────────────────────────────────────────────────────────
 
-# =========================================================
-# STEP 1: STANDARDIZE COLUMNS
-# =========================================================
-df["date"] = pd.to_datetime(df["DATE"])
-df["abs_gbp"] = df["GBP_AMOUNT"].abs()
-
-# Fill nulls (important for grouping)
-df["CashFlag"] = df["CashFlag"].fillna("UNKNOWN")
-df["BreakType"] = df["BreakType"].fillna("UNKNOWN")
-df["AccountGroup"] = df["AccountGroup"].fillna("UNKNOWN")
-df["Product"] = df["Product"].fillna("UNKNOWN")
-
-# =========================================================
-# STEP 2: AMOUNT BUCKETING
-# =========================================================
-def amount_bucket(x):
-    if x < 1_000:
-        return "0-1K"
-    elif x < 10_000:
-        return "1K-10K"
-    elif x < 100_000:
-        return "10K-100K"
-    elif x < 1_000_000:
-        return "100K-1M"
-    else:
-        return "1M+"
-
-df["amt_bucket"] = df["abs_gbp"].apply(amount_bucket)
-
-# =========================================================
-# STEP 3: CREATE BREAK SIGNATURE
-# =========================================================
-df["BreakSignature"] = (
-    df["CashFlag"].astype(str) + "|" +
-    df["BreakType"].astype(str) + "|" +
-    df["AccountGroup"].astype(str) + "|" +
-    df["Product"].astype(str) + "|" +
-    df["amt_bucket"].astype(str)
+st.set_page_config(
+    page_title="CASHFOARE D3S PoC — Root Cause Cascade",
+    page_icon="🔗",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# =========================================================
-# STEP 4: SORT DATA
-# =========================================================
-df = df.sort_values(["TradeGroupKey", "BreakSignature", "date"])
+# ─── Global CSS ───────────────────────────────────────────────────────────────
 
-# =========================================================
-# STEP 5: BREAK LINKING WITH DATE TOLERANCE (±2 DAYS)
-# =========================================================
-linked_rows = []
-global_group_id = 0
+st.markdown("""
+<style>
+    .stApp { background-color: #080d1a; }
+    .stApp > header { background-color: #080d1a; }
 
-for (tgk, sig), group in df.groupby(["TradeGroupKey", "BreakSignature"]):
+    /* Sidebar */
+    section[data-testid="stSidebar"] { background-color: #0a0f1e; border-right: 1px solid #1e2d4a; }
+    section[data-testid="stSidebar"] * { color: #94a3b8 !important; }
 
-    group = group.sort_values("date").copy()
-    
-    current_cluster = []
-    base_date = None
+    /* Tab strip */
+    .stTabs [data-baseweb="tab-list"] { background-color: #0f1525; border-radius: 8px; padding: 4px; gap: 4px; }
+    .stTabs [data-baseweb="tab"] { background-color: transparent; border-radius: 6px; color: #64748b; font-weight: 700; font-size: 12px; letter-spacing: 1px; }
+    .stTabs [aria-selected="true"] { background-color: #1e2d4a !important; color: #f59e0b !important; }
 
-    for idx, row in group.iterrows():
+    /* Metric cards */
+    [data-testid="stMetric"] { background: #0f1525; border: 1px solid #1e2d4a; border-radius: 8px; padding: 12px 16px; }
+    [data-testid="stMetricValue"] { color: #f1f5f9 !important; font-size: 28px !important; font-weight: 900 !important; }
+    [data-testid="stMetricLabel"] { color: #64748b !important; font-size: 11px !important; }
 
-        if base_date is None:
-            base_date = row["date"]
-            current_cluster = [row]
+    /* Text elements */
+    h1, h2, h3 { color: #f1f5f9 !important; }
+    p, label, .stMarkdown { color: #94a3b8 !important; }
 
-        else:
-            date_diff = abs((row["date"] - base_date).days)
+    /* Selectbox / radio */
+    .stSelectbox label, .stRadio label { color: #94a3b8 !important; }
+    .stSelectbox > div > div { background: #0f1525 !important; border-color: #1e2d4a !important; color: #e2e8f0 !important; }
 
-            if date_diff <= 2:
-                current_cluster.append(row)
-            else:
-                # Assign cluster ID
-                global_group_id += 1
-                for r in current_cluster:
-                    r = r.copy()
-                    r["LinkedBreakID"] = global_group_id
-                    linked_rows.append(r)
+    /* Dataframe */
+    .stDataFrame { border: 1px solid #1e2d4a; border-radius: 8px; }
 
-                # Reset cluster
-                base_date = row["date"]
-                current_cluster = [row]
+    /* Divider */
+    hr { border-color: #1e2d4a; }
 
-    # Final cluster
-    if current_cluster:
-        global_group_id += 1
-        for r in current_cluster:
-            r = r.copy()
-            r["LinkedBreakID"] = global_group_id
-            linked_rows.append(r)
+    /* Expander */
+    .streamlit-expanderHeader { background: #0f1525 !important; color: #94a3b8 !important; border: 1px solid #1e2d4a !important; border-radius: 6px !important; }
+    .streamlit-expanderContent { background: #080d1a !important; border: 1px solid #1e2d4a !important; }
 
-# =========================================================
-# STEP 6: FINAL LINKED DATAFRAME
-# =========================================================
-linked_df = pd.DataFrame(linked_rows)
+    /* Buttons */
+    .stButton > button {
+        background: #0f1525; border: 1px solid #1e2d4a;
+        color: #94a3b8; border-radius: 6px; font-weight: 700; font-size: 11px;
+    }
+    .stButton > button:hover { border-color: #f59e0b; color: #f59e0b; background: #f59e0b11; }
+</style>
+""", unsafe_allow_html=True)
 
-# =========================================================
-# STEP 7: OPTIONAL — AGGREGATED VIEW (VERY USEFUL)
-# =========================================================
-summary = (
-    linked_df.groupby("LinkedBreakID")
-    .agg(
-        TradeGroupKey=("TradeGroupKey", "first"),
-        BreakSignature=("BreakSignature", "first"),
-        Total_Amount=("GBP_AMOUNT", "sum"),
-        Count=("GBP_AMOUNT", "count"),
-        Min_Date=("date", "min"),
-        Max_Date=("date", "max")
+# ─── Data: All recs ───────────────────────────────────────────────────────────
+
+RECS = {
+    # D3S PoC sources
+    "D3S_CEQ": dict(layer="D3S", product="CEQ", office="FO", poc=True,
+        label="D3S Graph — CEQ Breaks", sublabel="D3S OTC · Cash Equity breaks",
+        desc="Lavastorm D3S workflow generates CEQ reconciliation breaks. Root trigger for all downstream CEQ rec impacts."),
+    "D3S_LND": dict(layer="D3S", product="LnD", office="FO", poc=True,
+        label="D3S Graph — LnD Breaks", sublabel="D3S OTC · Loans & Deposits breaks",
+        desc="D3S workflow generates LnD breaks. Root trigger for downstream L&D cash contra and P&L recs."),
+    "D3S_MTN": dict(layer="D3S", product="MTN", office="FO", poc=True,
+        label="D3S Graph — MTN Breaks", sublabel="D3S OTC · Medium Term Notes breaks",
+        desc="D3S workflow generates MTN breaks. Root trigger for coupon/maturity-driven downstream P&L and fiscal recs."),
+    "D3S_OTC": dict(layer="D3S", product="OTC", office="FO", poc=True,
+        label="D3S Graph — OTC Breaks", sublabel="D3S OTC · Derivatives breaks",
+        desc="D3S workflow generates OTC breaks covering EQD, ETD and FX derivatives."),
+
+    # Front Office
+    "FOBO_EQ": dict(layer="FO", product="CEQ", office="FO", poc=False,
+        label="FOBO Rec – Equities", sublabel="Trade population / position integrity",
+        desc="FO position rec between Front Office booking and Back Office confirmation."),
+    "FOBO_DIV": dict(layer="FO", product="CEQ", office="FO", poc=False,
+        label="FOBO Rec – Dividend", sublabel="Corporate action event rec",
+        desc="Dividend event reconciliation. Timing breaks propagate to FLARE vs Fiscal and P&L Rec – CEQ."),
+    "FID_FTP": dict(layer="FO", product="OTC", office="FO", poc=False,
+        label="Fidessa vs FTP – Stock/Index Futures", sublabel="ETD position population",
+        desc="ETD position rec between Fidessa and FTP."),
+
+    # Middle Office
+    "PL_CEQ": dict(layer="MO", product="CEQ", office="MO", poc=False,
+        label="P&L Rec – CEQ", sublabel="ACT / Product Control",
+        desc="Core CEQ P&L rec. Inherits from FOBO Equities and Sophis vs FTP Cash Equity."),
+    "PL_SED": dict(layer="MO", product="SED", office="MO", poc=False,
+        label="P&L Rec – SED", sublabel="ACT / Product Control",
+        desc="SED P&L rec. Fed by FOBO Equities and Sophis FTP."),
+    "PL_SEF": dict(layer="MO", product="SEF", office="MO", poc=False,
+        label="P&L Rec – SEF", sublabel="ACT / Product Control",
+        desc="SEF P&L rec. Receives cascade from FOBO and FLARE breaks."),
+    "SOPHIS_CEQ": dict(layer="MO", product="CEQ", office="MO", poc=False,
+        label="Sophis vs FTP – Cash Equity (P&L – MTM & Cash)", sublabel="Risk system / FTP valuation",
+        desc="MTM and cash P&L between Sophis and FTP."),
+    "SOPHIS_EQD": dict(layer="MO", product="OTC", office="MO", poc=False,
+        label="Sophis vs FTP – EQD (P&L – MTM & Cash)", sublabel="Equity derivatives valuation",
+        desc="EQD MTM and cash P&L. Directly driven by D3S_OTC and Fidessa vs FTP ETD breaks."),
+    "SOPHIS_ETD": dict(layer="MO", product="OTC", office="MO", poc=False,
+        label="Sophis vs FTP – ETD PnL", sublabel="Exchange traded derivatives",
+        desc="ETD daily P&L. Driven by Fidessa vs FTP and D3S_OTC breaks."),
+    "SOPHIS_FX": dict(layer="MO", product="FX", office="MO", poc=False,
+        label="Sophis vs FTP – FX Spot/Fwd/NDF/FX swap PnL", sublabel="FX derivatives P&L",
+        desc="FX P&L rec across Spot, Forward, NDF and FX Swap."),
+    "SOPHIS_LND": dict(layer="MO", product="LnD", office="MO", poc=False,
+        label="Sophis vs FTP – L&D (P&L – MTM & Cash)", sublabel="Loans & Deposits valuation",
+        desc="L&D MTM and cash P&L. Direct downstream of D3S_LND breaks."),
+    "SOPHIS_MTN": dict(layer="MO", product="MTN", office="MO", poc=False,
+        label="Sophis vs FTP – MTN (P&L – MTM & Cash)", sublabel="Medium Term Notes valuation",
+        desc="MTN MTM and cash P&L. Direct downstream of D3S_MTN breaks."),
+    "SOPHIS_VAULT": dict(layer="MO", product="FX", office="MO", poc=False,
+        label="Sophis vs Vault (Murex) – FXO book level", sublabel="FX Options / Murex",
+        desc="FX Options book level rec between Sophis and Murex Vault."),
+    "GLOBAL1": dict(layer="MO", product="LnD", office="MO", poc=False,
+        label="Global1 vs FTP (HLR – SBL/FCT)", sublabel="HLR funding / Prime Services",
+        desc="Funding and prime services rec. Receives cascade from D3S_LND."),
+    "HLR_PS": dict(layer="MO", product="LnD", office="MO", poc=False,
+        label="HLR – Prime Services", sublabel="Prime brokerage / HLR",
+        desc="Prime services HLR rec. Linked to Global1 vs FTP and D3S_LND."),
+
+    # Back Office
+    "FLARE_FISCAL": dict(layer="BO", product="CEQ", office="BO", poc=False,
+        label="FLARE vs Fiscal Cash Control (Cash Equities)", sublabel="Settlement / Fiscal accounting",
+        desc="Cash settlement rec between FLARE and Fiscal."),
+    "FLARE_HUB_EQD": dict(layer="BO", product="OTC", office="BO", poc=False,
+        label="FLARE vs HUB Cash Contra (EQD Contra/control)", sublabel="EQD cash contra / settlements",
+        desc="EQD cash contra between FLARE and HUB."),
+    "FLARE_HUB_LND": dict(layer="BO", product="LnD", office="BO", poc=False,
+        label="FLARE vs HUB Cash Contra (L&D)", sublabel="L&D cash contra / settlements",
+        desc="L&D cash contra between FLARE and HUB."),
+    "FLARE_SYN": dict(layer="BO", product="CEQ", office="BO", poc=False,
+        label="FLARE vs SYN – Cash Equities/SBL Control", sublabel="Cash equities / SBL settlements",
+        desc="Cash equities and SBL control between FLARE and Synthesis."),
+    "NETTED": dict(layer="BO", product="CEQ", office="BO", poc=False,
+        label="Netted Cash Control – Cash Equities/SBL", sublabel="Netting engine / settlements",
+        desc="Netted cash positions for CEQ and SBL."),
+    "FID_FISCAL_FTP": dict(layer="BO", product="CEQ", office="BO", poc=False,
+        label="Fidessa vs Fiscal vs FTP – Cash Equity", sublabel="Three-way cash equity rec",
+        desc="Three-way rec spanning Fidessa, Fiscal and FTP."),
+    "COMPTA_SED": dict(layer="BO", product="SED", office="BO", poc=False,
+        label="CRI COMPTA Rec – SED", sublabel="COMPTA accounting / SED",
+        desc="SED COMPTA accounting rec."),
+    "COMPTA_SEF": dict(layer="BO", product="SEF", office="BO", poc=False,
+        label="CRI COMPTA Rec – SEF", sublabel="COMPTA accounting / SEF",
+        desc="SEF COMPTA accounting rec."),
+    "COMPTA_CEQ": dict(layer="BO", product="CEQ", office="BO", poc=False,
+        label="CRI COMPTA Rec – Cash Equities/SBL", sublabel="COMPTA accounting / CEQ",
+        desc="Cash Equities COMPTA rec."),
+    "WASHBOOK": dict(layer="BO", product="ALL", office="BO", poc=False,
+        label="Washbook '0006 Fiscal account' – Market Charges", sublabel="Fiscal washbook / market charges",
+        desc="Market charges washbook."),
+}
+
+# ─── Edges ────────────────────────────────────────────────────────────────────
+
+EDGES = [
+    # D3S_CEQ chain
+    ("D3S_CEQ", "FOBO_EQ", "H", "CEQ position break surfaces in FOBO equity position rec"),
+    ("D3S_CEQ", "FLARE_FISCAL", "H", "CEQ cash not posted to FLARE → Fiscal cash control break"),
+    ("D3S_CEQ", "FID_FISCAL_FTP", "H", "CEQ position missing from Fidessa → three-way rec break"),
+    ("D3S_CEQ", "SOPHIS_CEQ", "H", "CEQ position difference → MTM missing in Sophis vs FTP"),
+    ("D3S_CEQ", "FLARE_SYN", "M", "CEQ break propagates to FLARE vs SYN via SBL feed"),
+    ("D3S_CEQ", "PL_CEQ", "H", "CEQ position break → P&L exposure difference in CEQ rec"),
+    # D3S_LND chain
+    ("D3S_LND", "FLARE_HUB_LND", "H", "LnD cash difference → FLARE vs HUB L&D contra break"),
+    ("D3S_LND", "SOPHIS_LND", "H", "LnD position break → Sophis vs FTP L&D MTM difference"),
+    ("D3S_LND", "GLOBAL1", "M", "LnD funding difference cascades to Global1 vs FTP HLR"),
+    ("D3S_LND", "HLR_PS", "L", "LnD break flows into prime services HLR indirectly"),
+    ("D3S_LND", "WASHBOOK", "L", "LnD market charges artefact in Fiscal washbook 0006"),
+    # D3S_MTN chain
+    ("D3S_MTN", "SOPHIS_MTN", "H", "MTN position break → Sophis vs FTP MTN MTM difference"),
+    ("D3S_MTN", "WASHBOOK", "M", "MTN coupon/market charges → Fiscal washbook 0006 break"),
+    ("D3S_MTN", "FLARE_FISCAL", "M", "MTN cash settlement feeds through FLARE vs Fiscal"),
+    # D3S_OTC chain
+    ("D3S_OTC", "FID_FTP", "H", "OTC/ETD position break surfaces in Fidessa vs FTP"),
+    ("D3S_OTC", "FLARE_HUB_EQD", "H", "OTC EQD cash contra break in FLARE vs HUB EQD"),
+    ("D3S_OTC", "SOPHIS_EQD", "H", "OTC EQD position → EQD MTM difference in Sophis vs FTP"),
+    ("D3S_OTC", "SOPHIS_ETD", "H", "OTC ETD position → ETD PnL difference in Sophis vs FTP"),
+    ("D3S_OTC", "SOPHIS_FX", "M", "OTC FX component breaks → FX Spot/Fwd/NDF PnL rec"),
+    ("D3S_OTC", "SOPHIS_VAULT", "M", "OTC FXO component → Sophis vs Vault Murex FXO level"),
+    # FO secondary
+    ("FOBO_EQ", "FLARE_FISCAL", "H", "Unmatched equity trade → Fiscal cash posting missing"),
+    ("FOBO_EQ", "NETTED", "H", "FOBO position mismatch → netting residual"),
+    ("FOBO_EQ", "PL_CEQ", "H", "FOBO position break → CEQ P&L exposure"),
+    ("FOBO_EQ", "PL_SED", "M", "FOBO break shared across SED book"),
+    ("FOBO_EQ", "PL_SEF", "M", "FOBO break shared across SEF book"),
+    ("FOBO_DIV", "FLARE_FISCAL", "H", "Dividend cash not posted → Fiscal cash break"),
+    ("FOBO_DIV", "PL_CEQ", "H", "Dividend not booked → CEQ P&L income missing"),
+    ("FOBO_DIV", "COMPTA_CEQ", "M", "Dividend entry missing → COMPTA CEQ accounting break"),
+    ("FID_FTP", "FLARE_HUB_EQD", "H", "ETD position → EQD cash contra break"),
+    ("FID_FTP", "SOPHIS_EQD", "H", "ETD position miss → EQD MTM missing in Sophis"),
+    ("FID_FTP", "SOPHIS_ETD", "H", "Same position — ETD PnL inherits break"),
+    # BO secondary
+    ("FLARE_FISCAL", "NETTED", "H", "Unsettled cash → netting residual"),
+    ("FLARE_FISCAL", "COMPTA_CEQ", "M", "Missing settlement → COMPTA CEQ entry missing"),
+    ("FLARE_SYN", "NETTED", "M", "SYN discrepancy flows into netting engine"),
+    # MO secondary
+    ("SOPHIS_CEQ", "PL_CEQ", "H", "MTM difference is a component of P&L Rec CEQ"),
+    ("SOPHIS_EQD", "PL_CEQ", "M", "EQD MTM feeds into CEQ consolidated P&L"),
+    ("GLOBAL1", "HLR_PS", "M", "HLR funding break propagates to Prime Services"),
+]
+
+# ─── Colour maps ──────────────────────────────────────────────────────────────
+
+LAYER_COLOR = {
+    "D3S": {"border": "#f59e0b", "bg": "#92400e", "text": "#fde68a"},
+    "FO": {"border": "#0ea5e9", "bg": "#0c4a6e", "text": "#bae6fd"},
+    "MO": {"border": "#a78bfa", "bg": "#2e1065", "text": "#ddd6fe"},
+    "BO": {"border": "#10b981", "bg": "#064e3b", "text": "#a7f3d0"},
+}
+PROD_COLOR = {
+    "CEQ": "#3b82f6", "LnD": "#10b981", "MTN": "#f59e0b",
+    "OTC": "#8b5cf6", "SED": "#06b6d4", "SEF": "#ec4899",
+    "EQD": "#0891b2", "ETD": "#7c3aed", "FX": "#d97706", "ALL": "#64748b",
+}
+PROB_COLOR = {"H": "#ef4444", "M": "#f59e0b", "L": "#10b981"}
+PROB_LABEL = {"H": "HIGH", "M": "MEDIUM", "L": "LOW"}
+
+# ─── Helper functions ─────────────────────────────────────────────────────────
+
+def layer_badge(layer: str) -> str:
+    lc = LAYER_COLOR[layer]
+    return (f'<span style="background:{lc["bg"]};color:{lc["text"]};'
+            f'border-radius:3px;padding:1px 7px;font-size:10px;font-weight:700;'
+            f'letter-spacing:1px;">{layer}</span>')
+
+def prod_badge(product: str) -> str:
+    c = PROD_COLOR.get(product, "#64748b")
+    return (f'<span style="background:{c}22;border:1px solid {c}66;color:{c};'
+            f'border-radius:3px;padding:1px 6px;font-size:10px;font-weight:700;">{product}</span>')
+
+def prob_badge(prob: str) -> str:
+    c = PROB_COLOR[prob]
+    return (f'<span style="background:{c}22;border:1px solid {c}66;color:{c};'
+            f'border-radius:3px;padding:1px 8px;font-size:10px;font-weight:800;">'
+            f'{PROB_LABEL[prob]}</span>')
+
+def info_box(title: str, content: str, color: str = "#0ea5e9") -> str:
+    return f"""
+    <div style="background:{color}11;border-left:4px solid {color};border-radius:0 8px 8px 0;
+    padding:12px 16px;margin:10px 0;">
+    <div style="color:{color};font-size:10px;font-weight:800;letter-spacing:2px;margin-bottom:5px;">
+    {title}
+    </div>
+    <div style="color:#94a3b8;font-size:12px;line-height:1.6;">{content}</div>
+    </div>"""
+
+# ─── Sankey diagram ────────────────────────────────────────────────────────────
+
+def build_sankey(filter_d3s: Optional[str] = None) -> go.Figure:
+    edges = EDGES
+    if filter_d3s:
+        hop1_targets = {e[1] for e in edges if e[0] == filter_d3s}
+        edges = [e for e in edges if e[0] == filter_d3s or e[0] in hop1_targets]
+
+    nodes_set = []
+    for frm, to, prob, _ in edges:
+        if frm not in nodes_set: nodes_set.append(frm)
+        if to not in nodes_set: nodes_set.append(to)
+    node_idx = {n: i for i, n in enumerate(nodes_set)}
+
+    node_labels = [RECS[n]["label"][:35] + ("..." if len(RECS[n]["label"]) > 35 else "") for n in nodes_set]
+    node_colors = [LAYER_COLOR[RECS[n]["layer"]]["border"] for n in nodes_set]
+
+    src, tgt, val, link_colors = [], [], [], []
+    for frm, to, prob, _ in edges:
+        src.append(node_idx[frm])
+        tgt.append(node_idx[to])
+        val.append(3 if prob == "H" else 2 if prob == "M" else 1)
+        c = PROB_COLOR[prob]
+        link_colors.append(c + "88")
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=18, thickness=20,
+            line=dict(color="#1e2d4a", width=0.5),
+            label=node_labels,
+            color=node_colors,
+            hovertemplate="<b>%{label}</b><extra></extra>",
+        ),
+        link=dict(
+            source=src, target=tgt, value=val, color=link_colors,
+            hovertemplate="Flow probability: %{value}<extra></extra>",
+        ),
+    ))
+    fig.update_layout(
+        paper_bgcolor="#080d1a", plot_bgcolor="#080d1a",
+        font=dict(family="monospace", size=10, color="#94a3b8"),
+        height=520, margin=dict(l=10, r=10, t=30, b=10),
     )
-    .reset_index()
-)
+    return fig
 
-# =========================================================
-# OUTPUT
-# =========================================================
-print("Linked Data Sample:")
-print(linked_df.head())
+# ─── Impact matrix ────────────────────────────────────────────────────────────
 
-print("\nSummary:")
-print(summary.head())
+def build_impact_matrix() -> pd.DataFrame:
+    D3S_IDS = ["D3S_CEQ", "D3S_LND", "D3S_MTN", "D3S_OTC"]
+    downstream = [rid for rid, r in RECS.items() if not r["poc"]]
 
-# Save if needed
-# linked_df.to_csv("linked_breaks.csv", index=False)
-# summary.to_csv("linked_summary.csv", index=False)
+    direct = {d: set(e[1] for e in EDGES if e[0] == d) for d in D3S_IDS}
+    indirect = {}
+    for d in D3S_IDS:
+        ind = set()
+        for mid in direct[d]:
+            for e in EDGES:
+                if e[0] == mid:
+                    ind.add(e[1])
+        indirect[d] = ind - direct[d]
+
+    rows = []
+    for rid in downstream:
+        r = RECS[rid]
+        row = {"Rec ID": rid, "Reconciliation": r["label"], "Layer": r["layer"], "Product": r["product"]}
+        any_impact = False
+        for d in D3S_IDS:
+            if rid in direct[d]:
+                prob = next(e[2] for e in EDGES if e[0] == d and e[1] == rid)
+                row[d] = f"{PROB_LABEL[prob]} (direct)"
+                any_impact = True
+            elif rid in indirect[d]:
+                row[d] = "MED (indirect)"
+                any_impact = True
+            else:
+                row[d] = ""
+        if any_impact: rows.append(row)
+
+    return pd.DataFrame(rows)
+
+# ─── PoC walkthrough steps ────────────────────────────────────────────────────
+
+POC_STEPS = [
+    dict(
+        title="Step 1 — D3S Generates a CEQ Break",
+        rec="D3S_CEQ", color="#f59e0b",
+        desc="The Lavastorm D3S workflow for CASHFOARE runs and generates a CEQ break.",
+        evidence="break_id: CEQ-2024-001\nentity: ENTITY_A\namount: £2,340,000",
+        ml_action="false_break_prob = 0.82 → risk_tier: Suppress",
+    ),
+    dict(
+        title="Step 2 — Break Propagates to FOBO Rec – Equities",
+        rec="FOBO_EQ", color="#0ea5e9",
+        desc="The CEQ position break from D3S surfaces in FOBO Rec – Equities within the same day.",
+        evidence="break_id: FOBO-2024-001\nentity: ENTITY_A\namount: £2,340,000",
+        ml_action="upstream_d3s_ceq_break = 1\nfalse_break_prob = 0.87 → Suppress",
+    ),
+    dict(
+        title="Step 3 — Cascades to FLARE vs Fiscal",
+        rec="FLARE_FISCAL", color="#10b981",
+        desc="The unmatched position means corresponding cash posting is missing from FLARE.",
+        evidence="break_id: FLARE-2024-001\namount: £2,340,000",
+        ml_action="upstream_fo1_break = 1\nfalse_break_prob = 0.91 → Suppress",
+    ),
+    dict(
+        title="Step 4 — Cascades to Netted Cash Control",
+        rec="NETTED", color="#10b981",
+        desc="The settlement doesn’t net correctly, creating a residual in the Netted Cash Control rec.",
+        evidence="break_id: NETTED-2024-001\namount: £2,340,000",
+        ml_action="upstream_flare_fiscal_break = 1\nfalse_break_prob = 0.89 → Suppress",
+    ),
+    dict(
+        title="Step 5 — P&L Rec – CEQ Inherits",
+        rec="PL_CEQ", color="#a78bfa",
+        desc="The position difference creates a P&L exposure in P&L Rec – CEQ.",
+        evidence="break_id: PL-2024-001\nP&L impact: £187,500",
+        ml_action="upstream_d3s_ceq_break = 1\nfalse_break_prob = 0.78 → Review tier",
+    ),
+    dict(
+        title="Step 6 — PoC Proven ✓",
+        rec=None, color="#22c55e",
+        desc="One D3S root cause generating 5 downstream breaks. ML identifies and handles automatically.",
+        evidence="Savings: 4 breaks removed from MI\nTime saved: ~4 hrs/month",
+        ml_action="Phase 2: Target AUC-ROC > 0.80",
+    ),
+]
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("""
+    <div style='text-align:center;padding:12px 0 6px;'>
+    <div style='font-size:20px;'>🔗</div>
+    <div style='color:#f59e0b;font-size:11px;font-weight:800;letter-spacing:2px;'>CASHFOARE</div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.divider()
+
+    page = st.radio("Navigation", ["📊 Cascade Map", "🧪 PoC Proof", "📈 Sankey Flow", "📋 Impact Matrix"], label_visibility="collapsed")
+
+    st.divider()
+    st.metric("D3S PoC Sources", sum(1 for r in RECS.values() if r["poc"]))
+    st.metric("Total Recs Mapped", len(RECS))
+    st.metric("Propagation Links", len(EDGES))
+
+# ─── Header ───────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<h1 style='color:#f1f5f9;font-size:26px;font-weight:900;margin:4px 0;'>Root Cause Cascade Map</h1>
+""", unsafe_allow_html=True)
+
+# ─── Pages ────────────────────────────────────────────────────────────────────
+
+if page == "📊 Cascade Map":
+    col_filter, col_prod = st.columns(2)
+    with col_filter:
+        layer_filter = st.selectbox("Filter by layer", ["ALL", "D3S", "FO", "MO", "BO"])
+    with col_prod:
+        prod_filter = st.selectbox("Filter by product", ["ALL", "CEQ", "LnD", "MTN", "OTC", "SED", "SEF", "EQD", "ETD", "FX"])
+
+    all_recs = [r for r in RECS.keys() if (layer_filter == "ALL" or RECS[r]["layer"] == layer_filter) and (prod_filter == "ALL" or RECS[r]["product"] == prod_filter)]
+
+    left_col, right_col = st.columns([2, 3])
+    with left_col:
+        for layer in ["D3S", "FO", "MO", "BO"]:
+            layer_recs = [r for r in all_recs if RECS[r]["layer"] == layer]
+            if not layer_recs: continue
+            st.markdown(f"<div style='color:{LAYER_COLOR[layer]['border']};font-size:9px;font-weight:800;'>{layer}</div>", unsafe_allow_html=True)
+            selected_label = st.radio(f"_l_{layer}", ["(none)"] + [f"{rid} - {RECS[rid]['label']}" for rid in layer_recs], label_visibility="collapsed")
+            if selected_label != "(none)": st.session_state["selected_rec"] = selected_label.split(" - ")[0]
+
+    with right_col:
+        sel = st.session_state.get("selected_rec")
+        if sel in RECS:
+            r = RECS[sel]
+            st.markdown(f"### {r['label']}")
+            st.write(r['desc'])
+            up_edges = [e for e in EDGES if e[1] == sel]
+            down_edges = [e for e in EDGES if e[0] == sel]
+            if up_edges:
+                st.markdown("**Upstream Causes**")
+                for f, t, p, m in up_edges: st.caption(f"↑ {f} [{p}]: {m}")
+            if down_edges:
+                st.markdown("**Downstream Impacts**")
+                for f, t, p, m in down_edges: st.caption(f"↓ {t} [{p}]: {m}")
+
+elif page == "🧪 PoC Proof":
+    if "poc_step" not in st.session_state: st.session_state["poc_step"] = 0
+    step_idx = st.session_state["poc_step"]
+    s = POC_STEPS[step_idx]
+    st.subheader(s["title"])
+    st.write(s["desc"])
+    ev_col, ml_col = st.columns(2)
+    ev_col.markdown(info_box("DATA", s["evidence"].replace("\n", "<br>"), s["color"]), unsafe_allow_html=True)
+    ml_col.markdown(info_box("ML ACTION", s["ml_action"].replace("\n", "<br>"), "#a78bfa"), unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    if c1.button("Back") and step_idx > 0:
+        st.session_state["poc_step"] -= 1
+        st.rerun()
+    if c2.button("Next") and step_idx < len(POC_STEPS) - 1:
+        st.session_state["poc_step"] += 1
+        st.rerun()
+
+elif page == "📈 Sankey Flow":
+    st.plotly_chart(build_sankey(), use_container_width=True)
+
+elif page == "📋 Impact Matrix":
+    df = build_impact_matrix()
+    st.dataframe(df, use_container_width=True)
