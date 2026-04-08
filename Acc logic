@@ -15,6 +15,7 @@ mi_df   = pd.read_csv("monthly_mi.csv")
 cash_df["Date"] = pd.to_datetime(cash_df["BREAK_DATE"])
 cash_df["TRADE_ID"] = cash_df["TRADE_ID"].astype(str)
 cash_df["PRODUCT"] = cash_df["PRODUCT"].astype(str)
+# Coerce break amounts to numeric to calculate financial exposure
 cash_df["BREAK"] = pd.to_numeric(cash_df["BREAK"], errors="coerce").fillna(0)
 
 mi_df["Date"] = pd.to_datetime(mi_df["Date"])
@@ -23,32 +24,37 @@ mi_df["Rec"] = mi_df["Rec Name (as per Rec Cube)"].astype(str)
 mi_df["Break_Type"] = mi_df.get("Type of break", "UNKNOWN")
 
 # =========================================================
-# STEP 3 — FILTER (Dec–Feb)
+# STEP 3 — ORIGIN (FIRST BREAK) **CALCULATED BEFORE FILTERING**
 # =========================================================
-cash_df = cash_df[(cash_df["Date"] >= "2025-12-01") & (cash_df["Date"] <= "2026-02-28")]
-mi_df   = mi_df[(mi_df["Date"] >= "2025-12-01") & (mi_df["Date"] <= "2026-02-28")]
-
-# =========================================================
-# STEP 4 — CASHFOARE MONTHLY PRESENCE
-# =========================================================
-cash_df["Month"] = cash_df["Date"].dt.to_period("M")
-
-cash_month = (
-    cash_df.groupby(["TRADE_ID", "Month"])
-    .size()
-    .reset_index(name="Break_Count")
-)
-
-# =========================================================
-# STEP 5 — ORIGIN (FIRST BREAK)
-# =========================================================
+# Capturing the true origin date using the entire historical dataset
 origin_df = (
     cash_df.groupby("TRADE_ID")
     .agg(First_Break_Date=("Date", "min"))
     .reset_index()
 )
-
 origin_df["Origin_Month"] = origin_df["First_Break_Date"].dt.to_period("M")
+
+# =========================================================
+# STEP 4 — FILTER (Dec–Feb)
+# =========================================================
+cash_df = cash_df[(cash_df["Date"] >= "2025-12-01") & (cash_df["Date"] <= "2026-02-28")]
+mi_df   = mi_df[(mi_df["Date"] >= "2025-12-01") & (mi_df["Date"] <= "2026-02-28")]
+
+# =========================================================
+# STEP 5 — CASHFOARE MONTHLY PRESENCE & FINANCIAL EXPOSURE
+# =========================================================
+cash_df["Month"] = cash_df["Date"].dt.to_period("M")
+
+# Adding Max and Average absolute exposure to track P&L risk
+cash_month = (
+    cash_df.groupby(["TRADE_ID", "Month"])
+    .agg(
+        Break_Count=("Date", "size"),
+        Max_Abs_Exposure=("BREAK", lambda x: x.abs().max()),
+        Avg_Abs_Exposure=("BREAK", lambda x: x.abs().mean())
+    )
+    .reset_index()
+)
 
 # =========================================================
 # STEP 6 — REC ORDER
@@ -66,11 +72,10 @@ mi_df["rec_rank"] = mi_df["Rec"].map(REC_ORDER).fillna(999)
 # STEP 7 — MONTH COLUMN
 # =========================================================
 mi_df["Month"] = mi_df["Date"].dt.to_period("M")
-
 mi_df = mi_df.sort_values(["TRADE REF", "Month", "rec_rank", "Date"])
 
 # =========================================================
-# STEP 8 — REC FLOW PER MONTH
+# STEP 8 — REC FLOW & PING-PONG TRACKING
 # =========================================================
 def ordered_unique(x):
     return list(dict.fromkeys(x))
@@ -78,10 +83,15 @@ def ordered_unique(x):
 rec_flow_month = (
     mi_df.groupby(["TRADE REF", "Month"])
     .agg(
-        Rec_Flow=("Rec", lambda x: " → ".join(ordered_unique(x)))
+        Rec_Flow=("Rec", lambda x: " → ".join(ordered_unique(x))),
+        Total_System_Touches=("Rec", "size"),
+        Unique_Systems_Touched=("Rec", lambda x: len(set(x)))
     )
     .reset_index()
 )
+
+# Flag trades that are bouncing back and forth between the same systems
+rec_flow_month["Ping_Pong_Flag"] = rec_flow_month["Total_System_Touches"] > rec_flow_month["Unique_Systems_Touched"]
 
 # =========================================================
 # STEP 9 — ROOT REC
@@ -121,7 +131,7 @@ monthly = monthly.merge(journal_month, on=["TRADE REF", "Month"])
 monthly = monthly.merge(break_type, on=["TRADE REF", "Month"])
 
 # =========================================================
-# STEP 13 — ADD CASH + ORIGIN
+# STEP 13 — ADD CASH, ORIGIN & AGING
 # =========================================================
 monthly = monthly.merge(
     cash_month,
@@ -139,21 +149,26 @@ monthly = monthly.merge(
 
 monthly["Break_Exists"] = monthly["Break_Count"].notna()
 
+# Calculate days outstanding (aging) from the origin date to the end of the reporting month
+monthly["Reporting_Month_End"] = monthly["Month"].dt.to_timestamp(how='end')
+monthly["Break_Age_Days"] = (monthly["Reporting_Month_End"] - monthly["First_Break_Date"]).dt.days
+
 # =========================================================
 # STEP 14 — NEXT MONTH BREAK
 # =========================================================
 monthly = monthly.sort_values(["TRADE REF", "Month"])
-
-monthly["Next_Month_Break"] = (
-    monthly.groupby("TRADE REF")["Break_Exists"].shift(-1)
-)
+monthly["Next_Month_Break"] = monthly.groupby("TRADE REF")["Break_Exists"].shift(-1)
 
 # =========================================================
-# STEP 15 — CLOSURE LOGIC
+# STEP 15 — CLOSURE LOGIC (WITH MIRAGE PREVENTION)
 # =========================================================
+max_month = monthly["Month"].max()
+
 def classify(row):
     if row["Journal_Used"]:
-        if row["Next_Month_Break"]:
+        if row["Month"] == max_month:
+            return "PENDING_VERIFICATION" # Prevents false true-closures in the final month
+        elif row["Next_Month_Break"]:
             return "FALSE_CLOSURE"
         else:
             return "TRUE_CLOSURE"
@@ -161,53 +176,20 @@ def classify(row):
 
 monthly["Closure_Type"] = monthly.apply(classify, axis=1)
 
+# Clean up temporary columns
+monthly = monthly.drop(columns=["TRADE_ID_x", "TRADE_ID_y", "Reporting_Month_End"], errors='ignore')
+
 # =========================================================
 # STEP 16 — SAVE FINAL OUTPUT
 # =========================================================
+# Reorder columns for better readability
+final_cols = [
+    "TRADE REF", "Month", "Closure_Type", "Max_Abs_Exposure", "Avg_Abs_Exposure", 
+    "Break_Age_Days", "First_Break_Date", "Break_Type", "Root_Rec", "Rec_Flow", 
+    "Ping_Pong_Flag", "Total_System_Touches", "Break_Count", "Journal_Used"
+]
+monthly = monthly[final_cols]
+
 monthly.to_csv("final_output.csv", index=False)
 
-print("✅ Final dataset created: final_output.csv")
-
-
-
-# =========================================================
-# STREAMLIT DASHBOARD
-# =========================================================
-
-import streamlit as st
-import pandas as pd
-
-st.set_page_config(layout="wide")
-st.title("📊 Break Intelligence Dashboard")
-
-df = pd.read_csv("final_output.csv")
-
-# Filters
-st.sidebar.header("Filters")
-
-product = st.sidebar.multiselect("Product", df["PRODUCT"].dropna().unique(), default=df["PRODUCT"].dropna().unique())
-closure = st.sidebar.multiselect("Closure", df["Closure_Type"].unique(), default=df["Closure_Type"].unique())
-
-df = df[df["Closure_Type"].isin(closure)]
-
-# KPIs
-col1, col2, col3 = st.columns(3)
-
-col1.metric("Total", len(df))
-col2.metric("False Closures", (df["Closure_Type"]=="FALSE_CLOSURE").sum())
-col3.metric("True Closures", (df["Closure_Type"]=="TRUE_CLOSURE").sum())
-
-# Trend
-st.subheader("Monthly Trend")
-trend = df.groupby(["Month","Closure_Type"]).size().unstack().fillna(0)
-st.line_chart(trend)
-
-# Root Analysis
-st.subheader("Root Cause")
-root = df.groupby("Root_Rec").size().sort_values(ascending=False)
-st.bar_chart(root)
-
-# Table
-st.subheader("Details")
-st.dataframe(df)
-
+print("✅ Final dataset created with risk metrics: final_output.csv")
