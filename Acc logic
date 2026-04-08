@@ -1,9 +1,7 @@
-"""
-CASHFOARE — Equities Asset Class Break Chaining
-
-Identifies root-cause breaks and traces propagation chains
-across equities recs (FO → BO → MO flow)
-"""
+# =========================================================
+# CASHFOARE PHASE 1 — FINAL END-TO-END PIPELINE
+# Lifecycle + Rec Flow + Journal + False Closure
+# =========================================================
 
 import pandas as pd
 import numpy as np
@@ -11,167 +9,138 @@ import numpy as np
 # =========================================================
 # STEP 0 — LOAD DATA
 # =========================================================
-# df = pd.read_csv("your_file.csv")
+# Replace with your actual files
+
+# cash_df = pd.read_csv("cashfoare_daily.csv")
+# mi_df   = pd.read_csv("monthly_mi.csv")
+
 
 # =========================================================
-# STEP 1 — COLUMN NAME MAPPING
+# STEP 1 — STANDARDIZE
 # =========================================================
-MAP_COLS = {
-    "date": "Date",
-    "entity": "Entity",
-    "asset_class": "Asset Class",
-    "product": "High Level Product",
-    "trade_ref": "TRADE REF",
-    "rec_name": "Rec Name (as per Rec Cube)",
-    "break_amount": "BREAK AMOUNT GBP",
-    "break_id": "Break ID",
-    "team": "Team",
-}
 
-# =========================================================
-# STEP 2 — REC ORDER
-# =========================================================
-REC_ORDER = {
-    "FOBO Rec-Equities": 1,
-    "FOBO Rec-Dividend": 2,
-    "Fidessa vs FTP - Stock/Index Futures": 3,
-    "Fidessa vs Fiscal vs FTP - Cash Equity": 4,
-
-    "FLARE vs Fiscal Cash Control (Cash Equities)": 10,
-    "FLARE vs HUB Cash Contra (EQD Contra/control)": 11,
-    "FLARE vs HUB Cash Contra (L&D)": 12,
-    "Flare vs SYN - Cash Equities/SBL Control": 13,
-    "Neted Cash Control - Cash equities/SBL": 14,
-
-    "CRI COMPTA Rec - SED": 20,
-    "CRI COMPTA Rec - SEF": 21,
-    "CRI COMPTA Rec - Cash Equities/SBL": 22,
-
-    "Sophis vs FTP - Cash Equity (P&L - MTM & Cash)": 30,
-    "Sophis vs FTP - EQD (P&L - MTM & Cash)": 31,
-    "Sophis vs FTP - ETD PnL": 32,
-    "Sophis vs FTP - FX Spot/Fwd/NDF/FX swap PnL": 33,
-    "Sophis vs FTP - L&D (P&L - MTM & Cash)": 34,
-    "Sophis vs FTP - MTN (P&L - MTM & Cash)": 35,
-    "Sophis vs Vault (Murex) - FXO book level": 36,
-
-    "Global1 vs FTP ( HLR - SBL/FCT)": 40,
-    "HLR - Prime Services": 41,
-
-    "P&L Rec - CEQ": 50,
-    "P&L Rec - SED": 51,
-    "P&L Rec - SEF": 52,
-
-    "Washbook '0006 Fiscal account' - Market Charges": 60,
-}
-
-# =========================================================
-# STEP 3 — STANDARDISE
-# =========================================================
-def standardise(df):
+def standardize_cash(df):
     df = df.copy()
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-
-    str_cols = ["Entity", "Asset Class", "High Level Product", "TRADE REF", "Rec Name (as per Rec Cube)"]
-    for col in str_cols:
-        df[col] = df[col].astype(str).str.strip().fillna("UNKNOWN")
-
-    df["BREAK AMOUNT GBP"] = pd.to_numeric(df["BREAK AMOUNT GBP"], errors="coerce").fillna(0)
+    df["Date"] = pd.to_datetime(df["BREAK_DATE"], errors="coerce")
+    df["TRADE_ID"] = df["TRADE_ID"].astype(str).str.strip()
+    df["PRODUCT"] = df["PRODUCT"].astype(str).str.strip()
+    df["BREAK"] = pd.to_numeric(df["BREAK"], errors="coerce").fillna(0)
 
     return df
 
-df = standardise(df)
+
+def standardize_mi(df):
+    df = df.copy()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["TRADE REF"] = df["TRADE REF"].astype(str).str.strip()
+    df["Rec"] = df["Rec Name (as per Rec Cube)"].astype(str).str.strip()
+
+    return df
+
+
+cash_df = standardize_cash(cash_df)
+mi_df   = standardize_mi(mi_df)
+
 
 # =========================================================
-# STEP 4 — REC RANK
+# STEP 2 — FILTER (Dec–Feb)
 # =========================================================
-df["rec_rank"] = df["Rec Name (as per Rec Cube)"].map(REC_ORDER)
-df["rec_rank"] = df["rec_rank"].fillna(999)
+
+START_DATE = "2025-12-01"
+END_DATE   = "2026-02-28"
+
+cash_df = cash_df[
+    (cash_df["Date"] >= START_DATE) &
+    (cash_df["Date"] <= END_DATE)
+]
+
+mi_df = mi_df[
+    (mi_df["Date"] >= START_DATE) &
+    (mi_df["Date"] <= END_DATE)
+]
+
+# Remove aged breaks
+if "Age Days" in mi_df.columns:
+    mi_df = mi_df[mi_df["Age Days"] <= 90]
+
 
 # =========================================================
-# STEP 5 — TRADE KEY
+# STEP 3 — TRADE KEY + CHAINS (CASHFOARE)
 # =========================================================
-df["TradeKey"] = (
-    df["Entity"] + "|" +
-    df["Asset Class"] + "|" +
-    df["High Level Product"] + "|" +
-    df["TRADE REF"]
+
+cash_df["TradeKey"] = (
+    cash_df["PRODUCT"] + "|" +
+    cash_df["TRADE_ID"]
 )
 
-df["amt_bucket"] = (df["BREAK AMOUNT GBP"].abs() / 1000).round(0).astype(int).astype(str)
+cash_df = cash_df.sort_values(["TradeKey", "Date"])
 
-df["TradeKey_Fuzzy"] = (
-    df["Entity"] + "|" +
-    df["Asset Class"] + "|" +
-    df["High Level Product"] + "|" +
-    df["amt_bucket"]
+cash_df["BreakChainID"] = cash_df.groupby("TradeKey").ngroup()
+
+
+# =========================================================
+# STEP 4 — CASHFOARE CHAIN SUMMARY (WHEN)
+# =========================================================
+
+chain_summary = (
+    cash_df.groupby("BreakChainID")
+    .agg(
+        Trade=("TRADE_ID", "first"),
+        Product=("PRODUCT", "first"),
+        Start_Date=("Date", "min"),
+        End_Date=("Date", "max"),
+        Days_Active=("Date", "nunique"),
+        Total_Breaks=("BREAK", "count"),
+        Total_Amount=("BREAK", "sum")
+    )
+    .reset_index()
 )
 
-# =========================================================
-# STEP 6 — PARAMETERS
-# =========================================================
-MAX_DATE_GAP = 5
+chain_summary["Is_Recurring"] = chain_summary["Days_Active"] > 1
+
 
 # =========================================================
-# STEP 7 — CHAINING FUNCTION
+# STEP 5 — BUILD REC FLOW FROM MI (WHERE)
 # =========================================================
-def chain_group(group, start_id):
-    group = group.sort_values(["Date", "rec_rank"])
-    results = []
-    chain_id = start_id
 
-    current_chain = []
-    last_date = None
+# Rec precedence (important for correct flow)
+REC_ORDER = {
+    "FOBO Rec-Equities": 1,
+    "FOBO Rec-Dividend": 1,
 
-    for _, row in group.iterrows():
+    "Fidessa vs Fiscal vs FTP - Cash Equity": 2,
+    "Fidessa vs FTP - Stock/Index Futures": 2,
 
-        if not current_chain:
-            current_chain = [row]
-            last_date = row["Date"]
-            continue
+    "FLARE vs Fiscal Cash Control (Cash Equities)": 3,
+    "FLARE vs HUB Cash Contra (EQD Contra/control)": 4,
+    "FLARE vs HUB Cash Contra (L&D)": 4,
+    "Flare vs SYN - Cash Equities/SBL Control": 5,
+    "Netted Cash Control - Cash equities/SBL": 6,
 
-        date_gap = (row["Date"] - last_date).days
+    "CRI COMPTA Rec - Cash Equities/SBL": 7,
+    "CRI COMPTA Rec - SED": 7,
+    "CRI COMPTA Rec - SEF": 7,
 
-        if date_gap <= MAX_DATE_GAP and row["rec_rank"] >= current_chain[-1]["rec_rank"]:
-            current_chain.append(row)
-            last_date = row["Date"]
-        else:
-            chain_id += 1
-            for i, r in enumerate(current_chain):
-                r = r.copy()
-                r["BreakChainID"] = chain_id
-                r["IsRootBreak"] = (i == 0)
-                results.append(r)
+    "Sophis vs FTP - Cash Equity (P&L - MTM & Cash)": 8,
+    "Sophis vs FTP - EQD (P&L - MTM & Cash)": 8,
+    "Sophis vs FTP - ETD PnL": 8,
+    "Sophis vs FTP - FX Spot/Fwd/NDF/FX swap PnL": 8,
 
-            current_chain = [row]
-            last_date = row["Date"]
+    "P&L Rec - CEQ": 9,
+    "P&L Rec - SED": 9,
+    "P&L Rec - SEF": 9,
 
-    if current_chain:
-        chain_id += 1
-        for i, r in enumerate(current_chain):
-            r = r.copy()
-            r["BreakChainID"] = chain_id
-            r["IsRootBreak"] = (i == 0)
-            results.append(r)
+    "Washbook '0006 Fiscal account' - Market Charges": 10,
+}
 
-    return results, chain_id
+mi_df["rec_rank"] = mi_df["Rec"].map(REC_ORDER).fillna(999)
 
-# =========================================================
-# STEP 8 — APPLY CHAINING
-# =========================================================
-all_rows = []
-chain_id = 0
+# Sort properly
+mi_df = mi_df.sort_values(["TRADE REF", "Date", "rec_rank"])
 
-for key, grp in df.groupby("TradeKey"):
-    rows, chain_id = chain_group(grp, chain_id)
-    all_rows.extend(rows)
 
-chain_df = pd.DataFrame(all_rows)
-
-# =========================================================
-# STEP 9 — SUMMARY
-# =========================================================
 def ordered_unique(x):
     seen = []
     for i in x:
@@ -179,33 +148,138 @@ def ordered_unique(x):
             seen.append(i)
     return seen
 
-summary = (
-    chain_df.sort_values(["BreakChainID", "Date", "rec_rank"])
-    .groupby("BreakChainID")
+
+# Build Rec Flow
+rec_flow_df = (
+    mi_df.groupby("TRADE REF")
     .agg(
-        Trade=("TRADE REF", "first"),
-        Product=("High Level Product", "first"),
-        Root_Rec=("Rec Name (as per Rec Cube)", "first"),
-        Start_Date=("Date", "min"),
-        End_Date=("Date", "max"),
-        Rec_Count=("Rec Name (as per Rec Cube)", "nunique"),
-        Rec_Flow=("Rec Name (as per Rec Cube)", lambda x: " → ".join(ordered_unique(x))),
-        Total_Amount=("BREAK AMOUNT GBP", "sum"),
-        Total_Breaks=("Date", "count"),
+        Rec_List=("Rec", lambda x: ordered_unique(x)),
+        Rec_Flow=("Rec", lambda x: " → ".join(ordered_unique(x)))
     )
     .reset_index()
 )
 
-# =========================================================
-# STEP 10 — ROOT CAUSE
-# =========================================================
-root_cause = chain_df[chain_df["IsRootBreak"]].copy()
+# Root Rec
+root_df = (
+    mi_df.groupby("TRADE REF")
+    .first()
+    .reset_index()[["TRADE REF", "Rec"]]
+    .rename(columns={"Rec": "Root_Rec"})
+)
+
 
 # =========================================================
-# OUTPUT
+# STEP 6 — JOURNAL INFO
 # =========================================================
-print("\n===== SUMMARY =====")
-print(summary.head())
 
-print("\n===== ROOT CAUSE =====")
-print(root_cause.head())
+mi_df["Journal_Flag"] = mi_df["Journals Posted"].notna()
+
+journal_df = (
+    mi_df.groupby("TRADE REF")
+    .agg(Journal_Used=("Journal_Flag", "max"))
+    .reset_index()
+)
+
+
+# =========================================================
+# STEP 7 — MERGE EVERYTHING
+# =========================================================
+
+final_summary = chain_summary.merge(
+    rec_flow_df,
+    left_on="Trade",
+    right_on="TRADE REF",
+    how="left"
+)
+
+final_summary = final_summary.merge(
+    root_df,
+    left_on="Trade",
+    right_on="TRADE REF",
+    how="left"
+)
+
+final_summary = final_summary.merge(
+    journal_df,
+    left_on="Trade",
+    right_on="TRADE REF",
+    how="left"
+)
+
+
+# =========================================================
+# STEP 8 — FALSE CLOSURE LOGIC
+# =========================================================
+
+final_summary["False_Closure"] = (
+    (final_summary["Journal_Used"] == True) &
+    (final_summary["Is_Recurring"] == True)
+)
+
+
+# =========================================================
+# STEP 9 — ROOT SYSTEM EXTRACTION
+# =========================================================
+
+final_summary["Root_System"] = final_summary["Root_Rec"].str.split(" vs ").str[0]
+
+
+# =========================================================
+# STEP 10 — KPIs
+# =========================================================
+
+total = len(final_summary)
+recurring = final_summary["Is_Recurring"].sum()
+journal = final_summary["Journal_Used"].sum()
+false_closure = final_summary["False_Closure"].sum()
+
+print("\n================ KPI SUMMARY ================")
+print(f"Total Chains        : {total}")
+print(f"Recurring           : {recurring} ({recurring/total:.1%})")
+print(f"Journal Used        : {journal} ({journal/total:.1%})")
+print(f"False Closure       : {false_closure} ({false_closure/total:.1%})")
+
+
+# =========================================================
+# STEP 11 — TOP ROOT CAUSE SYSTEMS
+# =========================================================
+
+root_system_summary = (
+    final_summary.groupby("Root_System")
+    .agg(
+        Total_Chains=("BreakChainID", "count"),
+        False_Closures=("False_Closure", "sum")
+    )
+    .reset_index()
+    .sort_values("Total_Chains", ascending=False)
+)
+
+print("\n===== TOP ROOT SYSTEMS =====")
+print(root_system_summary.head(10))
+
+
+# =========================================================
+# STEP 12 — TOP FALSE CLOSURE CHAINS
+# =========================================================
+
+top_false = final_summary[
+    final_summary["False_Closure"] == True
+].sort_values("Days_Active", ascending=False)
+
+print("\n===== TOP FALSE CLOSURE TRADES =====")
+print(top_false[[
+    "Trade",
+    "Product",
+    "Days_Active",
+    "Rec_Flow",
+    "Root_Rec"
+]].head(10))
+
+
+# =========================================================
+# STEP 13 — EXPORT
+# =========================================================
+
+# final_summary.to_csv("final_break_summary.csv", index=False)
+
+print("\n[DONE] Phase 1 Completed Successfully 🚀")
