@@ -1,156 +1,91 @@
 # =========================================================
-# CASHFOARE PHASE 1 — FINAL CORRECT VERSION
-# Lifecycle + Monthly Rec Flow + Root Cause + Recurrence
+# STEP 0 — IMPORTS
 # =========================================================
-
 import pandas as pd
-import numpy as np
 
 # =========================================================
-# STEP 0 — LOAD DATA
+# STEP 1 — LOAD DATA
 # =========================================================
-# cash_df = pd.read_csv("cashfoare_daily.csv")
-# mi_df   = pd.read_csv("monthly_mi.csv")
-
-
-# =========================================================
-# STEP 1 — STANDARDIZE
-# =========================================================
-
-def standardize_cash(df):
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["BREAK_DATE"], errors="coerce")
-    df["TRADE_ID"] = df["TRADE_ID"].astype(str).str.strip()
-    df["PRODUCT"] = df["PRODUCT"].astype(str).str.strip()
-    df["BREAK"] = pd.to_numeric(df["BREAK"], errors="coerce").fillna(0)
-    return df
-
-
-def standardize_mi(df):
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["TRADE REF"] = df["TRADE REF"].astype(str).str.strip()
-    df["Rec"] = df["Rec Name (as per Rec Cube)"].astype(str).str.strip()
-    return df
-
-
-cash_df = standardize_cash(cash_df)
-mi_df   = standardize_mi(mi_df)
-
+cash_df = pd.read_csv("cashfoare_daily.csv")
+mi_df   = pd.read_csv("monthly_mi.csv")
 
 # =========================================================
-# STEP 2 — FILTER (Dec–Feb)
+# STEP 2 — STANDARDIZE
 # =========================================================
+cash_df["Date"] = pd.to_datetime(cash_df["BREAK_DATE"])
+cash_df["TRADE_ID"] = cash_df["TRADE_ID"].astype(str)
+cash_df["PRODUCT"] = cash_df["PRODUCT"].astype(str)
+cash_df["BREAK"] = pd.to_numeric(cash_df["BREAK"], errors="coerce").fillna(0)
 
-START_DATE = "2025-12-01"
-END_DATE   = "2026-02-28"
-
-cash_df = cash_df[
-    (cash_df["Date"] >= START_DATE) &
-    (cash_df["Date"] <= END_DATE)
-]
-
-mi_df = mi_df[
-    (mi_df["Date"] >= START_DATE) &
-    (mi_df["Date"] <= END_DATE)
-]
-
-if "Age Days" in mi_df.columns:
-    mi_df = mi_df[mi_df["Age Days"] <= 90]
-
+mi_df["Date"] = pd.to_datetime(mi_df["Date"])
+mi_df["TRADE REF"] = mi_df["TRADE REF"].astype(str)
+mi_df["Rec"] = mi_df["Rec Name (as per Rec Cube)"].astype(str)
+mi_df["Break_Type"] = mi_df.get("Type of break", "UNKNOWN")
 
 # =========================================================
-# STEP 3 — CASHFOARE CHAINS (WHEN)
+# STEP 3 — FILTER (Dec–Feb)
 # =========================================================
+cash_df = cash_df[(cash_df["Date"] >= "2025-12-01") & (cash_df["Date"] <= "2026-02-28")]
+mi_df   = mi_df[(mi_df["Date"] >= "2025-12-01") & (mi_df["Date"] <= "2026-02-28")]
 
-cash_df["TradeKey"] = cash_df["PRODUCT"] + "|" + cash_df["TRADE_ID"]
+# =========================================================
+# STEP 4 — CASHFOARE MONTHLY PRESENCE
+# =========================================================
+cash_df["Month"] = cash_df["Date"].dt.to_period("M")
 
-cash_df = cash_df.sort_values(["TradeKey", "Date"])
-cash_df["BreakChainID"] = cash_df.groupby("TradeKey").ngroup()
+cash_month = (
+    cash_df.groupby(["TRADE_ID", "Month"])
+    .size()
+    .reset_index(name="Break_Count")
+)
 
-chain_summary = (
-    cash_df.groupby("BreakChainID")
-    .agg(
-        Trade=("TRADE_ID", "first"),
-        Product=("PRODUCT", "first"),
-        Start_Date=("Date", "min"),
-        End_Date=("Date", "max"),
-        Days_Active=("Date", "nunique"),
-        Total_Breaks=("BREAK", "count"),
-        Total_Amount=("BREAK", "sum")
-    )
+# =========================================================
+# STEP 5 — ORIGIN (FIRST BREAK)
+# =========================================================
+origin_df = (
+    cash_df.groupby("TRADE_ID")
+    .agg(First_Break_Date=("Date", "min"))
     .reset_index()
 )
 
-chain_summary["Is_Recurring"] = chain_summary["Days_Active"] > 1
-
+origin_df["Origin_Month"] = origin_df["First_Break_Date"].dt.to_period("M")
 
 # =========================================================
-# STEP 4 — REC PRECEDENCE
+# STEP 6 — REC ORDER
 # =========================================================
-
 REC_ORDER = {
-    "FOBO Rec-Equities": 1,
-    "FOBO Rec-Dividend": 1,
-
-    "Fidessa vs Fiscal vs FTP - Cash Equity": 2,
-    "Fidessa vs FTP - Stock/Index Futures": 2,
-
-    "FLARE vs Fiscal Cash Control (Cash Equities)": 3,
-    "FLARE vs HUB Cash Contra (EQD Contra/control)": 4,
-    "FLARE vs HUB Cash Contra (L&D)": 4,
-    "Flare vs SYN - Cash Equities/SBL Control": 5,
-    "Netted Cash Control - Cash equities/SBL": 6,
-
-    "CRI COMPTA Rec - Cash Equities/SBL": 7,
-    "CRI COMPTA Rec - SED": 7,
-    "CRI COMPTA Rec - SEF": 7,
-
-    "Sophis vs FTP - Cash Equity (P&L - MTM & Cash)": 8,
-    "Sophis vs FTP - EQD (P&L - MTM & Cash)": 8,
-    "Sophis vs FTP - ETD PnL": 8,
-
-    "P&L Rec - CEQ": 9,
-    "P&L Rec - SED": 9,
-    "P&L Rec - SEF": 9,
-
-    "Washbook '0006 Fiscal account' - Market Charges": 10,
+    "Fidessa vs Fiscal vs FTP - Cash Equity": 1,
+    "FLARE vs Fiscal Cash Control (Cash Equities)": 2,
+    "CRI COMPTA Rec - Cash Equities/SBL": 3,
+    "P&L Rec - CEQ": 4,
 }
 
 mi_df["rec_rank"] = mi_df["Rec"].map(REC_ORDER).fillna(999)
 
-
 # =========================================================
-# STEP 5 — MONTH COLUMN (CRITICAL)
+# STEP 7 — MONTH COLUMN
 # =========================================================
-
 mi_df["Month"] = mi_df["Date"].dt.to_period("M")
 
 mi_df = mi_df.sort_values(["TRADE REF", "Month", "rec_rank", "Date"])
 
-
 # =========================================================
-# STEP 6 — REC FLOW PER MONTH
+# STEP 8 — REC FLOW PER MONTH
 # =========================================================
-
 def ordered_unique(x):
     return list(dict.fromkeys(x))
-
 
 rec_flow_month = (
     mi_df.groupby(["TRADE REF", "Month"])
     .agg(
-        Rec_List=("Rec", ordered_unique),
         Rec_Flow=("Rec", lambda x: " → ".join(ordered_unique(x)))
     )
     .reset_index()
 )
 
-
 # =========================================================
-# STEP 7 — ROOT REC PER MONTH
+# STEP 9 — ROOT REC
 # =========================================================
-
 root_month = (
     mi_df.groupby(["TRADE REF", "Month"])
     .first()
@@ -158,127 +93,121 @@ root_month = (
     .rename(columns={"Rec": "Root_Rec"})
 )
 
-
 # =========================================================
-# STEP 8 — JOURNAL FLAG PER MONTH
+# STEP 10 — JOURNAL FLAG
 # =========================================================
-
-mi_df["Journal_Flag"] = mi_df["Journals Posted"].notna()
+mi_df["Journal_Used"] = mi_df["Journals Posted"].notna()
 
 journal_month = (
     mi_df.groupby(["TRADE REF", "Month"])
-    .agg(Journal_Used=("Journal_Flag", "max"))
+    .agg(Journal_Used=("Journal_Used", "max"))
     .reset_index()
 )
 
-
 # =========================================================
-# STEP 9 — MERGE MONTHLY VIEW
+# STEP 11 — BREAK TYPE
 # =========================================================
-
-monthly_view = rec_flow_month.merge(root_month, on=["TRADE REF", "Month"], how="left")
-monthly_view = monthly_view.merge(journal_month, on=["TRADE REF", "Month"], how="left")
-
-
-# =========================================================
-# STEP 10 — RECURRING ROOT DETECTION
-# =========================================================
-
-repeat_summary = (
-    monthly_view.groupby(["TRADE REF", "Root_Rec"])
-    .agg(
-        Months_Repeated=("Month", "nunique"),
-        Journal_Count=("Journal_Used", "sum")
-    )
+break_type = (
+    mi_df.groupby(["TRADE REF", "Month"])
+    .agg(Break_Type=("Break_Type", "first"))
     .reset_index()
 )
 
-repeat_summary["Is_Repeating_Root"] = repeat_summary["Months_Repeated"] >= 2
-
+# =========================================================
+# STEP 12 — MERGE MONTHLY DATA
+# =========================================================
+monthly = rec_flow_month.merge(root_month, on=["TRADE REF", "Month"])
+monthly = monthly.merge(journal_month, on=["TRADE REF", "Month"])
+monthly = monthly.merge(break_type, on=["TRADE REF", "Month"])
 
 # =========================================================
-# STEP 11 — FINAL MERGE WITH CASHFOARE
+# STEP 13 — ADD CASH + ORIGIN
 # =========================================================
-
-final_summary = chain_summary.merge(
-    repeat_summary,
-    left_on="Trade",
-    right_on="TRADE REF",
+monthly = monthly.merge(
+    cash_month,
+    left_on=["TRADE REF", "Month"],
+    right_on=["TRADE_ID", "Month"],
     how="left"
 )
 
-
-# =========================================================
-# STEP 12 — FALSE CLOSURE (FINAL LOGIC)
-# =========================================================
-
-final_summary["False_Closure"] = (
-    (final_summary["Is_Repeating_Root"] == True) &
-    (final_summary["Journal_Count"] > 0)
+monthly = monthly.merge(
+    origin_df,
+    left_on="TRADE REF",
+    right_on="TRADE_ID",
+    how="left"
 )
 
+monthly["Break_Exists"] = monthly["Break_Count"].notna()
 
 # =========================================================
-# STEP 13 — ROOT SYSTEM
+# STEP 14 — NEXT MONTH BREAK
 # =========================================================
+monthly = monthly.sort_values(["TRADE REF", "Month"])
 
-final_summary["Root_System"] = final_summary["Root_Rec"].str.split(" vs ").str[0]
-
-
-# =========================================================
-# STEP 14 — KPIs
-# =========================================================
-
-total = len(final_summary)
-recurring = final_summary["Is_Recurring"].sum()
-repeating_root = final_summary["Is_Repeating_Root"].sum()
-false_closure = final_summary["False_Closure"].sum()
-
-print("\n================ KPI SUMMARY ================")
-print(f"Total Chains           : {total}")
-print(f"Recurring Breaks       : {recurring} ({recurring/total:.1%})")
-print(f"Repeating Root Causes  : {repeating_root} ({repeating_root/total:.1%})")
-print(f"False Closures         : {false_closure} ({false_closure/total:.1%})")
-
-
-# =========================================================
-# STEP 15 — TOP ROOT SYSTEMS
-# =========================================================
-
-root_system_summary = (
-    final_summary.groupby("Root_System")
-    .agg(
-        Total_Chains=("BreakChainID", "count"),
-        False_Closures=("False_Closure", "sum")
-    )
-    .reset_index()
-    .sort_values("Total_Chains", ascending=False)
+monthly["Next_Month_Break"] = (
+    monthly.groupby("TRADE REF")["Break_Exists"].shift(-1)
 )
 
-print("\n===== TOP ROOT SYSTEMS =====")
-print(root_system_summary.head(10))
+# =========================================================
+# STEP 15 — CLOSURE LOGIC
+# =========================================================
+def classify(row):
+    if row["Journal_Used"]:
+        if row["Next_Month_Break"]:
+            return "FALSE_CLOSURE"
+        else:
+            return "TRUE_CLOSURE"
+    return "NO_JOURNAL"
+
+monthly["Closure_Type"] = monthly.apply(classify, axis=1)
+
+# =========================================================
+# STEP 16 — SAVE FINAL OUTPUT
+# =========================================================
+monthly.to_csv("final_output.csv", index=False)
+
+print("✅ Final dataset created: final_output.csv")
+
 
 
 # =========================================================
-# STEP 16 — SAMPLE OUTPUT
+# STREAMLIT DASHBOARD
 # =========================================================
 
-print("\n===== SAMPLE OUTPUT =====")
-print(final_summary[[
-    "Trade",
-    "Product",
-    "Days_Active",
-    "Root_Rec",
-    "Months_Repeated",
-    "Journal_Count",
-    "False_Closure"
-]].head(10))
+import streamlit as st
+import pandas as pd
 
+st.set_page_config(layout="wide")
+st.title("📊 Break Intelligence Dashboard")
 
-# =========================================================
-# STEP 17 — EXPORT
-# =========================================================
+df = pd.read_csv("final_output.csv")
 
-# final_summary.to_csv("final_output.csv", index=False)
+# Filters
+st.sidebar.header("Filters")
 
-print("\n[DONE] FINAL PHASE 1 COMPLETE 🚀")
+product = st.sidebar.multiselect("Product", df["PRODUCT"].dropna().unique(), default=df["PRODUCT"].dropna().unique())
+closure = st.sidebar.multiselect("Closure", df["Closure_Type"].unique(), default=df["Closure_Type"].unique())
+
+df = df[df["Closure_Type"].isin(closure)]
+
+# KPIs
+col1, col2, col3 = st.columns(3)
+
+col1.metric("Total", len(df))
+col2.metric("False Closures", (df["Closure_Type"]=="FALSE_CLOSURE").sum())
+col3.metric("True Closures", (df["Closure_Type"]=="TRUE_CLOSURE").sum())
+
+# Trend
+st.subheader("Monthly Trend")
+trend = df.groupby(["Month","Closure_Type"]).size().unstack().fillna(0)
+st.line_chart(trend)
+
+# Root Analysis
+st.subheader("Root Cause")
+root = df.groupby("Root_Rec").size().sort_values(ascending=False)
+st.bar_chart(root)
+
+# Table
+st.subheader("Details")
+st.dataframe(df)
+
